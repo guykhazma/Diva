@@ -108,6 +108,70 @@ public:
     void BulkLoadStreaming(const uint8_t *key, const uint32_t key_len, const uint64_t *payload=nullptr);
     void BulkLoadStreamingFinish();
 
+    struct InfiniteByteString {
+      const uint8_t *str;
+      uint32_t length;
+
+      InfiniteByteString(): str(nullptr), length(0) {};
+      InfiniteByteString(const uint8_t *str, uint32_t length): str(str), length(length) {};
+      InfiniteByteString(const InfiniteByteString& other): str(other.str), length(other.length) {};
+
+      InfiniteByteString& operator=(const InfiniteByteString& other) {
+        str = other.str;
+        length = other.length;
+        return *this;
+      }
+
+      __attribute__((always_inline))
+      uint64_t WordAt(const uint32_t byte_pos) const {
+        if (byte_pos >= length)
+          return 0;
+        uint64_t res = 0;
+        memcpy(&res, str + byte_pos, std::min<uint32_t>(sizeof(res), length - byte_pos));
+        return __builtin_bswap64(res);
+      };
+
+      __attribute__((always_inline))
+      uint64_t BitsAt(const uint32_t bit_pos, const uint32_t res_width) const {
+        if (bit_pos / 8 >= length)
+          return 0;
+        uint64_t res = 0;
+        memcpy(&res, str + bit_pos / 8, std::min<uint32_t>(sizeof(res), length - bit_pos / 8));
+        res = __builtin_bswap64(res) >> (8 * sizeof(res) - res_width - bit_pos % 8);
+        return res & BITMASK(res_width);
+      };
+
+      __attribute__((always_inline))
+      uint32_t GetBit(const uint32_t pos) const {
+        return (pos / 8 < length ? (str[pos / 8] >> (7 - pos % 8)) & 1 : 0);
+      };
+
+      __attribute__((always_inline))
+      bool IsPrefixOf(const InfiniteByteString& other, const uint32_t bits_to_ignore=0) const {
+        if (length <= other.length && memcmp(str, other.str, length - 1) == 0)
+          return (str[length - 1] | BITMASK(bits_to_ignore)) == (other.str[length - 1] | BITMASK(bits_to_ignore));
+        return false;
+      }
+
+      bool operator<(const InfiniteByteString& rhs) const {
+        int32_t cmp_result = memcmp(str, rhs.str, std::min(length, rhs.length));
+        return cmp_result < 0 || (cmp_result == 0 && length < rhs.length);
+      }
+
+      bool operator<=(const InfiniteByteString& rhs) const {
+        int32_t cmp_result = memcmp(str, rhs.str, std::min(length, rhs.length));
+        return cmp_result < 0 || (cmp_result == 0 && length <= rhs.length);
+      }
+
+      bool operator>(const InfiniteByteString& rhs) const {
+        return !(*this < rhs);
+      }
+
+      bool operator==(const InfiniteByteString& rhs) const {
+        return length == rhs.length && memcmp(str, rhs.str, std::min(length, rhs.length)) == 0;
+      }
+    };
+
 private:
     static constexpr uint32_t infix_store_target_size = 1024;
     static_assert(infix_store_target_size % 64 == 0);
@@ -116,70 +180,6 @@ private:
     static constexpr uint32_t scale_implicit_shift = 15;
     static constexpr uint32_t size_scalar_count = 500;
     static constexpr uint32_t size_scalar_shrink_grow_sep = 55; // vs. 55 for load_factor_alt_=0.95
-
-    struct InfiniteByteString {
-        const uint8_t *str;
-        uint32_t length;
-
-        InfiniteByteString(): str(nullptr), length(0) {};
-        InfiniteByteString(const uint8_t *str, uint32_t length): str(str), length(length) {};
-        InfiniteByteString(const InfiniteByteString& other): str(other.str), length(other.length) {};
-
-        InfiniteByteString& operator=(const InfiniteByteString& other) {
-            str = other.str;
-            length = other.length;
-            return *this;
-        }
-
-        __attribute__((always_inline))
-        uint64_t WordAt(const uint32_t byte_pos) const {
-            if (byte_pos >= length)
-                return 0;
-            uint64_t res = 0;
-            memcpy(&res, str + byte_pos, std::min<uint32_t>(sizeof(res), length - byte_pos));
-            return __builtin_bswap64(res);
-        };
-
-        __attribute__((always_inline))
-        uint64_t BitsAt(const uint32_t bit_pos, const uint32_t res_width) const {
-            if (bit_pos / 8 >= length)
-                return 0;
-            uint64_t res = 0;
-            memcpy(&res, str + bit_pos / 8, std::min<uint32_t>(sizeof(res), length - bit_pos / 8));
-            res = __builtin_bswap64(res) >> (8 * sizeof(res) - res_width - bit_pos % 8);
-            return res & BITMASK(res_width);
-        };
-
-        __attribute__((always_inline))
-        uint32_t GetBit(const uint32_t pos) const {
-            return (pos / 8 < length ? (str[pos / 8] >> (7 - pos % 8)) & 1 : 0);
-        };
-
-        __attribute__((always_inline))
-        bool IsPrefixOf(const InfiniteByteString& other, const uint32_t bits_to_ignore=0) const {
-            if (length <= other.length && memcmp(str, other.str, length - 1) == 0)
-                return (str[length - 1] | BITMASK(bits_to_ignore)) == (other.str[length - 1] | BITMASK(bits_to_ignore));
-            return false;
-        }
-
-        bool operator<(const InfiniteByteString& rhs) const {
-            int32_t cmp_result = memcmp(str, rhs.str, std::min(length, rhs.length));
-            return cmp_result < 0 || (cmp_result == 0 && length < rhs.length);
-        }
-
-        bool operator<=(const InfiniteByteString& rhs) const {
-            int32_t cmp_result = memcmp(str, rhs.str, std::min(length, rhs.length));
-            return cmp_result < 0 || (cmp_result == 0 && length <= rhs.length);
-        }
-
-        bool operator>(const InfiniteByteString& rhs) const {
-            return !(*this < rhs);
-        }
-
-        bool operator==(const InfiniteByteString& rhs) const {
-            return length == rhs.length && memcmp(str, rhs.str, std::min(length, rhs.length)) == 0;
-        }
-    };
 
     struct InfixStore {
         static const uint32_t size_grade_bit_count = 8;
@@ -282,6 +282,8 @@ private:
         void GetPayload(uint64_t *out) const;
         bool IsValid() const;
 
+        ~Iterator();
+
     private:
         Diva<int_optimized, payload_type> *filter_;
         InfiniteByteString start_, next_to_fetch_;
@@ -292,7 +294,6 @@ private:
         Iterator(Diva<int_optimized, payload_type> *parent, std::string_view start);
         Iterator(Diva<int_optimized, payload_type> *parent, const uint8_t *start, uint32_t start_len);
         Iterator(Diva<int_optimized, payload_type> *parent, uint64_t start);
-        ~Iterator();
 
         void Fetch();
     };
@@ -411,16 +412,15 @@ public:
     Iterator GetIterator(uint64_t start);
 };
 
-
 template <bool int_optimized, PayloadType payload_type>
 inline Diva<int_optimized, payload_type>::Diva(const uint32_t infix_size, const uint32_t rng_seed,
                                                const float load_factor, const uint32_t payload_size):
+            infix_size_(infix_size),
+            payload_size_(0),
             wh_(nullptr),
             better_tree_(nullptr),
             wh_int_(nullptr),
             better_tree_int_(nullptr),
-            infix_size_(infix_size),
-            payload_size_(0),
             rng_seed_(rng_seed),
             load_factor_(load_factor),
             bulk_load_streaming_ind_(0) {
