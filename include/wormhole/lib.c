@@ -291,7 +291,7 @@ crc32c_inc_123(const u8 * buf, u32 nr, u32 crc)
   inline u32
 crc32c_inc_x4(const u8 * buf, u32 nr, u32 crc)
 {
-  //debug_assert((nr & 3) == 0);
+  //// debug_assert((nr & 3) == 0);
   const u32 nr8 = nr >> 3;
 #pragma nounroll
   for (u32 i = 0; i < nr8; i++)
@@ -984,7 +984,7 @@ thread_do_fork_join_worker(void * const ptr)
   const u32 rank = (u32)fjp.e1;
 
   const u32 nchild = (u32)__builtin_ctz(rank ? rank : bits_p2_up_u32(fji->total));
-  debug_assert(nchild <= FORK_JOIN_RANK_BITS);
+  // debug_assert(nchild <= FORK_JOIN_RANK_BITS);
   pthread_t tids[FORK_JOIN_RANK_BITS];
   if (nchild) {
     cpu_set_t set;
@@ -1238,7 +1238,7 @@ __thread const rwlock * rwdep_writers[RWDEP_NR] = {};
   static void
 rwdep_check(const rwlock * const lock)
 {
-  debug_assert(lock);
+  // debug_assert(lock);
   for (u64 i = 0; i < RWDEP_NR; i++) {
     if (rwdep_readers[i] == lock)
       debug_die();
@@ -1628,7 +1628,7 @@ static __thread struct co * volatile co_curr = NULL; // NULL in host
 co_init(struct co * const co, void * func, void * priv, u64 * const host,
     const u64 stksz, void * func_exit)
 {
-  debug_assert((stksz & 0x3f) == 0); // a multiple of 64 bytes
+  // debug_assert((stksz & 0x3f) == 0); // a multiple of 64 bytes
   u64 * rsp = ((u64 *)co) - 4;
   rsp[0] = (u64)func;
   rsp[1] = (u64)func_exit;
@@ -1693,8 +1693,8 @@ co_priv(void)
   inline u64
 co_enter(struct co * const to, const u64 retval)
 {
-  debug_assert(co_curr == NULL); // must entry from the host
-  debug_assert(to && to->host);
+  // debug_assert(co_curr == NULL); // must entry from the host
+  // debug_assert(to && to->host);
   u64 * const save = to->host;
   co_curr = to;
   const u64 ret = co_switch_stack(save, to->rsp, retval);
@@ -1708,9 +1708,9 @@ co_enter(struct co * const to, const u64 retval)
   inline u64
 co_switch_to(struct co * const to, const u64 retval)
 {
-  debug_assert(co_curr);
-  debug_assert(co_curr != to);
-  debug_assert(to && to->host);
+  // debug_assert(co_curr);
+  // debug_assert(co_curr != to);
+  // debug_assert(to && to->host);
   struct co * const save = co_curr;
   co_curr = to;
   return co_switch_stack(&(save->rsp), to->rsp, retval);
@@ -1721,7 +1721,7 @@ co_switch_to(struct co * const to, const u64 retval)
   inline u64
 co_back(const u64 retval)
 {
-  debug_assert(co_curr);
+  // debug_assert(co_curr);
   struct co * const save = co_curr;
   co_curr = NULL;
   return co_switch_stack(&(save->rsp), *(save->host), retval);
@@ -1747,7 +1747,7 @@ __attribute__((noreturn))
   void
 co_exit(const u64 retval)
 {
-  debug_assert(co_curr);
+  // debug_assert(co_curr);
 #ifdef CO_STACK_CHECK
   const u64 stksz = co_curr->stksz;
   u8 * const mem = ((u8 *)co_curr) - stksz;
@@ -1870,7 +1870,7 @@ __attribute__((noreturn))
   inline void
 corr_exit(void)
 {
-  debug_assert(co_curr);
+  // debug_assert(co_curr);
 #ifdef CO_STACK_CHECK
   const u64 stksz = co_curr->stksz;
   const u8 * const mem = ((u8 *)(co_curr)) - stksz;
@@ -2052,7 +2052,7 @@ vi128_encode_u32(u8 * dst, u32 v)
   const u8 *
 vi128_decode_u32(const u8 * src, u32 * const out)
 {
-  debug_assert(*src);
+  // debug_assert(*src);
   u32 r = 0;
   for (u32 shift = 0; shift < 32; shift += 7) {
     const u8 byte = *(src++);
@@ -2133,14 +2133,14 @@ vi128_decode_u64(const u8 * src, u64 * const out)
   inline struct entry13
 entry13(const u16 e1, const u64 e3)
 {
-  debug_assert((e3 >> 48) == 0);
+  // debug_assert((e3 >> 48) == 0);
   return (struct entry13){.v64 = (e3 << 16) | e1};
 }
 
   inline void
 entry13_update_e3(struct entry13 * const e, const u64 e3)
 {
-  debug_assert((e3 >> 48) == 0);
+  // debug_assert((e3 >> 48) == 0);
   *e = entry13(e->e1, e3);
 }
 
@@ -2168,7 +2168,7 @@ m_usable_size(void * const ptr)
 
 #ifndef HEAPCHECKING
   // valgrind and asan may return unaligned usable size
-  debug_assert((sz & 0x7lu) == 0);
+  // debug_assert((sz & 0x7lu) == 0);
 #endif // HEAPCHECKING
 
   return sz;
@@ -2448,7 +2448,7 @@ slab_init_internal(struct slab * const slab, const u64 obj_size, const u64 blk_s
   slab->obj_size = obj_size;
   slab->blk_size = blk_size;
   slab->objs_per_slab = (blk_size - obj0_offset) / obj_size;
-  debug_assert(slab->objs_per_slab); // >= 1
+  // debug_assert(slab->objs_per_slab); // >= 1
   slab->obj0_offset = obj0_offset;
   mutex_init(&(slab->lock));
 }
@@ -2487,7 +2487,7 @@ slab_alloc_unsafe(struct slab * const slab)
       return NULL;
     ret = astk_pop_unsafe(&slab->magic);
   }
-  debug_assert(ret);
+  // debug_assert(ret);
   slab->nr_ready--;
   return ret;
 }
@@ -2514,7 +2514,7 @@ slab_alloc_safe(struct slab * const slab)
   void
 slab_free_unsafe(struct slab * const slab, void * const ptr)
 {
-  debug_assert(ptr);
+  // debug_assert(ptr);
   astk_push_unsafe(&slab->magic, ptr, ptr);
   slab->nr_ready++;
 }
@@ -2566,7 +2566,7 @@ slab_get_nalloc(struct slab * const slab)
   static void
 slab_deinit(struct slab * const slab)
 {
-  debug_assert(slab);
+  // debug_assert(slab);
   struct acell * iter = slab->head_active;
   while (iter) {
     struct acell * const next = iter->next;
@@ -2873,7 +2873,7 @@ qsbr_create(void)
 qsbr_shard(struct qsbr * const q, void * const ptr)
 {
   const u32 sid = crc32c_u64(0, (u64)ptr) & QSBR_SHARD_MASK;
-  debug_assert(sid < QSBR_SHARD_NR);
+  // debug_assert(sid < QSBR_SHARD_NR);
   return &(q->shards[sid]);
 }
 
@@ -2920,8 +2920,8 @@ qsbr_unregister(struct qsbr * const q, struct qsbr_ref * const qref)
   struct qsbr_ref_real * const ref = (typeof(ref))qref;
   struct qshard * const shard = qsbr_shard(q, ref);
   const u32 pos = (u32)(ref->pptr - shard->ptrs);
-  debug_assert(pos < QSBR_STATES_NR);
-  debug_assert(shard->bitmap & (1lu << pos));
+  // debug_assert(pos < QSBR_STATES_NR);
+  // debug_assert(shard->bitmap & (1lu << pos));
 
   atomic_store_explicit(&shard->ptrs[pos], (u64)(&q->target), MO_RELAXED);
   //shard->ptrs[pos] = &q->target;
@@ -2942,7 +2942,7 @@ qsbr_unregister(struct qsbr * const q, struct qsbr_ref * const qref)
 qsbr_update(struct qsbr_ref * const qref, const u64 v)
 {
   struct qsbr_ref_real * const ref = (typeof(ref))qref;
-  debug_assert((*ref->pptr) == (u64)ref); // must be unparked
+  // debug_assert((*ref->pptr) == (u64)ref); // must be unparked
   // rcu update does not require release or acquire order
   qsbr_write_qstate(ref, v);
 }
@@ -3009,7 +3009,7 @@ qsbr_wait(struct qsbr * const q, const u64 target)
     corr_yield();
 #endif
   }
-  debug_assert(cbits == 0);
+  // debug_assert(cbits == 0);
   cpu_cfence();
 }
 

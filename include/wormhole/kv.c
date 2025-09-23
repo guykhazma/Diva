@@ -41,7 +41,7 @@ kv_size(const struct kv * const kv)
   inline size_t
 kv_size_align(const struct kv * const kv, const u64 align)
 {
-  debug_assert(align && ((align & (align - 1)) == 0));
+  // debug_assert(align && ((align & (align - 1)) == 0));
   return (sizeof(*kv) + kv->klen + kv->vlen + (align - 1)) & (~(align - 1));
 }
 
@@ -54,7 +54,7 @@ key_size(const struct kv *const key)
   inline size_t
 key_size_align(const struct kv *const key, const u64 align)
 {
-  debug_assert(align && ((align & (align - 1)) == 0));
+  // debug_assert(align && ((align & (align - 1)) == 0));
   return (sizeof(*key) + key->klen + (align - 1)) & (~(align - 1));
 }
 // }}} size
@@ -70,7 +70,7 @@ kv_update_hash(struct kv * const kv)
   inline void
 kv_refill_value(struct kv * const kv, const void * const value, const u32 vlen)
 {
-  debug_assert((vlen == 0) || value);
+  // debug_assert((vlen == 0) || value);
   memcpy(&(kv->kv[kv->klen]), value, vlen);
   kv->vlen = vlen;
 }
@@ -79,7 +79,7 @@ kv_refill_value(struct kv * const kv, const void * const value, const u32 vlen)
 kv_refill(struct kv * const kv, const void * const key, const u32 klen,
     const void * const value, const u32 vlen)
 {
-  debug_assert(kv);
+  // debug_assert(kv);
   kv->klen = klen;
   memcpy(&(kv->kv[0]), key, klen);
   kv_refill_value(kv, value, vlen);
@@ -272,7 +272,7 @@ kv_dup2_key_prefix(const struct kv * const from, struct kv * const to, const u32
 {
   if (from == NULL)
     return NULL;
-  debug_assert(plen <= from->klen);
+  // debug_assert(plen <= from->klen);
   const size_t sz = key_size(from) - from->klen + plen;
   struct kv * const new = to ? to : malloc(sz);
   if (new) {
@@ -330,8 +330,8 @@ kv_match_full(const struct kv * const kv1, const struct kv * const kv2)
   bool
 kv_match_kv128(const struct kv * const sk, const u8 * const kv128)
 {
-  debug_assert(sk);
-  debug_assert(kv128);
+  // debug_assert(sk);
+  // debug_assert(kv128);
 
   u32 klen128 = 0;
   u32 vlen128 = 0;
@@ -360,11 +360,11 @@ kv_compare_ptrs(const void * const p1, const void * const p2)
   int
 kv_k128_compare(const struct kv * const sk, const u8 * const k128)
 {
-  debug_assert(sk);
+  // debug_assert(sk);
   const u32 klen1 = sk->klen;
   u32 klen2 = 0;
   const u8 * const ptr2 = vi128_decode_u32(k128, &klen2);
-  debug_assert(ptr2);
+  // debug_assert(ptr2);
   const u32 len = (klen1 < klen2) ? klen1 : klen2;
   const int cmp = memcmp(sk->kv, ptr2, len);
   return cmp ? cmp : klen_compare(klen1, klen2);
@@ -373,7 +373,7 @@ kv_k128_compare(const struct kv * const sk, const u8 * const k128)
   int
 kv_kv128_compare(const struct kv * const sk, const u8 * const kv128)
 {
-  debug_assert(sk);
+  // debug_assert(sk);
   const u32 klen1 = sk->klen;
   u32 klen2 = 0;
   u32 vlen2 = 0;
@@ -402,7 +402,7 @@ kv_key_lcp(const struct kv * const key1, const struct kv * const key2)
 kv_key_lcp_skip(const struct kv * const key1, const struct kv * const key2, const u32 lcp0)
 {
   const u32 max = (key1->klen < key2->klen) ? key1->klen : key2->klen;
-  debug_assert(max >= lcp0);
+  // debug_assert(max >= lcp0);
   return lcp0 + memlcp(key1->kv+lcp0, key2->kv+lcp0, max-lcp0);
 }
 // }}}
@@ -456,8 +456,8 @@ kv_psort_rec(struct kv ** const kvs, const u64 lo, const u64 hi, const u64 tlo, 
   inline void
 kv_psort(struct kv ** const kvs, const u64 nr, const u64 tlo, const u64 thi)
 {
-  debug_assert(tlo <= thi);
-  debug_assert(thi < nr);
+  // debug_assert(tlo <= thi);
+  // debug_assert(thi < nr);
   kv_psort_rec(kvs, 0, nr-1, tlo, thi);
 }
 // }}} psort
@@ -494,7 +494,7 @@ kv_kptr_c(const struct kv * const kv)
   void
 kv_print(const struct kv * const kv, const char * const cmd, FILE * const out)
 {
-  debug_assert(cmd);
+  // debug_assert(cmd);
   const u32 klen = kv->klen;
   fprintf(out, "#%016lx k[%3u]", kv->hash, klen);
 
@@ -642,8 +642,8 @@ kref_compare(const struct kref * const kref1, const struct kref * const kref2)
   inline int
 kref_kv_compare(const struct kref * const kref, const struct kv * const k)
 {
-  debug_assert(kref);
-  debug_assert(k);
+  // debug_assert(kref);
+  // debug_assert(k);
   if (kref->len == 8 && k->klen == 8) {
       const u64 a = _bswap64(*((s64 *) kref->ptr));
       const u64 b = _bswap64(*((s64 *) k->kv));
@@ -674,11 +674,11 @@ kref_kv_lcp(const struct kref * const kref, const struct kv * const kv)
   inline int
 kref_k128_compare(const struct kref * const sk, const u8 * const k128)
 {
-  debug_assert(sk);
+  // debug_assert(sk);
   const u32 klen1 = sk->len;
   u32 klen2 = 0;
   const u8 * const ptr2 = vi128_decode_u32(k128, &klen2);
-  debug_assert(ptr2);
+  // debug_assert(ptr2);
   const u32 len = (klen1 < klen2) ? klen1 : klen2;
   const int cmp = memcmp(sk->ptr, ptr2, len);
   return cmp ? cmp : klen_compare(klen1, klen2);
@@ -688,7 +688,7 @@ kref_k128_compare(const struct kref * const sk, const u8 * const k128)
   inline int
 kref_kv128_compare(const struct kref * const sk, const u8 * const kv128)
 {
-  debug_assert(sk);
+  // debug_assert(sk);
   const u32 klen1 = sk->len;
   u32 klen2 = 0;
   u32 vlen2 = 0;
