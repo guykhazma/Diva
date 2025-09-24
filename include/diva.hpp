@@ -172,6 +172,40 @@ public:
       }
     };
 
+    class Iterator {
+      friend class Diva<int_optimized, payload_type>;
+      friend class DivaTests;
+
+      using KeyType = std::conditional_t<int_optimized, uint64_t, std::string>;
+
+     public:
+      Iterator(const Iterator& other);
+      Iterator& operator=(const Iterator& other);
+      std::pair<KeyType, uint32_t> operator*() const;
+      Iterator& operator++();
+      Iterator operator++(int);
+      bool operator==(const Iterator& rhs) const;
+      bool operator!=(const Iterator& rhs) const;
+
+      void GetPayload(uint64_t *out) const;
+      bool IsValid() const;
+
+      ~Iterator();
+
+     private:
+      Diva<int_optimized, payload_type> *filter_;
+      InfiniteByteString start_, next_to_fetch_;
+      std::vector<InfiniteByteString> keys_;
+      std::vector<uint64_t> bit_counts_, payloads_;
+      uint32_t ind_ = 0;
+
+      Iterator(Diva<int_optimized, payload_type> *parent, std::string_view start);
+      Iterator(Diva<int_optimized, payload_type> *parent, const uint8_t *start, uint32_t start_len);
+      Iterator(Diva<int_optimized, payload_type> *parent, uint64_t start);
+
+      void Fetch();
+    };
+
 private:
     static constexpr uint32_t infix_store_target_size = 1024;
     static_assert(infix_store_target_size % 64 == 0);
@@ -262,40 +296,6 @@ private:
             else 
                 status &= ~(1U << 31);
         }
-    };
-
-    class Iterator {
-        friend class Diva<int_optimized, payload_type>;
-        friend class DivaTests;
-
-        using KeyType = std::conditional_t<int_optimized, uint64_t, std::string>;
-
-    public:
-        Iterator(const Iterator& other);
-        Iterator& operator=(const Iterator& other);
-        std::pair<KeyType, uint32_t> operator*() const;
-        Iterator& operator++();
-        Iterator operator++(int);
-        bool operator==(const Iterator& rhs) const;
-        bool operator!=(const Iterator& rhs) const;
-
-        void GetPayload(uint64_t *out) const;
-        bool IsValid() const;
-
-        ~Iterator();
-
-    private:
-        Diva<int_optimized, payload_type> *filter_;
-        InfiniteByteString start_, next_to_fetch_;
-        std::vector<InfiniteByteString> keys_;
-        std::vector<uint64_t> bit_counts_, payloads_;
-        uint32_t ind_ = 0;
-
-        Iterator(Diva<int_optimized, payload_type> *parent, std::string_view start);
-        Iterator(Diva<int_optimized, payload_type> *parent, const uint8_t *start, uint32_t start_len);
-        Iterator(Diva<int_optimized, payload_type> *parent, uint64_t start);
-
-        void Fetch();
     };
 
     uint32_t infix_size_;
