@@ -181,6 +181,7 @@ public:
 
      public:
       Iterator(const Iterator& other);
+      ~Iterator();
       Iterator& operator=(const Iterator& other);
       std::pair<KeyType, uint32_t> operator*() const;
       Iterator& operator++();
@@ -190,8 +191,6 @@ public:
 
       void GetPayload(uint64_t *out) const;
       bool IsValid() const;
-
-      ~Iterator();
 
      private:
       Diva<int_optimized, payload_type> *filter_;
@@ -418,12 +417,13 @@ template <bool int_optimized, PayloadType payload_type>
 inline Diva<int_optimized, payload_type>::Diva(const uint32_t infix_size, const uint32_t rng_seed,
                                                const float load_factor, const uint32_t payload_size,
                                                const bool setup_start_end_samples):
+
+            infix_size_(infix_size),
+            payload_size_(0),
             wh_(nullptr),
             better_tree_(nullptr),
             wh_int_(nullptr),
             better_tree_int_(nullptr),
-            infix_size_(infix_size),
-            payload_size_(0),
             rng_seed_(rng_seed),
             load_factor_(load_factor),
             bulk_load_streaming_ind_(0) {
