@@ -181,6 +181,8 @@ public:
 
      public:
       Iterator(const Iterator& other);
+      // empty constructor
+      Iterator(Diva<int_optimized, payload_type> *parent) {};
       ~Iterator();
       Iterator& operator=(const Iterator& other);
       std::pair<KeyType, uint32_t> operator*() const;
@@ -191,6 +193,9 @@ public:
 
       void GetPayload(uint64_t *out) const;
       bool IsValid() const;
+      bool IsSegmentEnd() const {
+        return ind_ >= keys_.size();
+      }
 
      private:
       Diva<int_optimized, payload_type> *filter_;
