@@ -3717,8 +3717,6 @@ inline Diva<int_optimized, payload_type>::Iterator::Iterator(Diva<int_optimized,
 
 template <bool int_optimized, PayloadType payload_type>
 inline typename Diva<int_optimized, payload_type>::Iterator& Diva<int_optimized, payload_type>::Iterator::operator=(const Iterator &other) {
-    assert(filter_ == other.filter_);
-
     delete[] start_.str;
     delete[] next_to_fetch_.str;
     for (uint32_t i = 0; i < keys_.size(); i++)
@@ -3740,6 +3738,7 @@ inline typename Diva<int_optimized, payload_type>::Iterator& Diva<int_optimized,
     bit_counts_ = other.bit_counts_;
     payloads_ = other.payloads_;
     ind_ = other.ind_;
+    filter_ = other.filter_;
     return *this;
 }
 
