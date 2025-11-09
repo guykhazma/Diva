@@ -3,15 +3,15 @@
  *
  * All rights reserved. No warranty, explicit or implicit, provided.
  */
-#define _GNU_SOURCE
 
 #define BITMASK(nbits)                                    \
   ((nbits) == 64 ? 0xffffffffffffffff : ((1ull << nbits) - 1))
 
 // headers {{{
+#define _GNU_SOURCE
+#include "lib.h"
 #include <assert.h> // static_assert
 #include "kv.h"
-#include "lib.h"
 #include "ctypes.h"
 #include "wh_int.h"
 #include <x86intrin.h>
