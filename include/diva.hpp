@@ -115,6 +115,7 @@ public:
     void BulkLoadStreaming(std::string_view key, const uint64_t *payload=nullptr);
     void BulkLoadStreaming(const uint8_t *key, const uint32_t key_len, const uint64_t *payload=nullptr);
     void BulkLoadStreamingFinish();
+    uint64_t GetNumKeys() const;
 
     struct InfiniteByteString {
       const uint8_t *str;
@@ -341,6 +342,7 @@ private:
     const uint32_t size_scalar_shrink_grow_sep = std::log(infix_store_target_size / 64) / std::log(1 / load_factor_) + 1;
     uint64_t size_scalars_[size_scalar_count], scaled_sizes_[size_scalar_count], exception_scaled_size_;
     uint64_t implicit_scalars_[infix_store_target_size / 2 + 1];
+    std::atomic<uint64_t> n_keys_ = 0;
 
     uint32_t bulk_load_streaming_ind_, bulk_load_streaming_max_len_;
     InfiniteByteString bulk_load_left_key_, bulk_load_key_list_[infix_store_target_size];
@@ -945,6 +947,7 @@ inline void Diva<int_optimized, payload_type>::Insert(const uint8_t *key, const 
         InsertSplit(converted_key, payload);
     else 
         InsertSimple(converted_key, payload);
+    n_keys_.fetch_add(1, std::memory_order_release);
 }
 
 template <bool int_optimized, PayloadType payload_type>
@@ -1706,7 +1709,8 @@ inline uint64_t Diva<int_optimized, payload_type>::Size() const {
                  + sizeof(scale_implicit_shift) + sizeof(size_scalar_count)
                  + sizeof(size_scalar_shrink_grow_sep) + sizeof(load_factor_)
                  + sizeof(load_factor_alt_) + sizeof(infix_size_) 
-                 + sizeof(rng_seed_) + sizeof(InfixStore::size_grade_bit_count)
+                 + sizeof(rng_seed_) + sizeof(n_keys_) 
+                 + sizeof(InfixStore::size_grade_bit_count)
                  + sizeof(InfixStore::elem_count_bit_count);
 
     if constexpr (payload_type == PayloadType::FixedLength)
@@ -1863,6 +1867,10 @@ inline uint32_t Diva<int_optimized, payload_type>::SerializeMetadata(char *out) 
 
     memcpy(out + res, &rng_seed_, sizeof(rng_seed_));
     res += sizeof(rng_seed_);
+
+    const uint64_t n_keys_val = n_keys_.load(std::memory_order_acquire);
+    memcpy(out + res, &n_keys_val, sizeof(n_keys_val));
+    res += sizeof(n_keys_val);
 
     // Infix Store Metadata
     memcpy(out + res, &InfixStore::size_grade_bit_count, sizeof(InfixStore::size_grade_bit_count));
@@ -2028,6 +2036,11 @@ inline uint32_t Diva<int_optimized, payload_type>::DeserializeMetadata(const cha
     res += sizeof(rng_seed_);
     rng_.seed(rng_seed_);
 
+    uint64_t n_keys_val;
+    memcpy(&n_keys_val, deser_buf + res, sizeof(rng_seed_));
+    res += sizeof(n_keys_val);
+    n_keys_.store(n_keys_val, std::memory_order_release);
+
     // Infix Store Metadata
     memcpy(&buf32, deser_buf + res, sizeof(InfixStore::size_grade_bit_count));
     assert(buf32 == InfixStore::size_grade_bit_count && "Mismatched Diva version");
@@ -2160,6 +2173,7 @@ inline void Diva<int_optimized, payload_type>::Delete(const uint8_t *input_key, 
 
     DeleteRawFromInfixStore(infix_store, deletee, total_implicit, should_remove);
     rwlock_unlock_write(infix_store.rwlock);
+    n_keys_.fetch_sub(1, std::memory_order_release);
 }
 
 
@@ -2339,6 +2353,7 @@ inline void Diva<int_optimized, payload_type>::DeleteMerge(InfiniteByteString ke
 #endif // DEBUG
     */
     UnlockLeaves(leaves_to_unlock, it_write_lock);
+    n_keys_.fetch_sub(1, std::memory_order_release);
 }
 
 template <bool int_optimized, PayloadType payload_type>
@@ -2485,6 +2500,7 @@ inline void Diva<int_optimized, payload_type>::BulkLoadFixedLength(const t_itr b
                 }
                 ++last_key_it;
             }
+            n_keys_.fetch_add(infix_store_target_size, std::memory_order_release);
             /*
 #ifdef DEBUG
             {
@@ -2537,6 +2553,7 @@ inline void Diva<int_optimized, payload_type>::BulkLoadFixedLength(const t_itr b
         const uint32_t total_implicit = next_implicit - prev_implicit + 1;
         int32_t i = 0;
         ++last_key_it;
+        n_keys_.fetch_add(1, std::memory_order_release);
         uint32_t last_key_pos = 0;
         if constexpr (payload_type == PayloadType::FixedLength)
             last_key_pos = std::distance(begin, last_key_it);
@@ -2556,6 +2573,7 @@ inline void Diva<int_optimized, payload_type>::BulkLoadFixedLength(const t_itr b
             }
             i++;
             ++last_key_it;
+            n_keys_.fetch_add(1, std::memory_order_release);
         }
         /*
 #ifdef DEBUG
@@ -2641,6 +2659,7 @@ inline void Diva<int_optimized, payload_type>::BulkLoad(const t_itr begin, const
                 }
                 ++last_key_it;
             }
+            n_keys_.fetch_add(infix_store_target_size, std::memory_order_release);
             /*
 #ifdef DEBUG
             {
@@ -2724,6 +2743,7 @@ inline void Diva<int_optimized, payload_type>::BulkLoad(const t_itr begin, const
         const uint32_t total_implicit = next_implicit - prev_implicit + 1;
         int32_t i = 0;
         ++last_key_it;
+        n_keys_.fetch_add(1, std::memory_order_release);
         uint32_t last_key_pos = 0;
         if constexpr (payload_type == PayloadType::FixedLength)
             last_key_pos = std::distance(begin, last_key_it);
@@ -2739,6 +2759,7 @@ inline void Diva<int_optimized, payload_type>::BulkLoad(const t_itr begin, const
             }
             i++;
             ++last_key_it;
+            n_keys_.fetch_add(1, std::memory_order_release);
         }
         /*
 #ifdef DEBUG
@@ -2842,6 +2863,8 @@ inline void Diva<int_optimized, payload_type>::BulkLoadStreaming(const uint8_t *
     if constexpr (payload_type == PayloadType::FixedLength)
         copy_bitmap_to_bitmap(payload, 0, bulk_load_left_payload_, 0, payload_size_);
     bulk_load_streaming_ind_ = 0;
+
+    n_keys_.fetch_add(infix_store_target_size, std::memory_order_release);
 }
 
 
@@ -2886,6 +2909,8 @@ inline void Diva<int_optimized, payload_type>::BulkLoadStreamingFinish() {
                               bulk_load_right_payload_, 0, payload_size_);
         AddTreeKey(bulk_load_right_key.str, bulk_load_right_key.length, bulk_load_right_payload_);
         delete[] bulk_load_right_key.str;
+
+        n_keys_.fetch_add(bulk_load_streaming_ind_ + 1, std::memory_order_release);
     }
 
     delete[] bulk_load_left_key_.str;
@@ -2897,6 +2922,12 @@ inline void Diva<int_optimized, payload_type>::BulkLoadStreamingFinish() {
     }
     delete[] bulk_load_left_payload_;
     delete[] bulk_load_payload_list_;
+}
+
+
+template <bool int_optimized, PayloadType payload_type>
+inline uint64_t Diva<int_optimized, payload_type>::GetNumKeys() const {
+    return n_keys_.load(std::memory_order_acquire);
 }
 
 
@@ -4471,6 +4502,7 @@ inline void Diva<int_optimized, payload_type>::Iterator::FetchDelete() {
         }
         for (int32_t i = deletees.size() - 1; i >= 0; i--)
             filter_->DeleteRawFromInfixStore(infix_store, deletees[i], total_implicit, should_remove_);
+        filter_->n_keys_.fetch_sub(deletees.size(), std::memory_order_release);
 
         implicit_part = filter_->NextOccupied(infix_store, implicit_part);
     }
