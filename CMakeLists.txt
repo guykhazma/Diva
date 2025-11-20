@@ -73,6 +73,6 @@ if (BUILD_BENCHMARKS)
         execute_process(COMMAND bash -c "cd ../bench/scripts && bash build_wiredtiger.sh")
     endif()
 
-    message(STATUS "Building benchmarks")
-    add_subdirectory(bench)
+    #message(STATUS "Building benchmarks")
+    #add_subdirectory(bench)
 endif ()

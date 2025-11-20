@@ -13,7 +13,7 @@ FetchContent_MakeAvailable(argparse)
 set(CMAKE_CXX_STANDARD 17)
 
 list(APPEND SUCCINCT_LIBS "sux" "sdsl-lite")
-list(APPEND Targets "diva" "diva_int" "memento" "memento_expandable" "grafite" "surf" "rosetta" "proteus" "rencoder" "snarf" "oasis")
+list(APPEND Targets "diva" "diva_int")
 list(APPEND WiredTigerTargets "diva" "diva_int" "memento_expandable" "base")
 list(APPEND x86Targets "diva" "diva_int" "memento" "memento_expandable" "surf" "rosetta" "proteus" "rencoder" "oasis")
 
