@@ -296,7 +296,7 @@ private:
         InfixStore() = default;
         InfixStore(const InfixStore &other):
                     status(other.status),
-                    num_sample_payloads(num_sample_payloads),
+                    num_sample_payloads(other.num_sample_payloads),
                     rwlock(0),
                     ptr(other.ptr) { 
             rwlock.store(0, std::memory_order::memory_order_release);
@@ -450,9 +450,9 @@ private:
     void MovePayloadsLeft(const InfixStore &store, const uint32_t l, const uint32_t r, const uint32_t shamt);
 
     // Works with the inclusive-exclusive range [`l`, `r`).
-    void ZeroOutSlots(const InfixStore &store, const uint32_t l, const uint32_t r, const uint32_t shamt);
+    void ZeroOutSlots(const InfixStore &store, const uint32_t l, const uint32_t r);
     // Works with the inclusive-exclusive range [`l`, `r`).
-    void ZeroOutPayloads(const InfixStore &store, const uint32_t l, const uint32_t r, const uint32_t shamt);
+    void ZeroOutPayloads(const InfixStore &store, const uint32_t l, const uint32_t r);
 
 
     int32_t FindEmptySlotAfter(const InfixStore &store, const uint32_t runend_pos) const;
@@ -1060,6 +1060,7 @@ inline void Diva<int_optimized, payload_type>::InsertSimple(const InfiniteByteSt
         // Add new sample payload
         AddSamplePayload(infix_store, payload);
         rwlock_unlock_write(infix_store.rwlock);
+        n_keys_.fetch_add(1, std::memory_order_release);
         return;
     }
 
@@ -1288,6 +1289,7 @@ inline void Diva<int_optimized, payload_type>::InsertSplit(const InfiniteByteStr
         AddSamplePayload(infix_store, payload);
         rwlock_unlock_write(infix_store.rwlock);
         UnlockLeaves(leaves_to_unlock, it_write_lock);
+        n_keys_.fetch_add(1, std::memory_order_release);
         return;
     }
 
@@ -1495,7 +1497,7 @@ inline void Diva<int_optimized, payload_type>::InsertSplit(const InfiniteByteStr
     }
     delete[] ptr_to_free;
 
-    n_keys_.fetch_add(left_list_len + right_list_len - infix_count, std::memory_order_release);
+    n_keys_.fetch_add(left_list_len + right_list_len - infix_count + 1, std::memory_order_release);
 }
 
 
@@ -2178,23 +2180,26 @@ inline void Diva<int_optimized, payload_type>::Delete(const uint8_t *input_key, 
     if (prev_key == key) {
         if constexpr (payload_type == PayloadType::FixedLength) {
             uint64_t payload[(payload_size_ + 63) / 64 + 1];
+            bool removed = false;
             for (uint32_t i = 0; i < infix_store.num_sample_payloads; i++) {
                 GetSamplePayload(infix_store, i, payload);
                 if (should_remove(payload)) {
                     RemoveSamplePayload(infix_store, i);
+                    removed = true;
                     break;
                 }
             }
-            if (infix_store.num_sample_payloads == 0) {
+            if (removed || infix_store.num_sample_payloads == 0) {
                 rwlock_unlock_write(infix_store.rwlock);
-                UnlockLeaves(leaves_to_unlock, it_write_lock);
-                DeleteMerge(key);
+                if (infix_store.num_sample_payloads == 0)
+                    DeleteMerge(key);
+                else 
+                    n_keys_.fetch_sub(1, std::memory_order_release);
                 return;
             }
         }
         else {
             rwlock_unlock_write(infix_store.rwlock);
-            UnlockLeaves(leaves_to_unlock, it_write_lock);
             DeleteMerge(key);
             return;
         }
@@ -3354,8 +3359,7 @@ inline void Diva<int_optimized, payload_type>::MovePayloadsLeft(const InfixStore
 
 template <bool int_optimized, PayloadType payload_type>
 //__attribute__((always_inline))
-inline void Diva<int_optimized, payload_type>::ZeroOutSlots(const InfixStore &store, const uint32_t l, const uint32_t r,
-                                                            const uint32_t shamt) {
+inline void Diva<int_optimized, payload_type>::ZeroOutSlots(const InfixStore &store, const uint32_t l, const uint32_t r) {
     const uint32_t size_grade = store.GetSizeGrade();
     const uint32_t l_bit_pos = 128 + infix_store_target_size + scaled_sizes_[size_grade] + l * infix_size_;
     const uint32_t r_bit_pos = 128 + infix_store_target_size + scaled_sizes_[size_grade] + r * infix_size_ - 1;
@@ -3365,8 +3369,7 @@ inline void Diva<int_optimized, payload_type>::ZeroOutSlots(const InfixStore &st
 
 template <bool int_optimized, PayloadType payload_type>
 //__attribute__((always_inline))
-inline void Diva<int_optimized, payload_type>::ZeroOutPayloads(const InfixStore &store, const uint32_t l, const uint32_t r,
-                                                               const uint32_t shamt) {
+inline void Diva<int_optimized, payload_type>::ZeroOutPayloads(const InfixStore &store, const uint32_t l, const uint32_t r) {
     const uint32_t size_grade = store.GetSizeGrade();
     const uint32_t l_bit_pos = 128 + infix_store_target_size + scaled_sizes_[size_grade] * (infix_size_ + 1) + payload_size_ * l;
     const uint32_t r_bit_pos = 128 + infix_store_target_size + scaled_sizes_[size_grade] * (infix_size_ + 1) + payload_size_ * r - 1;
@@ -3900,9 +3903,9 @@ Diva<int_optimized, payload_type>::DeleteRawRangeFromInfixStore(InfixStore &stor
                 assert(shamt >= 0);
                 assert(0 <= last_removed + 1 - shamt);
 #endif // DEBUG
-                ShiftSlotsLeft(store, last_removed + 1, current_pos, shamt);
+                MoveSlotsLeft(store, last_removed + 1, current_pos, shamt);
                 if constexpr (payload_type == PayloadType::FixedLength)
-                    ShiftPayloadsLeft(store, last_removed + 1, current_pos, shamt);
+                    MovePayloadsLeft(store, last_removed + 1, current_pos, shamt);
                 last_written_pos += shift_length;
                 last_removed = current_pos;
             }
@@ -3923,10 +3926,16 @@ Diva<int_optimized, payload_type>::DeleteRawRangeFromInfixStore(InfixStore &stor
             assert(0 <= last_removed + 1 - shamt);
             assert(current_pos <= scaled_sizes_[size_grade]);
 #endif // DEBUG
-            ShiftSlotsLeft(store, last_removed + 1, current_pos, shamt);
+            MoveSlotsLeft(store, last_removed + 1, current_pos, shamt);
             if constexpr (payload_type == PayloadType::FixedLength)
-                ShiftPayloadsLeft(store, last_removed + 1, current_pos, shamt);
+                MovePayloadsLeft(store, last_removed + 1, current_pos, shamt);
             last_written_pos += shift_length;
+
+            if (last_written_pos + 1 < current_pos) {
+                ZeroOutSlots(store, last_written_pos + 1, current_pos);
+                if constexpr (payload_type == PayloadType::FixedLength)
+                    ZeroOutPayloads(store, last_written_pos + 1, current_pos);
+            }
 
 #ifdef DEBUG
             assert(last_written_pos == r[candidate_run_ind] - 1);
@@ -4091,17 +4100,23 @@ Diva<int_optimized, payload_type>::DeleteRawRangeFromInfixStore(InfixStore &stor
 #ifdef DEBUG
                     assert(orig_l[j] + length + shamt <= scaled_sizes_[size_grade]);
 #endif // DEBUG
-                    ShiftSlotsRight(store, orig_l[j], orig_l[j] + length, shamt);
-                    if constexpr (payload_type == PayloadType::FixedLength)
-                        ShiftPayloadsRight(store, orig_l[j], orig_l[j] + length, shamt);
+                    MoveSlotsRight(store, orig_l[j], orig_l[j] + length, shamt);
+                    ZeroOutSlots(store, orig_l[j], std::min(orig_l[j] + length, orig_l[j] + shamt));
+                    if constexpr (payload_type == PayloadType::FixedLength) {
+                        MovePayloadsRight(store, orig_l[j], orig_l[j] + length, shamt);
+                        ZeroOutPayloads(store, orig_l[j], std::min(orig_l[j] + length, orig_l[j] + shamt));
+                    }
                 }
                 else if (shamt < 0) {
 #ifdef DEBUG
                     assert(orig_l[j] + length <= scaled_sizes_[size_grade]);
 #endif // DEBUG
-                    ShiftSlotsLeft(store, orig_l[j], orig_l[j] + length, -shamt);
-                    if constexpr (payload_type == PayloadType::FixedLength)
-                        ShiftPayloadsLeft(store, orig_l[j], orig_l[j] + length, -shamt);
+                    MoveSlotsLeft(store, orig_l[j], orig_l[j] + length, -shamt);
+                    ZeroOutSlots(store, std::max(orig_l[j], orig_l[j] + length - shamt), orig_l[j] + length);
+                    if constexpr (payload_type == PayloadType::FixedLength) {
+                        MovePayloadsLeft(store, orig_l[j], orig_l[j] + length, -shamt);
+                        ZeroOutPayloads(store, std::max(orig_l[j], orig_l[j] + length - shamt), orig_l[j] + length);
+                    }
                 }
             }
             shift_stack_bottom = i;
@@ -4120,17 +4135,23 @@ Diva<int_optimized, payload_type>::DeleteRawRangeFromInfixStore(InfixStore &stor
 #ifdef DEBUG
                 assert(orig_l[j] + length + shamt <= scaled_sizes_[size_grade]);
 #endif // DEBUG
-                ShiftSlotsRight(store, orig_l[j], orig_l[j] + length, shamt);
-                if constexpr (payload_type == PayloadType::FixedLength)
-                    ShiftPayloadsRight(store, orig_l[j], orig_l[j] + length, shamt);
+                MoveSlotsRight(store, orig_l[j], orig_l[j] + length, shamt);
+                ZeroOutSlots(store, orig_l[j], std::min(orig_l[j] + length, orig_l[j] + shamt));
+                if constexpr (payload_type == PayloadType::FixedLength) {
+                    MovePayloadsRight(store, orig_l[j], orig_l[j] + length, shamt);
+                    ZeroOutPayloads(store, orig_l[j], std::min(orig_l[j] + length, orig_l[j] + shamt));
+                }
             }
             else if (shamt < 0) {
 #ifdef DEBUG
                 assert(orig_l[j] + length <= scaled_sizes_[size_grade]);
 #endif // DEBUG
-                ShiftSlotsLeft(store, orig_l[j], orig_l[j] + length, -shamt);
-                if constexpr (payload_type == PayloadType::FixedLength)
-                    ShiftPayloadsLeft(store, orig_l[j], orig_l[j] + length, -shamt);
+                MoveSlotsLeft(store, orig_l[j], orig_l[j] + length, -shamt);
+                ZeroOutSlots(store, std::max(orig_l[j], orig_l[j] + length - shamt), orig_l[j] + length);
+                if constexpr (payload_type == PayloadType::FixedLength) {
+                    MovePayloadsLeft(store, orig_l[j], orig_l[j] + length, -shamt);
+                    ZeroOutPayloads(store, std::max(orig_l[j], orig_l[j] + length - shamt), orig_l[j] + length);
+                }
             }
         }
     }
