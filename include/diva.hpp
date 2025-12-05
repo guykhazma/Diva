@@ -275,13 +275,13 @@ private:
     static constexpr uint32_t heap_alloc_threshold = 20000U;
     static constexpr uint64_t max_exp_backoff = BITMASK(14);
 
-    struct InfixStore {
+    struct __attribute__((packed)) InfixStore {
         static const uint32_t size_grade_bit_count = 8;
         static const uint32_t elem_count_bit_count = 20;
 
         uint32_t status = 0;
         uint16_t num_sample_payloads = 0;
-        std::atomic<lock_t> rwlock {0};
+        alignas(alignof(std::atomic<lock_t>)) std::atomic<lock_t> rwlock{0};
         uint64_t *ptr = nullptr;
 
         InfixStore(const uint32_t slot_count, const uint32_t slot_size,
