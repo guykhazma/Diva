@@ -13,7 +13,6 @@
 #include <iostream>
 #include <iterator>
 #include <limits>
-#include <malloc.h>
 #include <random>
 #include <string_view>
 #include <tuple>
@@ -1743,7 +1742,7 @@ inline uint64_t Diva<int_optimized, payload_type>::Size() const {
             res += sizeof(store->status);
             if constexpr (payload_type == PayloadType::FixedLength) {
                 res += sizeof(store->num_sample_payloads);
-                res += ((store->num_sample_payloads * payload_size_ + 63) / 64) * sizeof(uint64_t);
+                res += (store->num_sample_payloads * payload_size_ + 7) / 8;
             }
             if (store->ptr != nullptr) {
                 const uint64_t word_count = store->GetPtrWordCount(scaled_sizes_[store->GetSizeGrade()], infix_size_, payload_size_);
@@ -1772,7 +1771,7 @@ inline uint64_t Diva<int_optimized, payload_type>::Size() const {
             res += sizeof(store->status); // + sizeof(store->ptr);
             if constexpr (payload_type == PayloadType::FixedLength) {
                 res += sizeof(store->num_sample_payloads);
-                res += ((store->num_sample_payloads * payload_size_ + 63) / 64) * sizeof(uint64_t);
+                res += (store->num_sample_payloads * payload_size_ + 7) / 8;
             }
             if (store->ptr != nullptr) {
                 const uint64_t word_count = store->GetPtrWordCount(scaled_sizes_[store->GetSizeGrade()], infix_size_, payload_size_);
@@ -1947,7 +1946,7 @@ inline Diva<int_optimized, payload_type>::~Diva() {
             wh_int_iter_peek_ref(&it_int, reinterpret_cast<const void **>(&tree_key), &tree_key_len, 
                                           reinterpret_cast<void **>(&store), &dummy);
             if constexpr (payload_type == PayloadType::FixedLength)
-                delete[] reinterpret_cast<uint64_t *>(store->ptr[1]);
+                free(reinterpret_cast<void *>(store->ptr[1]));
             delete[] store->ptr;
         }
         if (it_int.leaf)
@@ -1964,7 +1963,7 @@ inline Diva<int_optimized, payload_type>::~Diva() {
             wh_iter_peek_ref(&it, reinterpret_cast<const void **>(&tree_key), &tree_key_len, 
                                   reinterpret_cast<void **>(&store), &dummy);
             if constexpr (payload_type == PayloadType::FixedLength)
-                delete[] reinterpret_cast<uint64_t *>(store->ptr[1]);
+                free(reinterpret_cast<void *>(store->ptr[1]));
             delete[] store->ptr;
         }
         if (it.leaf)
@@ -2114,12 +2113,9 @@ inline uint32_t Diva<int_optimized, payload_type>::DeserializeInfixStore(const c
     if constexpr (payload_type == PayloadType::FixedLength) {
         if (store.num_sample_payloads > 0) {
             const uint32_t sample_payload_byte_count = (store.num_sample_payloads * payload_size_ + 7) / 8;
-            const uint32_t sample_payload_word_count = (store.num_sample_payloads * payload_size_ + 63) / 64;
-            uint64_t *sample_payloads = new uint64_t[sample_payload_word_count];
+            uint8_t *sample_payloads = reinterpret_cast<uint8_t *>(malloc(sample_payload_byte_count));
             store.ptr[1] = reinterpret_cast<uint64_t>(sample_payloads);
             memcpy(sample_payloads, deser_buf + offset, sample_payload_byte_count);
-            memset(sample_payloads + sample_payload_byte_count, 0,
-                   sizeof(uint64_t) * sample_payload_word_count - sample_payload_byte_count);
             offset += sample_payload_byte_count;
         }
     }
@@ -2268,6 +2264,7 @@ inline bool Diva<int_optimized, payload_type>::CompareInfixes(uint64_t a, uint64
 }
 
 
+static uint32_t delete_merge_cnt = 0;
 template <bool int_optimized, PayloadType payload_type>
 inline void Diva<int_optimized, payload_type>::DeleteMerge(InfiniteByteString key) {
     const bool it_write_lock = true;
@@ -2415,7 +2412,7 @@ inline void Diva<int_optimized, payload_type>::DeleteMerge(InfiniteByteString ke
     store_l->ptr = store.ptr;
     store_l->rwlock.store(store.rwlock.load(std::memory_order_acquire), std::memory_order_release);
     delete[] old_store_l_ptr;
-    delete[] reinterpret_cast<uint64_t *>(store_r->ptr[1]);
+    free(reinterpret_cast<void *>(store_r->ptr[1]));
     delete[] store_r->ptr;
     if (should_allocate_on_heap) {
         delete[] infix_list;
@@ -3224,19 +3221,13 @@ inline void Diva<int_optimized, payload_type>::AddSamplePayload(InfixStore &stor
                                                                 const uint32_t payload_offset) {
     uint64_t *payload_list = reinterpret_cast<uint64_t *>(store.ptr[1]);
     if (store.num_sample_payloads == 0) {
-        const uint32_t allocation_word_count = (payload_size_ + 63) / 64;
-        payload_list = new uint64_t[allocation_word_count];
-        memset(payload_list, 0, sizeof(uint64_t) * allocation_word_count);
+        const uint32_t malloc_size = (payload_size_ / 64 + 1) * 8;
+        payload_list = reinterpret_cast<uint64_t *>(malloc(malloc_size));
+        memset(payload_list, 0, malloc_size);
     }
     else {
-        const uint32_t old_allocation_word_count = (store.num_sample_payloads * payload_size_ + 63) / 64;
-        const uint32_t new_allocation_word_count = ((store.num_sample_payloads + 1) * payload_size_ + 63) / 64;
-        uint64_t *new_payload_list = new uint64_t[new_allocation_word_count];
-        memcpy(new_payload_list, payload_list, sizeof(uint64_t) * old_allocation_word_count);
-        memset(new_payload_list + old_allocation_word_count, 0,
-               sizeof(uint64_t) * (new_allocation_word_count - old_allocation_word_count));
-        delete[] payload_list;
-        payload_list = new_payload_list;
+        payload_list = reinterpret_cast<uint64_t *>(realloc(payload_list,
+                                                            ((store.num_sample_payloads + 1) * payload_size_ / 64 + 1) * 8));
     }
     const uint32_t bit_pos = store.num_sample_payloads * payload_size_;
     copy_bitmap_to_bitmap(reinterpret_cast<const uint64_t *>(payload), payload_offset,
@@ -3251,18 +3242,15 @@ template <bool int_optimized, PayloadType payload_type>
 inline void Diva<int_optimized, payload_type>::RemoveSamplePayload(InfixStore &store, const uint32_t pos) {
     uint64_t *payload_list = reinterpret_cast<uint64_t *>(store.ptr[1]);
     if (store.num_sample_payloads == 1) {
-        delete[] payload_list;
+        free(payload_list);
         payload_list = nullptr;
     }
     else {
         const uint32_t l = (pos + 1) * payload_size_;
         const uint32_t r = store.num_sample_payloads * payload_size_ - 1;
         shift_bitmap_left_unaligned(payload_list, l, r, payload_size_);
-        const uint32_t new_allocation_word_count = ((store.num_sample_payloads - 1) * payload_size_ + 63) / 64;
-        uint64_t *new_payload_list = new uint64_t[new_allocation_word_count];
-        memcpy(new_payload_list, payload_list, sizeof(uint64_t) * new_allocation_word_count);
-        delete[] payload_list;
-        payload_list = new_payload_list;
+        payload_list = reinterpret_cast<uint64_t *>(realloc(payload_list,
+                                                            ((store.num_sample_payloads - 1) * payload_size_ + 7) / 8));
     }
     store.num_sample_payloads--;
     store.ptr[1] = reinterpret_cast<uint64_t>(payload_list);
@@ -4413,7 +4401,6 @@ inline void Diva<int_optimized, payload_type>::ResizeInfixStore(InfixStore &stor
     delete[] store.ptr;
 
     // Update `size_grade`
-    const uint32_t old_size_grade = size_grade;
     if (infix_count >= (size_grade ? scaled_sizes_[size_grade - 1] : exception_scaled_size_))
         size_grade++;
     else {
@@ -4437,7 +4424,6 @@ inline void Diva<int_optimized, payload_type>::ResizeInfixStore(InfixStore &stor
         if constexpr (payload_type == PayloadType::FixedLength)
             delete[] payload_list;
     }
-    //malloc_trim(0);
 }
 
 
