@@ -2249,8 +2249,15 @@ inline void Diva<int_optimized, payload_type>::DeleteRange(const uint8_t *input_
     auto it = GetIterator(input_l, input_l_len, input_r, input_r_len,
                           should_remove ? should_remove 
                                         : [](const uint64_t *payload) { return true; });
-    while (it.IsValid())
-        it++;
+    uint64_t i = 0;
+    while (it.IsValid()) {
+      it++;
+      i++;
+      // trigger malloc trim
+      if (i % 100000 == 0) {
+        malloc_trim(0);
+      }
+    }
 }
 
 
