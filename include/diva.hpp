@@ -1742,7 +1742,7 @@ inline uint64_t Diva<int_optimized, payload_type>::Size() const {
             res += sizeof(store->status);
             if constexpr (payload_type == PayloadType::FixedLength) {
                 res += sizeof(store->num_sample_payloads);
-                res += (store->num_sample_payloads * payload_size_ + 7) / 8;
+                res += ((store->num_sample_payloads * payload_size_ + 63) / 64) * sizeof(uint64_t);
             }
             if (store->ptr != nullptr) {
                 const uint64_t word_count = store->GetPtrWordCount(scaled_sizes_[store->GetSizeGrade()], infix_size_, payload_size_);
@@ -1771,7 +1771,7 @@ inline uint64_t Diva<int_optimized, payload_type>::Size() const {
             res += sizeof(store->status); // + sizeof(store->ptr);
             if constexpr (payload_type == PayloadType::FixedLength) {
                 res += sizeof(store->num_sample_payloads);
-                res += (store->num_sample_payloads * payload_size_ + 7) / 8;
+                res += ((store->num_sample_payloads * payload_size_ + 63) / 64) * sizeof(uint64_t);
             }
             if (store->ptr != nullptr) {
                 const uint64_t word_count = store->GetPtrWordCount(scaled_sizes_[store->GetSizeGrade()], infix_size_, payload_size_);
@@ -2113,9 +2113,12 @@ inline uint32_t Diva<int_optimized, payload_type>::DeserializeInfixStore(const c
     if constexpr (payload_type == PayloadType::FixedLength) {
         if (store.num_sample_payloads > 0) {
             const uint32_t sample_payload_byte_count = (store.num_sample_payloads * payload_size_ + 7) / 8;
-            uint8_t *sample_payloads = reinterpret_cast<uint8_t *>(malloc(sample_payload_byte_count));
+            const uint32_t sample_payload_word_count = (store.num_sample_payloads * payload_size_ + 63) / 64;
+            uint8_t *sample_payloads = reinterpret_cast<uint8_t *>(malloc(sample_payload_word_count * sizeof(uint64_t)));
             store.ptr[1] = reinterpret_cast<uint64_t>(sample_payloads);
             memcpy(sample_payloads, deser_buf + offset, sample_payload_byte_count);
+            memset(sample_payloads + sample_payload_byte_count, 0,
+                   sample_payload_word_count * sizeof(uint64_t) - sample_payload_byte_count);
             offset += sample_payload_byte_count;
         }
     }
@@ -2271,7 +2274,6 @@ inline bool Diva<int_optimized, payload_type>::CompareInfixes(uint64_t a, uint64
 }
 
 
-static uint32_t delete_merge_cnt = 0;
 template <bool int_optimized, PayloadType payload_type>
 inline void Diva<int_optimized, payload_type>::DeleteMerge(InfiniteByteString key) {
     const bool it_write_lock = true;
@@ -3228,13 +3230,13 @@ inline void Diva<int_optimized, payload_type>::AddSamplePayload(InfixStore &stor
                                                                 const uint32_t payload_offset) {
     uint64_t *payload_list = reinterpret_cast<uint64_t *>(store.ptr[1]);
     if (store.num_sample_payloads == 0) {
-        const uint32_t malloc_size = (payload_size_ / 64 + 1) * 8;
+        const uint32_t malloc_size = ((payload_size_ + 63) / 64) * sizeof(uint64_t);
         payload_list = reinterpret_cast<uint64_t *>(malloc(malloc_size));
         memset(payload_list, 0, malloc_size);
     }
     else {
         payload_list = reinterpret_cast<uint64_t *>(realloc(payload_list,
-                                                            ((store.num_sample_payloads + 1) * payload_size_ / 64 + 1) * 8));
+                    (((store.num_sample_payloads + 1) * payload_size_ + 63) / 64) * sizeof(uint64_t)));
     }
     const uint32_t bit_pos = store.num_sample_payloads * payload_size_;
     copy_bitmap_to_bitmap(reinterpret_cast<const uint64_t *>(payload), payload_offset,
@@ -3257,7 +3259,7 @@ inline void Diva<int_optimized, payload_type>::RemoveSamplePayload(InfixStore &s
         const uint32_t r = store.num_sample_payloads * payload_size_ - 1;
         shift_bitmap_left_unaligned(payload_list, l, r, payload_size_);
         payload_list = reinterpret_cast<uint64_t *>(realloc(payload_list,
-                                                            ((store.num_sample_payloads - 1) * payload_size_ + 7) / 8));
+                    (((store.num_sample_payloads - 1) * payload_size_ + 63) / 64) * sizeof(uint64_t)));
     }
     store.num_sample_payloads--;
     store.ptr[1] = reinterpret_cast<uint64_t>(payload_list);
