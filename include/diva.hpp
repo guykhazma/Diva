@@ -2257,7 +2257,7 @@ inline void Diva<int_optimized, payload_type>::DeleteRange(const uint8_t *input_
       it++;
       i++;
       // trigger malloc trim
-      if (i % 100000 == 0) {
+      if (i % 1000 == 0) {
         malloc_trim(0);
       }
     }
@@ -4433,6 +4433,7 @@ inline void Diva<int_optimized, payload_type>::ResizeInfixStore(InfixStore &stor
         if constexpr (payload_type == PayloadType::FixedLength)
             delete[] payload_list;
     }
+    malloc_trim(0);
 }
 
 
