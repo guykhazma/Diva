@@ -2257,7 +2257,7 @@ inline void Diva<int_optimized, payload_type>::DeleteRange(const uint8_t *input_
       it++;
       i++;
       // trigger malloc trim
-      if (i % 1000 == 0) {
+      if (i % 10000 == 0) {
         malloc_trim(0);
       }
     }
