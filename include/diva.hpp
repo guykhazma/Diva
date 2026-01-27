@@ -4433,7 +4433,7 @@ inline void Diva<int_optimized, payload_type>::ResizeInfixStore(InfixStore &stor
         if constexpr (payload_type == PayloadType::FixedLength)
             delete[] payload_list;
     }
-    malloc_trim(0);
+    // malloc_trim(0);
 }
 
 
