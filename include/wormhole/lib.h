@@ -242,7 +242,7 @@ xalloc(const size_t align, const size_t size);
 yalloc(const size_t size);
 
   extern void **
-je_malloc_2d(const size_t nr, const size_t size);
+malloc_2d(const size_t nr, const size_t size);
 
   extern void **
 calloc_2d(const size_t nr, const size_t size);

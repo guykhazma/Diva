@@ -395,7 +395,7 @@ wormhole_alloc_akey(const size_t klen)
   if (alloc_fail())
     return NULL;
 #endif
-  return je_malloc(sizeof(struct kv) + klen);
+  return malloc(sizeof(struct kv) + klen);
 }
 
   static inline void
@@ -411,7 +411,7 @@ wormhole_alloc_mkey(const size_t klen)
   if (alloc_fail())
     return NULL;
 #endif
-  return je_malloc(sizeof(struct kv) + klen);
+  return malloc(sizeof(struct kv) + klen);
 }
 
   static inline void
@@ -3493,7 +3493,7 @@ wormhole_iter_leaf_sync_sorted(struct wormleaf * const leaf)
   struct wormhole_iter *
 wormhole_iter_create(struct wormref * const ref)
 {
-  struct wormhole_iter * const iter = je_malloc(sizeof(*iter));
+  struct wormhole_iter * const iter = malloc(sizeof(*iter));
   if (iter == NULL)
     return NULL;
   iter->ref = ref;
@@ -3810,7 +3810,7 @@ whsafe_iter_destroy(struct wormhole_iter * const iter, bool write)
   struct wormhole_iter *
 whunsafe_iter_create(struct wormhole * const map)
 {
-  struct wormhole_iter * const iter = je_malloc(sizeof(*iter));
+  struct wormhole_iter * const iter = malloc(sizeof(*iter));
   if (iter == NULL)
     return NULL;
   iter->ref = NULL;
@@ -3890,7 +3890,7 @@ whunsafe_iter_destroy(struct wormhole_iter * const iter)
   struct wormref *
 wormhole_ref(struct wormhole * const map)
 {
-  struct wormref * const ref = je_malloc(sizeof(*ref));
+  struct wormref * const ref = malloc(sizeof(*ref));
   if (ref == NULL)
     return NULL;
   ref->map = map;

@@ -6,7 +6,6 @@
 #pragma once
 
 #include "lib.h"
-#include <jemalloc/jemalloc.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -345,11 +344,11 @@ struct kvmap_api {
   bool async; // XXX for testing KVell
 
   // put (aka put/upsert): return true on success; false on error
-  // mm.in() controls how things move into the kvmap; the default mm make a copy with je_malloc()
+  // mm.in() controls how things move into the kvmap; the default mm make a copy with malloc()
   // mm.free() controls how old kv get disposed when replaced
   bool        (* put)     (void * const ref, struct kv * const kv, void **locked_leaf_addrs);
   // get: search and return a kv if found, or NULL if not
-  // with the default mm: je_malloc() if out == NULL; otherwise, use out as buffer
+  // with the default mm: malloc() if out == NULL; otherwise, use out as buffer
   // with custom kvmap_mm: mm.out() controls buffer; use with caution
   // caller should use the returned ptr even if out is provided
   struct kv * (* get)     (void * const ref, const struct kref * const key, struct kv * const out);

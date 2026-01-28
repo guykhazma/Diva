@@ -22,13 +22,13 @@
 
 #if defined(__linux__)
 #include <linux/fs.h>
-#include <jemalloc/jemalloc.h>  // je_malloc_usable_size
+#include <malloc.h>  // malloc_usable_size
 #elif defined(__APPLE__) && defined(__MACH__)
 #include <sys/disk.h>
-#include <jemalloc/jemalloc.h>
+#include <malloc/malloc.h>
 #elif defined(__FreeBSD__)
 #include <sys/disk.h>
-#include <jemalloc/jemalloc.h>>
+#include <malloc_np.h>
 #endif // OS
 
 #if defined(__FreeBSD__)
@@ -581,14 +581,14 @@ alloc_fail(void)
   return ((random_u64() % ALLOCFAIL_RECP) == ALLOCFAIL_MAGIC);
 }
 
-#ifdef je_mallocFAIL
-extern void * __libc_je_malloc(size_t size);
+#ifdef MALLOCFAIL
+extern void * __libc_malloc(size_t size);
   void *
-je_malloc(size_t size)
+malloc(size_t size)
 {
   if (alloc_fail())
     return NULL;
-  return __libc_je_malloc(size);
+  return __libc_malloc(size);
 }
 
 extern void * __libc_calloc(size_t nmemb, size_t size);
@@ -609,7 +609,7 @@ realloc(void *ptr, size_t size)
     return NULL;
   return __libc_realloc(ptr, size);
 }
-#endif // je_malloc_FAIL
+#endif // MALLOC_FAIL
 #endif // ALLOC_FAIL
 
   void *
@@ -636,11 +636,11 @@ yalloc(const size_t size)
 }
 
   void **
-je_malloc_2d(const size_t nr, const size_t size)
+malloc_2d(const size_t nr, const size_t size)
 {
   const size_t size1 = nr * sizeof(void *);
   const size_t size2 = nr * size;
-  void ** const mem = je_malloc(size1 + size2);
+  void ** const mem = malloc(size1 + size2);
   u8 * const mem2 = ((u8 *)mem) + size1;
   for (size_t i = 0; i < nr; i++)
     mem[i] = mem2 + (i * size);
@@ -650,7 +650,7 @@ je_malloc_2d(const size_t nr, const size_t size)
   inline void **
 calloc_2d(const size_t nr, const size_t size)
 {
-  void ** const ret = je_malloc_2d(nr, size);
+  void ** const ret = malloc_2d(nr, size);
   memset(ret[0], 0, nr * size);
   return ret;
 }
@@ -2200,14 +2200,14 @@ ptr_to_u64(const void * const ptr)
   return (u64)ptr;
 }
 
-// portable je_malloc_usable_size
+// portable malloc_usable_size
   inline size_t
 m_usable_size(void * const ptr)
 {
 #if defined(__linux__) || defined(__FreeBSD__)
   const size_t sz = malloc_usable_size(ptr);
 #elif defined(__APPLE__) && defined(__MACH__)
-  const size_t sz = je_malloc_size(ptr);
+  const size_t sz = malloc_size(ptr);
 #endif // OS
 
 #ifndef HEAPCHECKING
@@ -2778,7 +2778,7 @@ str_print_hex(FILE * const out, const void * const data, const u32 len)
 {
   const u8 * const ptr = data;
   const u32 strsz = len * 3;
-  u8 * const buf = je_malloc(strsz);
+  u8 * const buf = malloc(strsz);
   for (u32 i = 0; i < len; i++) {
     buf[i*3] = ' ';
     buf[i*3+1] = strhex_table_16[ptr[i]>>4];
@@ -2793,7 +2793,7 @@ str_print_dec(FILE * const out, const void * const data, const u32 len)
 {
   const u8 * const ptr = data;
   const u32 strsz = len * 4;
-  u8 * const buf = je_malloc(strsz);
+  u8 * const buf = malloc(strsz);
   for (u32 i = 0; i < len; i++) {
     const u8 v = ptr[i];
     buf[i*4] = ' ';
@@ -2815,11 +2815,11 @@ strtoks(const char * const str, const char * const delim)
   if (str == NULL)
     return NULL;
   size_t nptr_alloc = 32;
-  char ** tokens = je_malloc(sizeof(tokens[0]) * nptr_alloc);
+  char ** tokens = malloc(sizeof(tokens[0]) * nptr_alloc);
   if (tokens == NULL)
     return NULL;
   const size_t bufsize = strlen(str) + 1;
-  char * const buf = je_malloc(bufsize);
+  char * const buf = malloc(bufsize);
   if (buf == NULL)
     goto fail_buf;
 

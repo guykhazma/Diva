@@ -438,7 +438,7 @@ wormhole_alloc_akey(const size_t klen)
   if (alloc_fail())
     return NULL;
 #endif
-  return je_malloc(sizeof(struct kv) + klen);
+  return malloc(sizeof(struct kv) + klen);
 }
 
   static inline void
@@ -454,7 +454,7 @@ wormhole_alloc_mkey(const size_t klen)
   if (alloc_fail())
     return NULL;
 #endif
-  return je_malloc(sizeof(struct kv) + klen);
+  return malloc(sizeof(struct kv) + klen);
 }
 
   static inline void
@@ -1656,7 +1656,7 @@ wormleaf_int_insert(struct wormleaf_int * const leaf, const struct kv * const ne
   const u32 nr0 = leaf->nr_keys;
   leaf->kvs[nr0].key_size = new->klen;
   leaf->kvs[nr0].key = (*((u64 *) new->kv)) & BITMASK(new->klen * 8);
-  leaf->kvs[nr0].payload_ptr = je_malloc(new->vlen);
+  leaf->kvs[nr0].payload_ptr = malloc(new->vlen);
   memcpy(leaf->kvs[nr0].payload_ptr, new->kv + new->klen, new->vlen);
   leaf->nr_keys++;
 
@@ -1724,7 +1724,7 @@ wormleaf_int_update(struct wormleaf_int * const leaf, const u32 ih, const struct
   leaf->kvs[ih].key_size = new->klen;
   leaf->kvs[ih].key = (*((u64 *) new->kv)) & BITMASK(new->klen * 8);
   free(leaf->kvs[ih].payload_ptr);
-  leaf->kvs[ih].payload_ptr = je_malloc(new->vlen);
+  leaf->kvs[ih].payload_ptr = malloc(new->vlen);
   memcpy(leaf->kvs[ih].payload_ptr, new->kv + new->klen, new->vlen);
 }
 // }}} leaf-write
@@ -1802,7 +1802,7 @@ wormhole_split_leaf_move1(struct wormleaf_int * const leaf1, struct wormleaf_int
   struct int_store_pair new_isp;
   new_isp.key_size = new->klen;
   new_isp.key = (*((u64 *) new->kv)) & BITMASK(8 * new->klen);
-  new_isp.payload_ptr = je_malloc(new->vlen);
+  new_isp.payload_ptr = malloc(new->vlen);
   memcpy(new_isp.payload_ptr, new->kv + new->klen, new->vlen);
   struct int_store_pair es[WH_KPN];
 
@@ -1878,7 +1878,7 @@ wormhole_split_leaf(struct wormhole_int * const map, struct wormleaf_int * const
   struct int_store_pair new_isp;
   new_isp.key_size = new->klen;
   new_isp.key = (*((u64 *) new->kv)) & BITMASK(8 * new->klen);
-  new_isp.payload_ptr = je_malloc(new->vlen);
+  new_isp.payload_ptr = malloc(new->vlen);
   memcpy(new_isp.payload_ptr, new->kv + new->klen, new->vlen);
 
   wormleaf_int_sync_sorted(leaf1);
@@ -2740,7 +2740,7 @@ wormhole_int_iter_leaf_sync_sorted(struct wormleaf_int * const leaf)
   struct wormhole_int_iter *
 wormhole_int_iter_create(struct wormref_int * const ref)
 {
-  struct wormhole_int_iter * const iter = je_malloc(sizeof(*iter));
+  struct wormhole_int_iter * const iter = malloc(sizeof(*iter));
   if (iter == NULL)
     return NULL;
   iter->ref = ref;
@@ -3002,7 +3002,7 @@ whsafe_int_iter_destroy(struct wormhole_int_iter * const iter, bool write)
   struct wormref_int *
 wormhole_int_ref(struct wormhole_int * const map)
 {
-  struct wormref_int * const ref = je_malloc(sizeof(*ref));
+  struct wormref_int * const ref = malloc(sizeof(*ref));
   if (ref == NULL)
     return NULL;
   ref->map = map;
