@@ -25,10 +25,10 @@
 #include <jemalloc/jemalloc.h>  // je_malloc_usable_size
 #elif defined(__APPLE__) && defined(__MACH__)
 #include <sys/disk.h>
-#include <je_malloc/je_malloc.h>
+#include <jemalloc/jemalloc.h>
 #elif defined(__FreeBSD__)
 #include <sys/disk.h>
-#include <je_malloc_np.h>
+#include <jemalloc/jemalloc.h>>
 #endif // OS
 
 #if defined(__FreeBSD__)
