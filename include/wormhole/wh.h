@@ -6,6 +6,7 @@
 #pragma once
 
 #include "kv.h"
+#include <jemalloc/jemalloc.h>
 
 #ifdef __cplusplus
 extern "C" {
