@@ -171,7 +171,7 @@ kv_kref(const struct kv * const key)
   inline struct kv *
 kv_create(const void * const key, const u32 klen, const void * const value, const u32 vlen)
 {
-  struct kv * const kv = malloc(sizeof(*kv) + klen + vlen);
+  struct kv * const kv = je_malloc(sizeof(*kv) + klen + vlen);
   if (kv)
     kv_refill(kv, key, klen, value, vlen);
   return kv;
@@ -219,7 +219,7 @@ kv_dup(const struct kv * const kv)
     return NULL;
 
   const size_t sz = kv_size(kv);
-  struct kv * const new = malloc(sz);
+  struct kv * const new = je_malloc(sz);
   if (new)
     memcpy(new, kv, sz);
   return new;
@@ -232,7 +232,7 @@ kv_dup_key(const struct kv * const kv)
     return NULL;
 
   const size_t sz = key_size(kv);
-  struct kv * const new = malloc(sz);
+  struct kv * const new = je_malloc(sz);
   if (new) {
     memcpy(new, kv, sz);
     new->vlen = 0;
@@ -246,7 +246,7 @@ kv_dup2(const struct kv * const from, struct kv * const to)
   if (from == NULL)
     return NULL;
   const size_t sz = kv_size(from);
-  struct kv * const new = to ? to : malloc(sz);
+  struct kv * const new = to ? to : je_malloc(sz);
   if (new)
     memcpy(new, from, sz);
   return new;
@@ -258,7 +258,7 @@ kv_dup2_key(const struct kv * const from, struct kv * const to)
   if (from == NULL)
     return NULL;
   const size_t sz = key_size(from);
-  struct kv * const new = to ? to : malloc(sz);
+  struct kv * const new = to ? to : je_malloc(sz);
   if (new) {
     memcpy(new, from, sz);
     new->vlen = 0;
@@ -273,7 +273,7 @@ kv_dup2_key_prefix(const struct kv * const from, struct kv * const to, const u32
     return NULL;
   //debug_assert(plen <= from->klen);
   const size_t sz = key_size(from) - from->klen + plen;
-  struct kv * const new = to ? to : malloc(sz);
+  struct kv * const new = to ? to : je_malloc(sz);
   if (new) {
     new->klen = plen;
     memcpy(new->kv, from->kv, plen);
@@ -721,7 +721,7 @@ kvref_dup2_kv(struct kvref * const ref, struct kv * const to)
   if (ref == NULL)
     return NULL;
   const size_t sz = sizeof(*to) + ref->hdr.klen + ref->hdr.vlen;
-  struct kv * const new = to ? to : malloc(sz);
+  struct kv * const new = to ? to : je_malloc(sz);
   if (new == NULL)
     return NULL;
 
@@ -737,7 +737,7 @@ kvref_dup2_key(struct kvref * const ref, struct kv * const to)
   if (ref == NULL)
     return NULL;
   const size_t sz = sizeof(*to) + ref->hdr.klen;
-  struct kv * const new = to ? to : malloc(sz);
+  struct kv * const new = to ? to : je_malloc(sz);
   if (new == NULL)
     return NULL;
 
@@ -767,7 +767,7 @@ kv128_estimate_kv(const struct kv * const kv)
   u8 *
 kv128_encode_kv(const struct kv * const kv, u8 * const out, size_t * const pesize)
 {
-  u8 * const ptr = out ? out : malloc(kv128_estimate_kv(kv));
+  u8 * const ptr = out ? out : je_malloc(kv128_estimate_kv(kv));
   if (!ptr)
     return NULL;
 
@@ -785,7 +785,7 @@ kv128_decode_kv(const u8 * const ptr, struct kv * const out, size_t * const pesi
 {
   u32 klen, vlen;
   const u8 * const pdata = vi128_decode_u32(vi128_decode_u32(ptr, &klen), &vlen);
-  struct kv * const ret = out ? out : malloc(sizeof(struct kv) + klen + vlen);
+  struct kv * const ret = out ? out : je_malloc(sizeof(struct kv) + klen + vlen);
   if (ret)
     kv_refill(ret, pdata, klen, pdata + klen, vlen);
 

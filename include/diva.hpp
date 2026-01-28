@@ -18,6 +18,7 @@
 #include <tuple>
 #include <vector>
 #include <x86intrin.h>
+#include <jemalloc/jemalloc.h>
 
 #include "wormhole/wh.h"
 #include "util.hpp"
@@ -2114,7 +2115,7 @@ inline uint32_t Diva<int_optimized, payload_type>::DeserializeInfixStore(const c
         if (store.num_sample_payloads > 0) {
             const uint32_t sample_payload_byte_count = (store.num_sample_payloads * payload_size_ + 7) / 8;
             const uint32_t sample_payload_word_count = (store.num_sample_payloads * payload_size_ + 63) / 64;
-            uint8_t *sample_payloads = reinterpret_cast<uint8_t *>(malloc(sample_payload_word_count * sizeof(uint64_t)));
+            uint8_t *sample_payloads = reinterpret_cast<uint8_t *>(je_malloc(sample_payload_word_count * sizeof(uint64_t)));
             store.ptr[1] = reinterpret_cast<uint64_t>(sample_payloads);
             memcpy(sample_payloads, deser_buf + offset, sample_payload_byte_count);
             memset(sample_payloads + sample_payload_byte_count, 0,
@@ -2256,10 +2257,6 @@ inline void Diva<int_optimized, payload_type>::DeleteRange(const uint8_t *input_
     while (it.IsValid()) {
       it++;
       i++;
-      // trigger malloc trim
-      if (i % 10000 == 0) {
-        malloc_trim(0);
-      }
     }
 }
 
@@ -3230,9 +3227,9 @@ inline void Diva<int_optimized, payload_type>::AddSamplePayload(InfixStore &stor
                                                                 const uint32_t payload_offset) {
     uint64_t *payload_list = reinterpret_cast<uint64_t *>(store.ptr[1]);
     if (store.num_sample_payloads == 0) {
-        const uint32_t malloc_size = ((payload_size_ + 63) / 64) * sizeof(uint64_t);
-        payload_list = reinterpret_cast<uint64_t *>(malloc(malloc_size));
-        memset(payload_list, 0, malloc_size);
+        const uint32_t je_malloc_size = ((payload_size_ + 63) / 64) * sizeof(uint64_t);
+        payload_list = reinterpret_cast<uint64_t *>(je_malloc(je_malloc_size));
+        memset(payload_list, 0, je_malloc_size);
     }
     else {
         payload_list = reinterpret_cast<uint64_t *>(realloc(payload_list,
@@ -4433,7 +4430,7 @@ inline void Diva<int_optimized, payload_type>::ResizeInfixStore(InfixStore &stor
         if constexpr (payload_type == PayloadType::FixedLength)
             delete[] payload_list;
     }
-    // malloc_trim(0);
+    // je_malloc_trim(0);
 }
 
 
