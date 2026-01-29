@@ -1,7 +1,6 @@
 #pragma once
 
 #include <algorithm>
-#include <alloca.h>
 #include <atomic>
 #include <cassert>
 #include <cmath>
@@ -273,7 +272,6 @@ private:
     static constexpr uint32_t size_scalar_count = 500;
     static constexpr uint32_t heap_alloc_threshold = 20000U;
     static constexpr uint64_t max_exp_backoff = BITMASK(14);
-    static constexpr uint32_t page_size_bytes = 1 << 12;
 
     struct __attribute__((packed)) InfixStore {
         static const uint32_t size_grade_bit_count = 12;
@@ -288,7 +286,9 @@ private:
                    const uint32_t size_grade, const uint32_t payload_size=0) {
             SetSizeGrade(size_grade);
             const uint64_t word_count = GetPtrWordCount(slot_count, slot_size, payload_size);
-            ptr = allocate_page_multiple<uint64_t>(word_count, true);
+            rwlock.store(0, std::memory_order::memory_order_release);
+            ptr = new uint64_t[word_count];
+            memset(ptr, 0, sizeof(uint64_t) * word_count);
         }
         InfixStore(uint64_t *ptr): status(0), ptr(ptr) {};
         InfixStore() = default;
@@ -378,15 +378,6 @@ private:
     uint32_t bulk_load_streaming_ind_, bulk_load_streaming_max_len_;
     InfiniteByteString bulk_load_left_key_, bulk_load_key_list_[infix_store_target_size];
     uint64_t *bulk_load_left_payload_ = nullptr, *bulk_load_payload_list_ = nullptr;
-
-    template <typename T>
-    static T *allocate_page_multiple(uint32_t elem_count, bool zero_out=false) {
-        const uint32_t page_count = (elem_count * sizeof(T) + page_size_bytes - 1) / page_size_bytes;
-        T *res = reinterpret_cast<T *>(new uint8_t[page_count * page_size_bytes]);
-        if (zero_out)
-            memset(res, 0, page_count * page_size_bytes);
-        return res;
-    }
 
     void AddTreeKey(const uint8_t *key, const uint32_t key_len, const uint64_t *payload=nullptr);
     void InsertSimple(const InfiniteByteString key, const void *payload=nullptr);
@@ -1314,9 +1305,9 @@ inline uint32_t Diva<int_optimized, payload_type>::InsertSplit(const InfiniteByt
     uint64_t *infix_list = infix_list_contents;
     uint64_t *payload_list = payload_list_contents;
     if (infix_list_len > heap_alloc_threshold) {
-        infix_list = allocate_page_multiple<uint64_t>(infix_list_len + 1);
+        infix_list = new uint64_t[infix_list_len + 1];
         if constexpr (payload_type == PayloadType::FixedLength)
-            payload_list = allocate_page_multiple<uint64_t>(payload_list_size);
+            payload_list = new uint64_t[payload_list_size];
     }
     uint32_t infix_count;
     if constexpr (payload_type == PayloadType::FixedLength)
@@ -1346,8 +1337,8 @@ inline uint32_t Diva<int_optimized, payload_type>::InsertSplit(const InfiniteByt
     const uint32_t left_half_len = sep_r;
     const uint32_t right_half_len = infix_list_len - sep_r + num_partial_matches;
     if (num_partial_matches > 0) {
-        infix_list_right_half_ptr = allocate_page_multiple<uint64_t>(right_half_len);
-        payload_list_right_half_ptr = allocate_page_multiple<uint64_t>((right_half_len + 1) * payload_size_ / 64 + 2);
+        infix_list_right_half_ptr = new uint64_t[right_half_len];
+        payload_list_right_half_ptr = new uint64_t[(right_half_len + 1) * payload_size_ / 64 + 2];
         payload_list_right_half_offset = 0;
         uint64_t ind = 0;
         for (uint32_t i = split_pos; i < sep_r; i++) {
@@ -1407,9 +1398,9 @@ inline uint32_t Diva<int_optimized, payload_type>::InsertSplit(const InfiniteByt
     uint64_t *left_infix_list = left_infix_list_contents;
     uint64_t *left_payload_list = left_payload_list_contents;
     if (left_list_len > heap_alloc_threshold) {
-        left_infix_list = allocate_page_multiple<uint64_t>(left_list_len);
+        left_infix_list = new uint64_t[left_list_len];
         if constexpr (payload_type == PayloadType::FixedLength)
-            left_payload_list = allocate_page_multiple<uint64_t>(left_payload_list_size);
+            left_payload_list = new uint64_t[left_payload_list_size];
     }
     if constexpr (payload_type == PayloadType::FixedLength) {
         const uint32_t payload_list_offset = 0;
@@ -1438,9 +1429,9 @@ inline uint32_t Diva<int_optimized, payload_type>::InsertSplit(const InfiniteByt
     uint64_t *right_infix_list = right_infix_list_contents;
     uint64_t *right_payload_list = right_payload_list_contents;
     if (right_list_len > heap_alloc_threshold) {
-        right_infix_list = allocate_page_multiple<uint64_t>(right_list_len);
+        right_infix_list = new uint64_t[right_list_len];
         if constexpr (payload_type == PayloadType::FixedLength)
-            right_payload_list = allocate_page_multiple<uint64_t>(right_payload_list_size);
+            right_payload_list = new uint64_t[right_payload_list_size];
     }
     if constexpr (payload_type == PayloadType::FixedLength) {
         UpdateInfixList(infix_list_right_half_ptr, right_half_len, shamt_gt,
@@ -1572,7 +1563,7 @@ inline void Diva<int_optimized, payload_type>::UpdateInfixList(const uint64_t *l
     uint32_t payload_ind_contents[should_allocate_on_heap ? 1 : res_len];
     uint32_t *payload_ind = payload_ind_contents;
     if (should_allocate_on_heap)
-        payload_ind = allocate_page_multiple<uint32_t>(res_len);
+        payload_ind = new uint32_t[res_len];
     const uint64_t lower_implicit_lim = lower_lim >> infix_size_;
     const uint64_t upper_implicit_lim = upper_lim >> infix_size_;
     for (int32_t i = 0; i < list_len; i++) {
@@ -1606,7 +1597,7 @@ inline void Diva<int_optimized, payload_type>::UpdateInfixList(const uint64_t *l
         std::pair<uint64_t, uint32_t> sorter_contents[should_allocate_on_heap ? 1 : res_len];
         std::pair<uint64_t, uint32_t> *sorter = sorter_contents;
         if (should_allocate_on_heap)
-            sorter = allocate_page_multiple<std::pair<uint64_t, uint32_t>>(res_len);
+            sorter = new std::pair<uint64_t, uint32_t>[res_len];
 
         for (uint32_t i = 0; i < res_ind; i++)
             sorter[i] = {res[i], payload_ind[i]};
@@ -2115,7 +2106,7 @@ inline uint32_t Diva<int_optimized, payload_type>::DeserializeInfixStore(const c
     }
 
     const uint64_t word_count = store.GetPtrWordCount(scaled_sizes_[store.GetSizeGrade()], infix_size_, payload_size_);
-    store.ptr = allocate_page_multiple<uint64_t>(word_count);
+    store.ptr = new uint64_t[word_count];
     memcpy(store.ptr, deser_buf + offset, word_count * sizeof(uint64_t));
     offset += word_count * sizeof(uint64_t);
 
@@ -2325,10 +2316,10 @@ inline void Diva<int_optimized, payload_type>::DeleteMerge(InfiniteByteString ke
     uint64_t *payload_list = payload_list_contents;
     uint64_t *right_payload_list = right_payload_list_contents;
     if (should_allocate_on_heap) {
-        infix_list = allocate_page_multiple<uint64_t>(total_elem_count + 1);
+        infix_list = new uint64_t[total_elem_count + 1];
         if constexpr (payload_type == PayloadType::FixedLength) {
-            payload_list = allocate_page_multiple<uint64_t>(payload_list_size + 1);
-            right_payload_list = allocate_page_multiple<uint64_t>(payload_list_size + 1);
+            payload_list = new uint64_t[payload_list_size + 1];
+            right_payload_list = new uint64_t[payload_list_size + 1];
         }
     }
     GetInfixList(*store_l, infix_list, payload_list);
@@ -2359,8 +2350,8 @@ inline void Diva<int_optimized, payload_type>::DeleteMerge(InfiniteByteString ke
                 std::pair<uint64_t, uint32_t> *pair_list = pair_list_contents;
                 std::pair<uint64_t, uint32_t> *tmp = tmp_contents;
                 if (should_allocate_on_heap) {
-                    pair_list = allocate_page_multiple<std::pair<uint64_t, uint32_t>>(total_elem_count + 1);
-                    tmp = allocate_page_multiple<std::pair<uint64_t, uint32_t>>(total_elem_count + 1);
+                    pair_list = new std::pair<uint64_t, uint32_t>[total_elem_count + 1];
+                    tmp = new std::pair<uint64_t, uint32_t>[total_elem_count + 1];
                 }
 
                 for (uint32_t i = 0; i < total_elem_count; i++)
@@ -2373,7 +2364,7 @@ inline void Diva<int_optimized, payload_type>::DeleteMerge(InfiniteByteString ke
                 uint64_t payload_list_copy_contents[should_allocate_on_heap ? 1 : payload_list_size + 1];
                 uint64_t *payload_list_copy = payload_list_copy_contents;
                 if (should_allocate_on_heap)
-                    payload_list_copy = allocate_page_multiple<uint64_t>(payload_list_size + 1);
+                    payload_list_copy = new uint64_t[payload_list_size + 1];
                 memcpy(payload_list_copy, payload_list, (payload_list_size + 1) * sizeof(uint64_t));
                 for (uint32_t i = 0; i < total_elem_count; i++) {
                     infix_list[i] = tmp[i].first;
@@ -2392,7 +2383,7 @@ inline void Diva<int_optimized, payload_type>::DeleteMerge(InfiniteByteString ke
                 uint64_t tmp_contents[should_allocate_on_heap ? 1 : total_elem_count + 1];
                 uint64_t *tmp = tmp_contents;
                 if (should_allocate_on_heap)
-                    tmp = allocate_page_multiple<uint64_t>(total_elem_count + 1);
+                    tmp = new uint64_t[total_elem_count + 1];
 
                 std::merge(infix_list, infix_list + store_l->GetElemCount(),
                            infix_list + store_l->GetElemCount(), infix_list + total_elem_count,
@@ -4401,9 +4392,9 @@ inline void Diva<int_optimized, payload_type>::ResizeInfixStore(InfixStore &stor
     uint64_t *infix_list = infix_list_contents;
     uint64_t *payload_list = payload_list_contents;
     if (should_allocate_on_heap) {
-        infix_list = allocate_page_multiple<uint64_t>(infix_count);
+        infix_list = new uint64_t[infix_count];
         if constexpr (payload_type == PayloadType::FixedLength)
-            payload_list = allocate_page_multiple<uint64_t>(payload_list_size);
+            payload_list = new uint64_t[payload_list_size];
     }
 
     if constexpr (payload_type == PayloadType::FixedLength) {
@@ -4428,7 +4419,7 @@ inline void Diva<int_optimized, payload_type>::ResizeInfixStore(InfixStore &stor
     store.SetSizeGrade(size_grade);
     const uint32_t next_size = scaled_sizes_[size_grade];
     const uint64_t word_count = InfixStore::GetPtrWordCount(next_size, infix_size_, payload_size_);
-    uint64_t *new_ptr = allocate_page_multiple<uint64_t>(word_count);
+    uint64_t *new_ptr = new uint64_t[word_count];
     store.ptr = new_ptr;
     if constexpr (payload_type == PayloadType::FixedLength)
         LoadListToInfixStore(store, infix_list, infix_count, total_implicit, true, payload_list);
