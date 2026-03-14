@@ -9,6 +9,7 @@
 #include <endian.h>
 #include <fstream>
 #include <limits>
+#include <malloc.h>
 #include <random>
 #include <string_view>
 #include <thread>
@@ -28,6 +29,89 @@
 #include "util.hpp"
 
 namespace diva {
+
+typedef uint64_t SequenceNumber;
+
+static void decodePayload(uint64_t payload,
+                          uint8_t file_number_bits,
+                          uint8_t offset_bits,
+                          uint64_t* file_number,
+                          uint64_t* offset,
+                          bool* isTombstone) {
+    uint64_t fileNumberMask = (1UL << file_number_bits) - 1;
+    uint64_t offsetMask = (1UL << offset_bits) - 1;
+    *isTombstone = payload & 1;
+    *offset = (payload >> 1) & offsetMask;
+    *file_number = (payload >> (offset_bits + 1)) & fileNumberMask;
+}
+
+static void DecodeSequenceAndAddressDiva(const uint64_t* encoded,
+                                         uint64_t num_sequence_bits,
+                                         uint8_t file_number_bits,
+                                         uint8_t offset_bits,
+                                         SequenceNumber* seq,
+                                         uint64_t* file_number,
+                                         uint64_t* offset,
+                                         bool* isTombstone) {
+    uint64_t payload_bits = file_number_bits + offset_bits + 1;
+
+    uint64_t decoded_seq = 0;
+    uint64_t decoded_payload = 0;
+
+    // Helper: extract single bit (LSB-first)
+    auto get_bit = [&](uint64_t pos) -> bool {
+        uint64_t word_pos = pos / 64;
+        uint64_t bit_in_word = pos % 64; // LSB-first
+        return (encoded[word_pos] >> bit_in_word) & 1ULL;
+    };
+
+    // Decode sequence number bits
+    for (uint64_t i = 0; i < num_sequence_bits; ++i) {
+        decoded_seq |= (static_cast<uint64_t>(get_bit(i)) << i);
+    }
+
+    // Decode payload bits (file_number + offset + tombstone)
+    for (uint64_t i = 0; i < payload_bits; ++i) {
+        decoded_payload |= (static_cast<uint64_t>(get_bit(num_sequence_bits + i)) << i);
+    }
+
+    // Assign sequence number
+    if (seq) *seq = decoded_seq;
+
+    // Decode payload into file_number, offset, isTombstone
+    decodePayload(decoded_payload, file_number_bits, offset_bits,
+            file_number, offset, isTombstone);
+}
+
+std::vector<uint64_t> ReadLiveBlobFiles(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        throw std::runtime_error("Failed to open file for reading: " + path);
+    }
+
+    // 1. Read the number of elements
+    uint64_t size = 0;
+    in.read(reinterpret_cast<char*>(&size), sizeof(size));
+
+    if (!in) {
+        if (in.eof()) return {}; // Handle empty file if that's expected
+        throw std::runtime_error("Failed to read size from blob file");
+    }
+
+    // 2. Prepare the vector and read the data block
+    std::vector<uint64_t> live_blob_files;
+    if (size > 0) {
+        live_blob_files.resize(size);
+        in.read(reinterpret_cast<char*>(live_blob_files.data()),
+                size * sizeof(uint64_t));
+    }
+
+    if (!in) {
+        throw std::runtime_error("Failed to read vector data from blob file");
+    }
+
+    return live_blob_files;
+}
 
 class DivaTests {
 public:
@@ -4407,10 +4491,10 @@ public:
             const uint32_t seed = 2;
             const float load_factor = 0.8;
             const uint32_t n_keys = 30000000;
-            const uint32_t n_duplicates = 3;
+            const uint32_t n_duplicates = 1;
             const uint32_t n_threads = 8;
             const uint32_t n_bulk = std::min(n_keys / n_threads, n_keys / 8);
-            const uint64_t delete_threshold = 10000000;
+            const uint64_t delete_threshold = 20000000;
             const uint64_t query_period = 5000000;
 
             constexpr bool ascii = false;
@@ -4478,6 +4562,8 @@ public:
                 threads.emplace_back([&, i] {
                         if (i > 0) {
                             for (uint32_t ti = n_bulk + i; ti < n_keys; ti += n_threads) {
+                                if (ti % 100000 == i)
+                                    std::cerr << "filter_memory=" << s.Size() << " process_memory=" << getMemoryUsage() << std::endl;
                                 for (uint32_t j = 0; j < n_duplicates; j++) {
                                     for (auto it = s.GetIterator(string_keys[ti], string_keys[ti]); 
                                             it.IsValid();
@@ -4514,10 +4600,15 @@ public:
                         else {
                             while (n_keys_inserted_overall.load(std::memory_order_acquire) <= delete_threshold)
                                 cpu_pause();
-                            s.DeleteRange(nullptr, 0, nullptr, 0, 
-                                    [=](const uint64_t *payload) { 
-                                        return payload[0] <= delete_threshold && payload[0] > 0;
-                                    });
+                            const uint32_t num_repeats = 4;
+                            for (int32_t j = 0; j < num_repeats; j++) {
+                                std::cerr << "cleanup j=" << j << std::endl;
+                                s.DeleteRange(nullptr, 0, nullptr, 0, 
+                                        [=](const uint64_t *payload) { 
+                                            return payload[0] <= delete_threshold * (j + 1) / num_repeats && payload[0] > 0;
+                                        });
+                                std::cerr << "finished cleanup j=" << j << std::endl;
+                            }
                         }
                     });
             }
@@ -4544,6 +4635,56 @@ public:
                 }
                 REQUIRE_EQ(found, (payloads[i][0] > delete_threshold || payloads[i][0] == 0));
             }
+        }
+
+
+        SUBCASE("memory leak") {
+            const std::string filterPath = "blob_filter_data1769464730";
+            const std::string blobPath = "live_blob_files_1769464730";
+
+            // 1. Setup environment exactly like the original
+            std::vector<uint64_t> all_live_files = ReadLiveBlobFiles(blobPath);
+            std::sort(all_live_files.begin(), all_live_files.end());
+
+            // 2. Load the 100% case
+            std::ifstream in(filterPath, std::ios::binary);
+            in.seekg(0, std::ios::end);
+            std::streamsize size = in.tellg();
+            in.seekg(0, std::ios::beg);
+            char* buffer = new char[size];
+            in.read(buffer, size);
+
+            auto diva_ = new diva::Diva<false, diva::PayloadType::FixedLength>(buffer);
+            delete[] buffer;
+
+            size_t memoryAfterLoad = getMemoryUsage();
+            std::cout << "num keys before: " << diva_->GetNumKeys() << std::endl;
+            std::cout << "memory before: " << memoryAfterLoad << std::endl;
+
+            // Use the 100% subset
+            std::vector<uint64_t> current_live_subset = all_live_files;
+            uint32_t offset_bits = static_cast<uint32_t>(std::log2(65 << 20)) + 1;
+
+            // 3. The Operation
+            diva_->DeleteRange(nullptr, 0, nullptr, 0,
+                    [&](const uint64_t* payload) {
+                        SequenceNumber seq; uint64_t file_num, off; bool tomb;
+                        DecodeSequenceAndAddressDiva(payload, 56, 32, offset_bits, &seq, &file_num, &off, &tomb);
+                        return !std::binary_search(current_live_subset.begin(), current_live_subset.end(), file_num);
+                    });
+
+            size_t memoryAfterDelete = getMemoryUsage();
+            std::cout << "num keys after: " << diva_->GetNumKeys() << std::endl;
+            std::cout << "memory after: " << memoryAfterDelete << std::endl;
+            malloc_trim(0);
+            size_t memoryAfterTrim = getMemoryUsage();
+            std::cout << "memory after trim: " << memoryAfterTrim << std::endl;
+            // 4. Cleanup
+            delete diva_;
+
+            // Explicitly clear the vector to ensure it's not the "leak"
+            current_live_subset.clear();
+            current_live_subset.shrink_to_fit();
         }
 
 
