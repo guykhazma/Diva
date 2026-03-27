@@ -4130,31 +4130,17 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreamingSealWithBoundary(
         allocation_size_grade = std::lower_bound(scaled_sizes_, scaled_sizes_ + size_scalar_count, num_slots_filled) - scaled_sizes_;
     }
     InfixStore store(scaled_sizes_[allocation_size_grade], infix_size_,
-                     allocation_size_grade, payload_size_);
+                     allocation_size_grade, boundary_payload_size);
     if constexpr (diva_type == DivaType::BinaryTrie)
         LoadVectorToInfixStore(store, infix_vec, total_implicit, true, bulk_load_payload_list_);
     else
         LoadListToInfixStore(store, infix_list, bulk_load_streaming_ind_, total_implicit, true, bulk_load_payload_list_);
 
-    // Trie-only payload mode (PayloadType::None): payload_size_ is 0, so AddSamplePayload
-    // would copy 0 bits; store runtime-sized boundary bits directly in ptr[1].
-    if (boundary_payload != nullptr) {
-        if constexpr (payload_type == PayloadType::None) {
-            const uint32_t word_count = (boundary_payload_size + 63) / 64;
-            uint64_t *sample_payloads = reinterpret_cast<uint64_t *>(
-                malloc(word_count * sizeof(uint64_t)));
-            memset(sample_payloads, 0, word_count * sizeof(uint64_t));
-            copy_bitmap_to_bitmap(boundary_payload, 0, sample_payloads, 0,
-                                  boundary_payload_size);
-            store.ptr[1] = reinterpret_cast<uint64_t>(sample_payloads);
-            store.num_sample_payloads = 1;
-        } else {
-            uint64_t boundary_payload_bits[(boundary_payload_size + 63) / 64 + 1];
-            copy_bitmap_to_bitmap(boundary_payload, 0, boundary_payload_bits, 0,
-                                  boundary_payload_size);
-            AddSamplePayload(store, boundary_payload_bits);
-        }
-    }
+    // we always add a payload to the trie
+    uint64_t boundary_payload_bits[(boundary_payload_size + 63) / 64 + 1];
+    copy_bitmap_to_bitmap(boundary_payload, 0, boundary_payload_bits, 0,
+                          boundary_payload_size);
+    AddSamplePayload(store, boundary_payload_bits);
 
     if constexpr (diva_type == DivaType::Int) {
         wh_int_put(better_tree_int_, bulk_load_right_key.str,
