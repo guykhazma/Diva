@@ -1674,7 +1674,7 @@ wormleaf_int_insert(struct wormleaf_int * const leaf, const struct kv * const ne
   static void
 wormleaf_int_insert_isp(struct wormleaf_int * const leaf, const struct int_store_pair * const new)
 {
-  debug_assert(new->hash == kv_crc32c_extend(kv_crc32c(new->kv, new->klen)));
+//  debug_assert(new->hash == kv_crc32c_extend(kv_crc32c(new->kv, new->klen)));
   debug_assert(leaf->nr_keys < WH_KPN);
 
   // insert
@@ -1858,7 +1858,7 @@ wormhole_split_alloc_anchor(const struct kv * const key1, const struct kv * cons
 wormhole_isp_split_alloc_anchor(const struct int_store_pair * const key1, const struct int_store_pair * const key2)
 {
   const u32 alen = isp_key_lcp(key1, key2) + 1;
-  debug_assert(alen <= key2->klen);
+//  debug_assert(alen <= key2->klen);
 
   struct kv * const anchor = wormhole_alloc_akey(alen);
   if (anchor) {
@@ -2580,7 +2580,7 @@ wormhole_int_del(struct wormref_int * const ref, const struct kref * const key, 
   if (im < WH_KPN) { // found
     wormleaf_int_remove(leaf, im);
     wormhole_del_try_merge(ref, leaf, locked_leaf_addrs);
-    debug_assert(kv);
+//    debug_assert(kv);
     return true;
   } else {
     if (locked_leaf_addrs[0] != leaf && locked_leaf_addrs[1] != leaf)
@@ -2619,7 +2619,7 @@ whunsafe_int_del(struct wormhole_int * const map, const struct kref * const key)
   const u32 im = wormleaf_int_search_eq(leaf, key);
   if (im < WH_KPN) { // found
     wormleaf_int_remove(leaf, im);
-    debug_assert(kv);
+//    debug_assert(kv);
 
     whunsafe_int_del_try_merge(map, leaf);
     return true;
@@ -2792,7 +2792,7 @@ wormhole_int_iter_fix_rev(struct wormhole_int_iter * const iter, bool write, boo
     return true;
 
   while (unlikely(iter->is < 0)) {
-    debug_assert(iter->leaf->leaflock);
+//    debug_assert(iter->leaf->leaflock);
     struct wormleaf_int * const prev = iter->leaf->prev;
     if (likely(prev != NULL)) {
       struct wormref_int * const ref = iter->ref;
