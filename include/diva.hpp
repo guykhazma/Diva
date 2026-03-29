@@ -91,7 +91,8 @@ class Diva {
 
 public:
     Diva(const uint32_t infix_size, const uint32_t rng_seed, const float load_factor,
-         const uint32_t payload_size=0, const bool setup_start_end_samples=false);
+         const uint32_t payload_size=0, const bool setup_start_end_samples=false,
+         const uint32_t sample_payload_size=0);
 
     template <class t_itr>
     Diva(const uint32_t infix_size, const t_itr begin, const t_itr end, const uint32_t key_len,
@@ -614,6 +615,15 @@ private:
     uint32_t bulk_load_streaming_ind_, bulk_load_streaming_max_len_;
     InfiniteByteString bulk_load_left_key_, bulk_load_key_list_[infix_store_target_size];
     uint64_t *bulk_load_left_payload_ = nullptr, *bulk_load_payload_list_ = nullptr;
+    // Carries the block handle from one SealWithBoundary call to the next so it
+    // can be written at the LEFT key's InfixStore (ptr[1]) rather than the right
+    // key, matching regular BulkLoadStreaming layout and PointQuery semantics.
+    uint64_t *prev_seal_payload_ = nullptr;
+    uint32_t prev_seal_payload_size_ = 0;
+    // Width of the ptr[1] sample-payload blob in bits. Independent of
+    // payload_size_ (which is per-slot overhead). Serialized in metadata so
+    // DeserializeInfixStore knows how many bytes to read/write for ptr[1].
+    uint32_t sample_payload_size_ = 0;
 
     void AddTreeKey(const uint8_t *key, const uint32_t key_len, const uint64_t *payload=nullptr);
     void InsertSimple(const InfiniteByteString key, const void *payload=nullptr);
@@ -815,7 +825,8 @@ public:
 template <DivaType diva_type, PayloadType payload_type>
 inline Diva<diva_type, payload_type>::Diva(const uint32_t infix_size, const uint32_t rng_seed,
                                            const float load_factor, const uint32_t payload_size,
-                                           const bool setup_start_end_samples):
+                                           const bool setup_start_end_samples,
+                                           const uint32_t sample_payload_size):
             wh_(nullptr),
             better_tree_(nullptr),
             wh_int_(nullptr),
@@ -837,6 +848,7 @@ inline Diva<diva_type, payload_type>::Diva(const uint32_t infix_size, const uint
     }
     if constexpr (payload_type == PayloadType::FixedLength) {
         payload_size_ = payload_size;
+        sample_payload_size_ = sample_payload_size;
         bulk_load_left_payload_ = new uint64_t[(payload_size_ + 63) / 64 + 1];
         bulk_load_payload_list_ = new uint64_t[infix_store_target_size * ((payload_size_ + 63) / 64) + 1];
     }
@@ -1599,54 +1611,86 @@ inline bool Diva<diva_type, payload_type>::PointQueryWithBoundary(
     // prev_key/next_key from peek_ref point into wormhole leaf memory; copy
     // bytes before a second bounds walk or UnlockLeaves, or pointers go stale.
     std::vector<uint8_t> bound_bytes;
-    InfixStore *payload_store = nullptr;
     if (prev_key == key) {
+        // Exact trie match — key is definitely present; its block handle lives
+        // on the infix store stored at this very trie node.
         bound_bytes.assign(prev_key.str, prev_key.str + prev_key.length);
-        payload_store = infix_store_ptr;
+        rwlock_lock_read(infix_store_ptr->rwlock);
+        UnlockLeaves(leaves_to_unlock, it_write_lock);
+
+        if (out_key != nullptr)
+            out_key->assign(bound_bytes.begin(), bound_bytes.end());
+        if (out_payload != nullptr && payload_size > 0) {
+            const uint64_t *payload_list =
+                reinterpret_cast<const uint64_t *>(infix_store_ptr->ptr[1]);
+            if (payload_list != nullptr)
+                copy_bitmap_to_bitmap(payload_list, 0, out_payload, 0, payload_size);
+        }
+        rwlock_unlock_read(infix_store_ptr->rwlock);
+        return true;
     } else {
+        // key in (prev_key, next_key).
+        // Infix is stored at prev_key (infix_store_ptr); block handle is at next_key (ptr[1]).
+        // The iterator is still positioned at next_key with leaves locked — peek its
+        // store directly instead of doing a second GetLowerUpperBounds walk.
         bound_bytes.assign(next_key.str, next_key.str + next_key.length);
-        const InfiniteByteString next_key_owned{
-            bound_bytes.data(), static_cast<uint32_t>(bound_bytes.size())};
-        void *leaves2[3] = {};
-        wormhole_int_iter it_int2;
-        wormhole_iter it2;
-        InfiniteByteString prev2 {};
-        InfiniteByteString next2 {};
-        InfixStore *store2 = nullptr;
-        GetLowerUpperBounds(next_key_owned, it_write_lock, leaves2, it2,
-                            it_int2, prev2, next2, store2);
-        uint64_t prev2_word, next2_word;
+
+        InfixStore *next_store_ptr;
+        uint32_t dummy_val;
         if constexpr (diva_type == DivaType::Int) {
-            prev2_word = *reinterpret_cast<const uint64_t *>(prev2.str);
-            prev2.str = reinterpret_cast<const uint8_t *>(&prev2_word);
-            if (next2.str != nullptr) {
-                next2_word = *reinterpret_cast<const uint64_t *>(next2.str);
-                next2.str = reinterpret_cast<const uint8_t *>(&next2_word);
+            const uint8_t *dummy_str; uint32_t dummy_len;
+            wh_int_iter_peek_ref(&it_int,
+                reinterpret_cast<const void **>(&dummy_str), &dummy_len,
+                reinterpret_cast<void **>(&next_store_ptr), &dummy_val);
+        } else {
+            const uint8_t *dummy_str; uint32_t dummy_len;
+            wh_iter_peek_ref(&it,
+                reinterpret_cast<const void **>(&dummy_str), &dummy_len,
+                reinterpret_cast<void **>(&next_store_ptr), &dummy_val);
+        }
+
+        // Lock both stores before releasing leaf locks (hand-over-hand protocol):
+        // raw pointers from peek_ref point into wormhole leaf memory and must not
+        // be dereferenced after UnlockLeaves.
+        rwlock_lock_read(infix_store_ptr->rwlock);   // prev_key store: for infix check
+        rwlock_lock_read(next_store_ptr->rwlock);    // next_key store: for block handle
+        UnlockLeaves(leaves_to_unlock, it_write_lock);
+
+        auto [shared, ignore, implicit_size] =
+            GetSharedIgnoreImplicitLengths(prev_key, next_key);
+        const uint32_t key_start_bit = shared + ignore + implicit_size;
+        const uint64_t extraction =
+            ExtractPartialKey(key, shared, ignore, implicit_size, key.GetBit(shared));
+        const uint64_t prev_implicit_val =
+            ExtractPartialKey(prev_key, shared, ignore, implicit_size, 0) >> infix_size_;
+        const uint64_t next_implicit_val =
+            ExtractPartialKey(next_key, shared, ignore, implicit_size, 1) >> infix_size_;
+        const uint32_t total_implicit = next_implicit_val - prev_implicit_val + 1;
+        const uint64_t query_key_enc = extraction - (prev_implicit_val << infix_size_);
+        // Infix check on prev_key's store — same store and interval as regular PointQuery.
+        const bool in_infix = PointQueryInfixStore(*infix_store_ptr, query_key_enc,
+                                                   total_implicit,
+                                                   {key.str, 8 * key.length},
+                                                   key_start_bit);
+
+        rwlock_unlock_read(infix_store_ptr->rwlock);
+        if (!in_infix) {
+            rwlock_unlock_read(next_store_ptr->rwlock);
+            return false;
+        }
+
+        if (out_key != nullptr)
+            out_key->assign(bound_bytes.begin(), bound_bytes.end());
+        if (out_payload != nullptr && payload_size > 0) {
+            const uint64_t *payload_list =
+                reinterpret_cast<const uint64_t *>(next_store_ptr->ptr[1]);
+            if (payload_list != nullptr) {
+                copy_bitmap_to_bitmap(payload_list, 0, out_payload, 0, payload_size);
             }
         }
-#ifdef DEBUG
-        assert(prev2 == next_key_owned &&
-               "lower_bound target must be an exact trie key");
-#endif
-        payload_store = store2;
-        UnlockLeaves(leaves2, it_write_lock);
+        rwlock_unlock_read(next_store_ptr->rwlock);
+        return true;
     }
-
-    rwlock_lock_read(payload_store->rwlock);
-    UnlockLeaves(leaves_to_unlock, it_write_lock);
-
-    if (out_key != nullptr)
-        out_key->assign(bound_bytes.begin(), bound_bytes.end());
-    if (out_payload != nullptr && payload_size > 0) {
-        const uint64_t *payload_list =
-            reinterpret_cast<const uint64_t *>(payload_store->ptr[1]);
-        if (payload_list != nullptr) {
-            copy_bitmap_to_bitmap(payload_list, 0, out_payload, 0, payload_size);
-        }
-    }
-
-    rwlock_unlock_read(payload_store->rwlock);
-    return true;
 }
 
 
@@ -2407,7 +2451,7 @@ inline uint64_t Diva<diva_type, payload_type>::Size() const {
                  + sizeof(InfixStore::full_slot_count_bit_count);
 
     if constexpr (payload_type == PayloadType::FixedLength)
-        res += sizeof(payload_size_);
+        res += sizeof(payload_size_) + sizeof(sample_payload_size_);
 
     const uint8_t *tree_key, *last_tree_key = nullptr;
     uint32_t tree_key_len, last_tree_key_len = 0, dummy;
@@ -2427,7 +2471,7 @@ inline uint64_t Diva<diva_type, payload_type>::Size() const {
             res += sizeof(store->status);
             if constexpr (payload_type == PayloadType::FixedLength) {
                 res += sizeof(store->num_sample_payloads);
-                res += (store->num_sample_payloads * payload_size_ + 7) / 8;
+                res += (store->num_sample_payloads * sample_payload_size_ + 7) / 8;
             }
             if (store->ptr != nullptr) {
                 const uint64_t word_count = store->GetPtrWordCount(scaled_sizes_[store->GetSizeGrade()], infix_size_, payload_size_);
@@ -2450,7 +2494,7 @@ inline uint64_t Diva<diva_type, payload_type>::Size() const {
             res += sizeof(store->status); // + sizeof(store->ptr);
             if constexpr (payload_type == PayloadType::FixedLength) {
                 res += sizeof(store->num_sample_payloads);
-                res += (store->num_sample_payloads * payload_size_ + 7) / 8;
+                res += (store->num_sample_payloads * sample_payload_size_ + 7) / 8;
             }
             if (store->ptr != nullptr) {
                 const uint64_t word_count = store->GetPtrWordCount(scaled_sizes_[store->GetSizeGrade()], infix_size_, payload_size_);
@@ -2557,6 +2601,8 @@ inline uint32_t Diva<diva_type, payload_type>::SerializeMetadata(char *out) cons
     if constexpr (payload_type == PayloadType::FixedLength) {
         memcpy(out + res, &payload_size_, sizeof(payload_size_));
         res += sizeof(payload_size_);
+        memcpy(out + res, &sample_payload_size_, sizeof(sample_payload_size_));
+        res += sizeof(sample_payload_size_);
     }
 
     memcpy(out + res, &rng_seed_, sizeof(rng_seed_));
@@ -2595,7 +2641,7 @@ inline uint64_t Diva<diva_type, payload_type>::SerializeInfixStore(char *out,
 
     if constexpr (payload_type == PayloadType::FixedLength) {
         if (store.num_sample_payloads > 0) {
-            const uint32_t sample_payload_byte_count = (store.num_sample_payloads * payload_size_ + 7) / 8;
+            const uint32_t sample_payload_byte_count = (store.num_sample_payloads * sample_payload_size_ + 7) / 8;
             uint8_t *sample_payloads = reinterpret_cast<uint8_t *>(store.ptr[1]);
             memcpy(out + offset, sample_payloads, sample_payload_byte_count);
             offset += sample_payload_byte_count;
@@ -2746,6 +2792,8 @@ inline uint32_t Diva<diva_type, payload_type>::DeserializeMetadata(const char *d
     if constexpr (payload_type == PayloadType::FixedLength) {
         memcpy(&payload_size_, deser_buf + res, sizeof(payload_size_));
         res += sizeof(payload_size_);
+        memcpy(&sample_payload_size_, deser_buf + res, sizeof(sample_payload_size_));
+        res += sizeof(sample_payload_size_);
     }
 
     memcpy(&rng_seed_, deser_buf + res, sizeof(rng_seed_));
@@ -2789,7 +2837,7 @@ inline uint32_t Diva<diva_type, payload_type>::DeserializeInfixStore(const char 
 
     if constexpr (payload_type == PayloadType::FixedLength) {
         if (store.num_sample_payloads > 0) {
-            const uint32_t sample_payload_byte_count = (store.num_sample_payloads * payload_size_ + 7) / 8;
+            const uint32_t sample_payload_byte_count = (store.num_sample_payloads * sample_payload_size_ + 7) / 8;
             uint8_t *sample_payloads = reinterpret_cast<uint8_t *>(malloc(sample_payload_byte_count));
             store.ptr[1] = reinterpret_cast<uint64_t>(sample_payloads);
             memcpy(sample_payloads, deser_buf + offset, sample_payload_byte_count);
@@ -4043,11 +4091,14 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreamingToCurrentInfix(
     memcpy(key_copy, key, key_len);
 
     if (bulk_load_left_key_.str == nullptr) {
-        bulk_load_left_key_ = {key_copy, key_len};
-        if constexpr (payload_type == PayloadType::FixedLength)
-            copy_bitmap_to_bitmap(payload, 0, bulk_load_left_payload_, 0, payload_size_);
+        // Use a 0x00 sentinel as the initial left boundary so the infix interval
+        // (0x00, B_0) at build time matches (prev_key, next_key) at query time once
+        // SealFinish inserts the 0x00 sentinel into the trie.
+        uint8_t *zero_key = new uint8_t[key_len];
+        memset(zero_key, 0x00, key_len);
+        bulk_load_left_key_ = {zero_key, key_len};
         bulk_load_streaming_max_len_ = key_len;
-        return;
+        // Fall through to buffer this first user key below.
     }
 
     bulk_load_streaming_max_len_ = std::max(bulk_load_streaming_max_len_, key_len);
@@ -4067,8 +4118,20 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreamingToCurrentInfix(
     delete[] key_copy;
 }
 
-// we enable a case where only the boundary key has a payload, so we can have a payload associated with the trie
-// without having to set payloads for all the buffered keys (which is the case when using BulkLoadStreamingToCurrentInfix with payloads)
+// Seals the current infix store at the LEFT boundary key (matching regular
+// BulkLoadStreaming layout) and saves the block handle for the NEXT call to
+// write at the new left key's ptr[1].  Trie layout after all seals + SealFinish:
+//
+//   0x00  : infix for (0x00, B_0),       ptr[1] = nullptr
+//   B_0   : infix for (B_0,  B_1),       ptr[1] = handle_0
+//   B_1   : infix for (B_1,  B_2),       ptr[1] = handle_1
+//   ...
+//   B_n   : empty infix,                  ptr[1] = handle_n
+//   0xFF  : sentinel
+//
+// PointQueryWithBoundary for K in (B_{i-1}, B_i):
+//   checks infix at prev_key = B_{i-1}  (same store as regular PointQuery)
+//   returns handle from next_key = B_i  (ptr[1])
 template <DivaType diva_type, PayloadType payload_type>
 inline void Diva<diva_type, payload_type>::BulkLoadStreamingSealWithBoundary(
     const uint8_t *boundary_key, const uint32_t boundary_key_len,
@@ -4076,7 +4139,6 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreamingSealWithBoundary(
 #ifdef DEBUG
     assert(bulk_load_left_key_.str != nullptr && "SealWithBoundary called with no buffered keys");
 #endif
-    // Boundary key is used as the trie key for the sealed infix store.
     uint8_t *boundary_copy = new uint8_t[boundary_key_len];
     memcpy(boundary_copy, boundary_key, boundary_key_len);
     InfiniteByteString bulk_load_right_key {boundary_copy, boundary_key_len};
@@ -4129,50 +4191,104 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreamingSealWithBoundary(
             num_slots_filled += infix.GetNumSlots(infix_size_);
         allocation_size_grade = std::lower_bound(scaled_sizes_, scaled_sizes_ + size_scalar_count, num_slots_filled) - scaled_sizes_;
     }
+    // Use payload_size_ (0) so per-slot overhead is zero; block handle goes in ptr[1].
     InfixStore store(scaled_sizes_[allocation_size_grade], infix_size_,
-                     allocation_size_grade, boundary_payload_size);
+                     allocation_size_grade, payload_size_);
     if constexpr (diva_type == DivaType::BinaryTrie)
         LoadVectorToInfixStore(store, infix_vec, total_implicit, true, bulk_load_payload_list_);
     else
         LoadListToInfixStore(store, infix_list, bulk_load_streaming_ind_, total_implicit, true, bulk_load_payload_list_);
 
-    // we always add a payload to the trie
-    uint64_t boundary_payload_bits[(boundary_payload_size + 63) / 64 + 1];
-    copy_bitmap_to_bitmap(boundary_payload, 0, boundary_payload_bits, 0,
-                          boundary_payload_size);
-    AddSamplePayload(store, boundary_payload_bits);
+    // Write the handle from the PREVIOUS seal into this store's ptr[1].
+    // On first seal prev_seal_payload_ is nullptr (no preceding block).
+    // Ownership of the allocated buffer is transferred to the InfixStore.
+    if (prev_seal_payload_ != nullptr) {
+        store.ptr[1] = reinterpret_cast<uint64_t>(prev_seal_payload_);
+        store.num_sample_payloads = 1;
+        prev_seal_payload_ = nullptr;
+    }
 
+    // Store infix at the LEFT key (bulk_load_left_key_), same as regular
+    // BulkLoadStreaming.  PointQuery / PointQueryWithBoundary will find this
+    // store at prev_key when the query key falls in (left, boundary).
     if constexpr (diva_type == DivaType::Int) {
-        wh_int_put(better_tree_int_, bulk_load_right_key.str,
-                bulk_load_right_key.length, &store,
+        wh_int_put(better_tree_int_, bulk_load_left_key_.str,
+                bulk_load_left_key_.length, &store,
                 sizeof(store),
                 dummy_locked_leaf_addrs);
     } else {
-        wh_put(better_tree_, bulk_load_right_key.str,
-                bulk_load_right_key.length, &store,
+        wh_put(better_tree_, bulk_load_left_key_.str,
+                bulk_load_left_key_.length, &store,
                 sizeof(store),
                 dummy_locked_leaf_addrs);
     }
 
+    // Save the current boundary's block handle; will be placed at ptr[1] of the
+    // store written for this boundary key on the next SealWithBoundary call (or
+    // by SealFinish for the last boundary).
+    if (boundary_payload != nullptr && boundary_payload_size > 0) {
+        const uint32_t words = (boundary_payload_size + 63) / 64;
+        prev_seal_payload_ = reinterpret_cast<uint64_t *>(malloc(words * sizeof(uint64_t)));
+        memset(prev_seal_payload_, 0, words * sizeof(uint64_t));
+        copy_bitmap_to_bitmap(boundary_payload, 0, prev_seal_payload_, 0,
+                              boundary_payload_size);
+        prev_seal_payload_size_ = boundary_payload_size;
+    }
+
     const uint32_t sealed_key_count = static_cast<uint32_t>(bulk_load_streaming_ind_) + 2;
 
-    // Reset buffered state; next segment starts fresh.
+    // Advance left key to the boundary (NOT yet in trie; written on next call).
     delete[] bulk_load_left_key_.str;
-    bulk_load_left_key_ = {};
+    bulk_load_left_key_ = bulk_load_right_key;  // transfer ownership
     bulk_load_streaming_ind_ = 0;
     for (int32_t i = 0; i < infix_store_target_size; i++) {
         delete[] bulk_load_key_list_[i].str;
         bulk_load_key_list_[i] = {};
     }
-    delete[] bulk_load_right_key.str;
 
     n_keys_.fetch_add(sealed_key_count, std::memory_order_release);
 }
 
 template <DivaType diva_type, PayloadType payload_type>
 inline void Diva<diva_type, payload_type>::BulkLoadStreamingSealFinish() {
-    assert(bulk_load_left_key_.str == nullptr);
     assert(bulk_load_streaming_ind_ == 0);
+
+    // bulk_load_left_key_ is the last boundary B_n (set by the final SealWithBoundary).
+    // Insert it into the trie with an empty infix and prev_seal_payload_ (= handle_n)
+    // in ptr[1], so PointQueryWithBoundary on keys in [B_n, 0xFF) returns handle_n.
+    // The 0x00 sentinel is already in the trie from the first BulkLoadStreamingToCurrentInfix
+    // call (where it was used as the initial left boundary).
+    if (bulk_load_left_key_.str != nullptr) {
+        void *dummy_locked_leaf_addrs[3] = {nullptr, nullptr, nullptr};
+        InfixStore store(scaled_sizes_[size_scalar_shrink_grow_sep], infix_size_,
+                         size_scalar_shrink_grow_sep, payload_size_);
+        if (prev_seal_payload_ != nullptr) {
+            store.ptr[1] = reinterpret_cast<uint64_t>(prev_seal_payload_);
+            store.num_sample_payloads = 1;
+            prev_seal_payload_ = nullptr;
+        }
+        if constexpr (diva_type == DivaType::Int) {
+            wh_int_put(better_tree_int_, bulk_load_left_key_.str,
+                       bulk_load_left_key_.length, &store, sizeof(store),
+                       dummy_locked_leaf_addrs);
+        } else {
+            wh_put(better_tree_, bulk_load_left_key_.str,
+                   bulk_load_left_key_.length, &store, sizeof(store),
+                   dummy_locked_leaf_addrs);
+        }
+        delete[] bulk_load_left_key_.str;
+        bulk_load_left_key_ = {};
+    } else if (prev_seal_payload_ != nullptr) {
+        free(prev_seal_payload_);
+        prev_seal_payload_ = nullptr;
+    }
+
+    // Add 0xFF sentinel so GetLowerUpperBounds always finds a next_key.
+    // (0x00 was already inserted as the initial left boundary.)
+    uint8_t *key_copy = new uint8_t[100];
+    memset(key_copy, 0xFF, 100);
+    AddTreeKey(key_copy, 100);
+    delete[] key_copy;
 }
 
 
