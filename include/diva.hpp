@@ -2800,8 +2800,8 @@ inline uint32_t Diva<diva_type, payload_type>::DeserializeMetadata(const char *d
     res += sizeof(rng_seed_);
     rng_.seed(rng_seed_);
 
-    uint64_t n_keys_val;
-    memcpy(&n_keys_val, deser_buf + res, sizeof(rng_seed_));
+    uint64_t n_keys_val = 0;
+    memcpy(&n_keys_val, deser_buf + res, sizeof(n_keys_val));
     res += sizeof(n_keys_val);
     n_keys_.store(n_keys_val, std::memory_order_release);
 
