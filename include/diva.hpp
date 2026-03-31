@@ -4395,7 +4395,7 @@ template <DivaType diva_type, PayloadType payload_type>
 inline void Diva<diva_type, payload_type>::BulkLoadStreamingFinish() {
     uint8_t *key_copy = new uint8_t[bulk_load_streaming_max_len_];
     memset(key_copy, 0x00, bulk_load_streaming_max_len_);
-    AddTreeKey(key_copy, bulk_load_streaming_max_len_);
+    AddTreeKey(key_copy, 1); // use size 1 to avoid overriding a user key
     memset(key_copy, 0xFF, bulk_load_streaming_max_len_);
     AddTreeKey(key_copy, bulk_load_streaming_max_len_);
 
