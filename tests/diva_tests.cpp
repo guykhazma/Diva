@@ -28,6 +28,30 @@
 #include "diva.hpp"
 #include "util.hpp"
 
+namespace {
+
+struct PayloadBitmapEqForDelete {
+    const uint64_t *ref_;
+    uint32_t payload_size_bits_;
+    bool operator()(const uint64_t *payload) const {
+        return compare_bitmap_to_bitmap(payload, 0, ref_, 0, payload_size_bits_);
+    }
+};
+
+struct PayloadFirstWordEq {
+    uint64_t expected_;
+    bool operator()(const uint64_t *payload) const { return payload[0] == expected_; }
+};
+
+struct PayloadInOpenRangeDeleteThreshold {
+    uint64_t threshold_;
+    bool operator()(const uint64_t *payload) const {
+        return payload[0] <= threshold_ && payload[0] > 0;
+    }
+};
+
+}  // namespace
+
 namespace diva {
 
 typedef Diva<DivaType::BinaryTrie, PayloadType::None> BinaryTrieDiva;
@@ -395,7 +419,7 @@ public:
         for (int32_t i = 1; i < 100; i++) {
             const uint32_t shared = 34;
             const uint32_t ignore = 1;
-            const uint32_t bits_to_zero_out = sizeof(uint64_t) * 8 - shared - ignore - Diva<diva_type>::base_implicit_size - s.infix_size_;
+            const uint32_t bits_to_zero_out = sizeof(uint64_t) * 8 - shared - ignore - __builtin_ctz(s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep]) - s.infix_size_;
 
             const uint64_t l = 0x0000000011111111ULL, r = 0x0000000022222222ULL;
             const uint64_t interp = (l * i + r * (100 - i)) / 100;
@@ -409,7 +433,7 @@ public:
         for (int32_t i = 90; i >= 70; i -= 2) {
             const uint32_t shared = 34;
             const uint32_t ignore = 1;
-            const uint32_t bits_to_zero_out = sizeof(uint64_t) * 8 - shared - ignore - Diva<diva_type>::base_implicit_size - s.infix_size_;
+            const uint32_t bits_to_zero_out = sizeof(uint64_t) * 8 - shared - ignore - __builtin_ctz(s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep]) - s.infix_size_;
 
             const uint64_t l = 0x0000000011111111ULL, r = 0x0000000022222222ULL;
             const uint64_t interp = (l * i + r * (100 - i)) / 100;
@@ -424,7 +448,7 @@ public:
         for (int32_t i = 1; i < 50; i++) {
             const uint32_t shared = 34;
             const uint32_t ignore = 1;
-            const uint32_t bits_to_zero_out = sizeof(uint64_t) * 8 - shared - ignore - Diva<diva_type>::base_implicit_size - s.infix_size_;
+            const uint32_t bits_to_zero_out = sizeof(uint64_t) * 8 - shared - ignore - __builtin_ctz(s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep]) - s.infix_size_;
 
             const uint64_t l = 0x0000000011111111ULL, r = 0x0000000022222222ULL;
             const uint64_t interp = (l * 30 + r * 70) / 100 + (i << shamt);
@@ -536,7 +560,7 @@ public:
         for (int32_t i = 1; i < 100; i++) {
             const uint32_t shared = 34;
             const uint32_t ignore = 1;
-            const uint32_t bits_to_zero_out = sizeof(uint64_t) * 8 - shared - ignore - Diva<diva_type>::base_implicit_size - s.infix_size_;
+            const uint32_t bits_to_zero_out = sizeof(uint64_t) * 8 - shared - ignore - __builtin_ctz(s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep]) - s.infix_size_;
 
             const uint64_t l = 0x0000000011111111ULL, r = 0x0000000022222222ULL;
             const uint64_t interp = (l * i + r * (100 - i)) / 100;
@@ -550,7 +574,7 @@ public:
         for (int32_t i = 90; i >= 70; i -= 2) {
             const uint32_t shared = 34;
             const uint32_t ignore = 1;
-            const uint32_t bits_to_zero_out = sizeof(uint64_t) * 8 - shared - ignore - Diva<diva_type>::base_implicit_size - s.infix_size_;
+            const uint32_t bits_to_zero_out = sizeof(uint64_t) * 8 - shared - ignore - __builtin_ctz(s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep]) - s.infix_size_;
 
             const uint64_t l = 0x0000000011111111ULL, r = 0x0000000022222222ULL;
             const uint64_t interp = (l * i + r * (100 - i)) / 100;
@@ -565,7 +589,7 @@ public:
         for (int32_t i = 1; i < 50; i++) {
             const uint32_t shared = 34;
             const uint32_t ignore = 1;
-            const uint32_t bits_to_zero_out = sizeof(uint64_t) * 8 - shared - ignore - Diva<diva_type>::base_implicit_size - s.infix_size_;
+            const uint32_t bits_to_zero_out = sizeof(uint64_t) * 8 - shared - ignore - __builtin_ctz(s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep]) - s.infix_size_;
 
             const uint64_t l = 0x0000000011111111ULL, r = 0x0000000022222222ULL;
             const uint64_t interp = (l * 30 + r * 70) / 100 + (i << shamt);
@@ -1057,7 +1081,7 @@ public:
             for (int32_t i = 1; i < 100; i++) {
                 const uint32_t shared = 34;
                 const uint32_t ignore = 1;
-                const uint32_t bits_to_zero_out = sizeof(uint64_t) * 8 - shared - ignore - Diva<diva_type>::base_implicit_size - s.infix_size_;
+                const uint32_t bits_to_zero_out = sizeof(uint64_t) * 8 - shared - ignore - __builtin_ctz(s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep]) - s.infix_size_;
 
                 const uint64_t l = 0x0000000011111111ULL, r = 0x0000000022222222ULL;
                 const uint64_t interp = (l * i + r * (100 - i)) / 100;
@@ -1069,7 +1093,7 @@ public:
             for (int32_t i = 90; i >= 70; i -= 2) {
                 const uint32_t shared = 34;
                 const uint32_t ignore = 1;
-                const uint32_t bits_to_zero_out = sizeof(uint64_t) * 8 - shared - ignore - Diva<diva_type>::base_implicit_size - s.infix_size_;
+                const uint32_t bits_to_zero_out = sizeof(uint64_t) * 8 - shared - ignore - __builtin_ctz(s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep]) - s.infix_size_;
 
                 const uint64_t l = 0x0000000011111111ULL, r = 0x0000000022222222ULL;
                 const uint64_t interp = (l * i + r * (100 - i)) / 100;
@@ -1082,7 +1106,7 @@ public:
             for (int32_t i = 1; i < 50; i++) {
                 const uint32_t shared = 34;
                 const uint32_t ignore = 1;
-                const uint32_t bits_to_zero_out = sizeof(uint64_t) * 8 - shared - ignore - Diva<diva_type>::base_implicit_size - s.infix_size_;
+                const uint32_t bits_to_zero_out = sizeof(uint64_t) * 8 - shared - ignore - __builtin_ctz(s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep]) - s.infix_size_;
 
                 const uint64_t l = 0x0000000011111111ULL, r = 0x0000000022222222ULL;
                 const uint64_t interp = (l * 30 + r * 70) / 100 + (i << shamt);
@@ -1126,7 +1150,8 @@ public:
                         const uint64_t prev_key = to_big_endian_order(*it);
                         auto [shared, ignore, implicit_size] = s.GetSharedIgnoreImplicitLengths(
                                 {reinterpret_cast<const uint8_t *>(&prev_key), sizeof(prev_key)},
-                                {reinterpret_cast<const uint8_t *>(&next_key), sizeof(next_key)});
+                                {reinterpret_cast<const uint8_t *>(&next_key), sizeof(next_key)},
+                                s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep]);
                         const uint32_t bits_to_zero_out = std::max(sizeof(uint64_t) * 8 - shared - ignore - implicit_size - s.infix_size_,
                                                                    keys[j].second);
                         const uint64_t l = keys[j].first & (~BITMASK(bits_to_zero_out + 1));
@@ -1548,7 +1573,8 @@ public:
         const uint32_t seed = 1;
         const float load_factor = 0.95;
         const uint32_t n_keys = 10 * 1024;
-        const uint32_t infix_store_target_size = Diva<diva_type, PayloadType::FixedLength>::infix_store_target_size;
+        constexpr uint32_t infix_store_target_size =
+            Diva<diva_type, PayloadType::FixedLength>::kDefaultInfixStoreTargetSize;
         const bool check_it_write = false;
         const bool check_it_unlock = true;
 
@@ -2473,7 +2499,7 @@ public:
                 for (int32_t i = 1; i < 100; i++) {
                     const uint32_t shared = 34;
                     const uint32_t ignore = 1;
-                    const uint32_t bits_to_zero_out = sizeof(uint64_t) * 8 - shared - ignore - Diva<diva_type>::base_implicit_size - s.infix_size_;
+                    const uint32_t bits_to_zero_out = sizeof(uint64_t) * 8 - shared - ignore - __builtin_ctz(s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep]) - s.infix_size_;
 
                     const uint64_t l = 0x0000000011111111ULL, r = 0x0000000022222222ULL;
                     const uint64_t interp = (l * i + r * (100 - i)) / 100;
@@ -2489,7 +2515,7 @@ public:
                 for (int32_t i = 90; i >= 70; i -= 2) {
                     const uint32_t shared = 34;
                     const uint32_t ignore = 1;
-                    const uint32_t bits_to_zero_out = sizeof(uint64_t) * 8 - shared - ignore - Diva<diva_type>::base_implicit_size - s.infix_size_;
+                    const uint32_t bits_to_zero_out = sizeof(uint64_t) * 8 - shared - ignore - __builtin_ctz(s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep]) - s.infix_size_;
 
                     const uint64_t l = 0x0000000011111111ULL, r = 0x0000000022222222ULL;
                     const uint64_t interp = (l * i + r * (100 - i)) / 100;
@@ -2506,7 +2532,7 @@ public:
                 for (int32_t i = 1; i < 50; i++) {
                     const uint32_t shared = 34;
                     const uint32_t ignore = 1;
-                    const uint32_t bits_to_zero_out = sizeof(uint64_t) * 8 - shared - ignore - Diva<diva_type>::base_implicit_size - s.infix_size_;
+                    const uint32_t bits_to_zero_out = sizeof(uint64_t) * 8 - shared - ignore - __builtin_ctz(s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep]) - s.infix_size_;
 
                     const uint64_t l = 0x0000000011111111ULL, r = 0x0000000022222222ULL;
                     const uint64_t interp = (l * 30 + r * 70) / 100 + (i << shamt);
@@ -2561,7 +2587,7 @@ public:
 
                     const uint64_t del_value = to_big_endian_order(keys[i].first);
                     s.Delete(reinterpret_cast<const uint8_t *>(&del_value), sizeof(del_value),
-                             [&](const uint64_t *payload) { return compare_bitmap_to_bitmap(payload, 0, payloads[i], 0, payload_size); });
+                             PayloadBitmapEqForDelete{payloads[i], payload_size});
 
                     for (int32_t j = 0; j < keys.size(); j++) {
                         const uint64_t query = to_big_endian_order(keys[j].first);
@@ -2573,7 +2599,8 @@ public:
                             uint64_t prev_key = to_big_endian_order(it->first);
                             auto [shared, ignore, implicit_size] = s.GetSharedIgnoreImplicitLengths(
                                     {reinterpret_cast<const uint8_t *>(&prev_key), sizeof(prev_key)},
-                                    {reinterpret_cast<const uint8_t *>(&next_key), sizeof(next_key)});
+                                    {reinterpret_cast<const uint8_t *>(&next_key), sizeof(next_key)},
+                                    s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep]);
                             const uint32_t bits_to_zero_out = std::max(sizeof(uint64_t) * 8 - shared - ignore - implicit_size - s.infix_size_,
                                                                        keys[j].second);
                             const uint64_t l = keys[j].first & (~BITMASK(bits_to_zero_out + 1));
@@ -2636,9 +2663,7 @@ public:
                         const uint32_t pos = rng() % i;
                         if (!deleted[pos]) {
                             s.Delete(string_keys[pos].first,
-                                     [&](const uint64_t *payload) { return compare_bitmap_to_bitmap(payload, 0,
-                                                                                                    string_keys[pos].second, 0,
-                                                                                                    payload_size); });
+                                     PayloadBitmapEqForDelete{string_keys[pos].second, payload_size});
                             deleted[pos] = true;
                         }
                     }
@@ -2693,7 +2718,7 @@ public:
 
                     const uint64_t delete_key = to_big_endian_order(0b00001111'11111111'01101101'10000000UL);
                     s.Delete(reinterpret_cast<const uint8_t *>(&delete_key), sizeof(delete_key),
-                            [] (const uint64_t *payload) {return payload[0] == 0x2de5277990af454b; });
+                            PayloadFirstWordEq{0x2de5277990af454bULL});
 
                     it = wh_int_iter_create(s.better_tree_int_);
                     wh_int_iter_seek(it, reinterpret_cast<const void *>(&value), sizeof(value), check_it_write);
@@ -2720,7 +2745,7 @@ public:
 
                     const uint64_t delete_key = to_big_endian_order(0b00001111'11111111'01101101'10000000UL);
                     s.Delete(reinterpret_cast<const uint8_t *>(&delete_key), sizeof(delete_key),
-                            [] (const uint64_t *payload) {return payload[0] == 0x2de5277990af454b; });
+                            PayloadFirstWordEq{0x2de5277990af454bULL});
 
                     it = wh_iter_create(s.better_tree_);
                     wh_iter_seek(it, reinterpret_cast<const void *>(&value), sizeof(value), check_it_write);
@@ -2869,7 +2894,8 @@ public:
         const uint32_t seed = 1;
         const float load_factor = 0.95;
         const uint32_t payload_size = 100;
-        const uint32_t infix_store_target_size = Diva<diva_type, PayloadType::FixedLength>::infix_store_target_size;
+        constexpr uint32_t infix_store_target_size =
+            Diva<diva_type, PayloadType::FixedLength>::kDefaultInfixStoreTargetSize;
         const uint32_t n_keys = 100 * infix_store_target_size;
 
         const uint32_t rng_seed = 2;
@@ -3398,9 +3424,7 @@ public:
                                     if (!deleted[pos].load(std::memory_order_acquire)) {
                                         auto it = s.GetIterator(string_keys[pos]);
                                         s.Delete(string_keys[pos],
-                                                [&](const uint64_t *ptr) {
-                                                    return compare_bitmap_to_bitmap(ptr, 0, payloads[pos], 0, payload_size);
-                                                });
+                                                PayloadBitmapEqForDelete{payloads[pos], payload_size});
                                         deleted[pos].store(true, std::memory_order_release);
                                     }
                                 }
@@ -3542,10 +3566,8 @@ public:
                         else {
                             while (n_keys_inserted_overall.load(std::memory_order_acquire) <= delete_threshold)
                                 cpu_pause();
-                            s.DeleteRange(nullptr, 0, nullptr, 0, 
-                                    [=](const uint64_t *payload) { 
-                                        return payload[0] <= delete_threshold && payload[0] > 0;
-                                    });
+                            s.DeleteRange(nullptr, 0, nullptr, 0,
+                                    PayloadInOpenRangeDeleteThreshold{delete_threshold});
                         }
                     });
             }
@@ -4166,12 +4188,13 @@ private:
             REQUIRE_EQ(store.GetFullSlotCount(), checks.size());
         if constexpr (payload_type == PayloadType::FixedLength)
             assert(check_payloads != nullptr);
+        const uint32_t bitmap_w = static_cast<uint32_t>(s.bitmap_target_sizes_[store.GetSizeGrade()]);
         const uint32_t *popcnts = reinterpret_cast<const uint32_t *>(store.ptr);
         const uint64_t *occupieds = store.ptr + Diva<diva_type, payload_type>::num_metadata_offset_words;
         const uint64_t *runends = store.ptr + Diva<diva_type, payload_type>::num_metadata_offset_words
-                                    + Diva<>::infix_store_target_size / 64;
+                                    + bitmap_w / 64;
         uint32_t ind = 0;
-        for (uint32_t i = 0; i < Diva<>::infix_store_target_size; i++) {
+        for (uint32_t i = 0; i < bitmap_w; i++) {
             if (ind < occupieds_pos.size() && i == occupieds_pos[ind]) {
                 REQUIRE_EQ(get_bitmap_bit(occupieds, i), 1);
                 ind++;
@@ -4210,7 +4233,7 @@ private:
         REQUIRE_EQ(occupieds_pos.size(), runend_count);
 
         uint32_t check_popcnts[2] = {};
-        for (int32_t i = 0; i < Diva<>::infix_store_target_size / 128; i++) {
+        for (int32_t i = 0; i < static_cast<int32_t>(bitmap_w / 128); i++) {
             check_popcnts[0] += __builtin_popcountll(occupieds[i]);
             const uint64_t masked_runends = runends[i] & BITMASK(std::min(64, std::max<int32_t>(total_size - 64 * i, 0)));
             check_popcnts[1] += __builtin_popcountll(masked_runends);
@@ -4223,7 +4246,6 @@ private:
     template <DivaType diva_type, PayloadType payload_type>
     static void AssertDivas(const Diva<diva_type, payload_type>& a, const Diva<diva_type, payload_type>& b) {
         REQUIRE_EQ(a.infix_store_target_size, b.infix_store_target_size);
-        REQUIRE_EQ(a.base_implicit_size, b.base_implicit_size);
         REQUIRE_EQ(a.scale_shift, b.scale_shift);
         REQUIRE_EQ(a.scale_implicit_shift, b.scale_implicit_shift);
         REQUIRE_EQ(a.size_scalar_count, b.size_scalar_count);
@@ -4266,7 +4288,11 @@ private:
                 REQUIRE_EQ(memcmp(tree_key_a, tree_key_b, tree_key_a_len), 0);
                 REQUIRE_EQ(store_a->status, store_b->status);
                 const uint32_t slot_count = a.scaled_sizes_[store_a->GetSizeGrade()];
-                const uint32_t word_count = store_a->GetPtrWordCount(slot_count, a.infix_size_);
+                const uint32_t bw = static_cast<uint32_t>(
+                    a.bitmap_target_sizes_[store_a->GetSizeGrade()]);
+                const uint32_t word_count = static_cast<uint32_t>(
+                    Diva<diva_type, payload_type>::InfixStore::GetPtrWordCount(
+                        slot_count, a.infix_size_, bw, a.payload_size_));
                 REQUIRE_EQ(store_a->ptr[0], store_b->ptr[0]);
                 REQUIRE_EQ(memcmp(store_a->ptr + Diva<diva_type, payload_type>::num_metadata_offset_words,
                                        store_b->ptr + Diva<diva_type, payload_type>::num_metadata_offset_words,
@@ -4309,7 +4335,11 @@ private:
                 REQUIRE_EQ(memcmp(tree_key_a, tree_key_b, tree_key_a_len), 0);
                 REQUIRE_EQ(store_a->status, store_b->status);
                 const uint32_t slot_count = a.scaled_sizes_[store_a->GetSizeGrade()];
-                const uint32_t word_count = store_a->GetPtrWordCount(slot_count, a.infix_size_);
+                const uint32_t bw = static_cast<uint32_t>(
+                    a.bitmap_target_sizes_[store_a->GetSizeGrade()]);
+                const uint32_t word_count = static_cast<uint32_t>(
+                    Diva<diva_type, payload_type>::InfixStore::GetPtrWordCount(
+                        slot_count, a.infix_size_, bw, a.payload_size_));
                 REQUIRE_EQ(store_a->ptr[0], store_b->ptr[0]);
                 REQUIRE_EQ(memcmp(store_a->ptr + Diva<diva_type, payload_type>::num_metadata_offset_words,
                                        store_b->ptr + Diva<diva_type, payload_type>::num_metadata_offset_words,
@@ -4338,7 +4368,8 @@ private:
     static void CheckDivaPayloads(Diva<diva_type, PayloadType::FixedLength>& s,
                                   std::vector<std::string> keys,
                                   const uint64_t **payloads) {
-        const uint32_t infix_store_target_size = Diva<diva_type, PayloadType::FixedLength>::infix_store_target_size;
+        constexpr uint32_t infix_store_target_size =
+            Diva<diva_type, PayloadType::FixedLength>::kDefaultInfixStoreTargetSize;
 
         uint32_t check_pos = 0;
         const bool write = false, unlock = true;
@@ -4417,10 +4448,11 @@ private:
     static void PrintStore(const Diva<diva_type, payload_type> &s,
                            const typename Diva<diva_type, payload_type>::InfixStore &store) {
         const uint32_t size_grade = store.GetSizeGrade();
+        const uint32_t bitmap_w = static_cast<uint32_t>(s.bitmap_target_sizes_[size_grade]);
         const uint32_t *popcnts = reinterpret_cast<const uint32_t *>(store.ptr);
         const uint64_t *occupieds = store.ptr + Diva<diva_type, payload_type>::num_metadata_offset_words;
         const uint64_t *runends = store.ptr + Diva<diva_type, payload_type>::num_metadata_offset_words
-                                  + Diva<>::infix_store_target_size / 64;
+                                  + bitmap_w / 64;
 
         std::cerr << " size_grade=" << size_grade << " full_slot_count=" << store.GetFullSlotCount() << std::endl;
         if constexpr (payload_type == PayloadType::FixedLength) {
@@ -4435,7 +4467,7 @@ private:
         }
         std::cerr << "popcnts=[" << popcnts[0] << ", " << popcnts[1] << ']' << std::endl;
         std::cerr << "occupieds: ";
-        for (int32_t i = 0; i < Diva<>::infix_store_target_size; i++) {
+        for (int32_t i = 0; i < static_cast<int32_t>(bitmap_w); i++) {
             if ((occupieds[i / 64] >> (i % 64)) & 1ULL)
                 std::cerr << i << ", ";
         }

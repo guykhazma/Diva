@@ -92,17 +92,20 @@ class Diva {
 public:
     Diva(const uint32_t infix_size, const uint32_t rng_seed, const float load_factor,
          const uint32_t payload_size=0, const bool setup_start_end_samples=false,
-         const uint32_t sample_payload_size=0);
+         const uint32_t sample_payload_size=0,
+         const uint32_t target_size=kDefaultInfixStoreTargetSize);
 
     template <class t_itr>
     Diva(const uint32_t infix_size, const t_itr begin, const t_itr end, const uint32_t key_len,
          const uint32_t rng_seed, const float load_factor,
-         const uint32_t payload_size=0, const uint64_t **payload_list=nullptr);
+         const uint32_t payload_size=0, const uint64_t **payload_list=nullptr,
+         const uint32_t target_size=kDefaultInfixStoreTargetSize);
 
     template <class t_itr>
-    Diva(const uint32_t infix_size, const t_itr begin, const t_itr end, 
+    Diva(const uint32_t infix_size, const t_itr begin, const t_itr end,
          const uint32_t rng_seed, const float load_factor,
-         const uint32_t payload_size=0, const uint64_t **payload_list=nullptr);
+         const uint32_t payload_size=0, const uint64_t **payload_list=nullptr,
+         const uint32_t target_size=kDefaultInfixStoreTargetSize);
 
     Diva(const char *deser_buf);
 
@@ -358,16 +361,11 @@ public:
                 end_key_ = {nullptr, 0};
         }
     };
+    static constexpr uint32_t kDefaultInfixStoreTargetSize = 1024;
 
 private:
     static constexpr uint32_t num_metadata_offset_words = payload_type == PayloadType::FixedLength ? 2 : 1;
-#if ACTUAL_SUFFIX_LEN_MODE == 0
-    static constexpr uint32_t infix_store_target_size = 1024;
-#else
-    static constexpr uint32_t infix_store_target_size = 256;
-#endif // DEBUG
-    static_assert(infix_store_target_size % 64 == 0);
-    static constexpr uint32_t base_implicit_size = __builtin_ctz(infix_store_target_size);
+    uint32_t infix_store_target_size;
     static constexpr uint32_t scale_shift = 15;
     static constexpr uint32_t scale_implicit_shift = 15;
     static constexpr uint32_t size_scalar_count = 500;
@@ -383,10 +381,11 @@ private:
         std::atomic<lock_t> rwlock {0};
         uint64_t *ptr = nullptr;
 
+        // occupied_bits: logical width of occupieds (see bitmap_target_sizes_[grade]). Runends use slot_count bits.
         InfixStore(const uint32_t slot_count, const uint32_t slot_size,
-                   const uint32_t size_grade, const uint32_t payload_size=0) {
+                   const uint32_t size_grade, const uint32_t occupied_bits, const uint32_t payload_size=0) {
             SetSizeGrade(size_grade);
-            const uint64_t word_count = GetPtrWordCount(slot_count, slot_size, payload_size);
+            const uint64_t word_count = GetPtrWordCount(slot_count, slot_size, occupied_bits, payload_size);
             rwlock.store(0, std::memory_order_release);
             ptr = new uint64_t[word_count];
             memset(ptr, 0, sizeof(uint64_t) * word_count);
@@ -403,17 +402,29 @@ private:
         InfixStore(InfixStore &&other) = default;
         InfixStore &operator=(const InfixStore &other) = default;
 
-        void Reset(const uint32_t slot_count, const uint32_t slot_size, const uint32_t payload_size=0) {
+        // occupied_bits: same as ctor.
+        void Reset(const uint32_t slot_count, const uint32_t slot_size, const uint32_t occupied_bits, const uint32_t payload_size=0) {
 #ifdef DEBUG
             assert(ptr);
 #endif // DEBUG
-            memset(ptr, 0, GetPtrWordCount(slot_count, slot_size, payload_size) * sizeof(uint64_t));
+            memset(ptr, 0, GetPtrWordCount(slot_count, slot_size, occupied_bits, payload_size) * sizeof(uint64_t));
         }
 
-        static uint64_t GetPtrWordCount(const uint32_t slot_count, const uint32_t slot_size, const uint32_t payload_size=0) {
+        // Rounds occupied logical width up to a 64-bit multiple for storage (occupied_aligned bits).
+        static uint32_t OccupiedAlignedBits(const uint32_t occupied_bits) {
+            return (occupied_bits + 63u) / 64u * 64u;
+        }
+
+        // Layout: occupieds (occupied_aligned bits), runends (slot_count bits), then slot strip.
+        static uint64_t GetPtrWordCount(const uint32_t slot_count, const uint32_t slot_size,
+                                        const uint32_t occupied_bits, const uint32_t payload_size=0) {
+            uint64_t slot_stride = static_cast<uint64_t>(slot_size);
             if constexpr (payload_type == PayloadType::FixedLength)
-                return num_metadata_offset_words + (Diva::infix_store_target_size + slot_count * (slot_size + 1 + payload_size) + 63) / 64;
-            return num_metadata_offset_words + (Diva::infix_store_target_size + slot_count * (slot_size + 1) + 63) / 64;
+                slot_stride += payload_size;
+            const uint64_t slot_bits = static_cast<uint64_t>(slot_count) * slot_stride;
+            const uint64_t occupied_aligned = static_cast<uint64_t>(OccupiedAlignedBits(occupied_bits));
+            const uint64_t data_bits = occupied_aligned + static_cast<uint64_t>(slot_count) + slot_bits;
+            return num_metadata_offset_words + (data_bits + 63) / 64;
         }
 
         uint64_t GetFullSlotCount() const {
@@ -518,7 +529,7 @@ private:
         int32_t GetLongestMatch(const InfiniteByteString key,
                                 uint32_t key_start_bit, 
                                 uint32_t slot_size) const;
-        void SerializeToInfixStore(InfixStore& store, uint32_t pos, uint32_t store_size, uint32_t slot_size) const;
+        void SerializeToInfixStore(InfixStore& store, uint32_t occupied_bits, uint32_t pos, uint32_t store_size, uint32_t slot_size) const;
         void SerializeToPtr(void *ptr, uint32_t bit_pos, uint32_t slot_size) const;
         void DeserializeFromPtr(void *ptr, uint32_t bit_pos, uint32_t slot_size);
         uint32_t GetNumTrieBitsFromInfixStore(const InfixStore& infix_store,
@@ -607,13 +618,22 @@ private:
     uint32_t rng_seed_;
     const float load_factor_ = 0.95;
     const float load_factor_alt_ = 0.95;
-    const uint32_t size_scalar_shrink_grow_sep = std::log(infix_store_target_size / 64) / std::log(1 / load_factor_) + 1;
-    uint64_t size_scalars_[size_scalar_count], scaled_sizes_[size_scalar_count], exception_scaled_size_;
-    uint64_t implicit_scalars_[infix_store_target_size / 2 + 1];
+    uint32_t size_scalar_shrink_grow_sep;
+
+    // Reconstruct infix_store_target_size from serialized size_scalar_shrink_grow_sep (same
+    // formula as normal ctors: integer target_size/64 inside std::log).
+    static uint32_t InfixStoreTargetSizeFromShrinkGrowSep(uint32_t sep, float load_factor);
+    uint64_t size_scalars_[size_scalar_count], scaled_sizes_[size_scalar_count],
+        // Per grade: occupied bitmap logical width = 2^ceil(log2(num_infixes)); storage is still 64-bit aligned via OccupiedAlignedBits. Runends use scaled_sizes_[i] bits.
+        bitmap_target_sizes_[size_scalar_count],
+        exception_scaled_size_;
+    std::vector<uint64_t> implicit_scalars_;
     std::atomic<uint64_t> n_keys_ = 0;
 
     uint32_t bulk_load_streaming_ind_, bulk_load_streaming_max_len_;
-    InfiniteByteString bulk_load_left_key_, bulk_load_key_list_[infix_store_target_size];
+    uint32_t bulk_load_streaming_capacity_ = 0;
+    InfiniteByteString bulk_load_left_key_;
+    std::vector<InfiniteByteString> bulk_load_key_list_;
     uint64_t *bulk_load_left_payload_ = nullptr, *bulk_load_payload_list_ = nullptr;
     // Carries the block handle from one SealWithBoundary call to the next so it
     // can be written at the LEFT key's InfixStore (ptr[1]) rather than the right
@@ -634,9 +654,13 @@ private:
     template <class t_itr>
     void BulkLoad(t_itr begin, t_itr end, const uint64_t **payloads=nullptr);
     void SetupScaleFactors();
+    // Bit offset from store.ptr[0] to slot 0 (after metadata + aligned occupieds + runends).
+    uint32_t SlotStripBitOffsetInData(uint32_t size_grade) const;
+    uint32_t SlotDataBaseBit(uint32_t size_grade) const;
     std::tuple<uint32_t, uint32_t, uint32_t> 
         GetSharedIgnoreImplicitLengths(const InfiniteByteString key_1,
-                                       const InfiniteByteString key_2) const;
+                                       const InfiniteByteString key_2,
+                                       uint32_t occupied_logical_bits) const;
     uint64_t ExtractPartialKey(const InfiniteByteString key,
                                const uint32_t shared, const uint32_t ignore,
                                const uint32_t implicit_size, const uint64_t msb) const;
@@ -664,6 +688,7 @@ private:
     int32_t PreviousRunend(const InfixStore &store, const uint32_t pos) const;
 
     int32_t GetMappedPos(const uint32_t implicit_part, const uint32_t size_grade, const uint64_t implicit_scalar) const;
+    uint64_t GetImplicitScalar(const uint32_t total_implicit, const uint32_t target_size) const;
     uint64_t GetSlot(const InfixStore &store, const uint32_t pos) const;
     void SetSlot(InfixStore &store, const uint32_t pos, const uint64_t value);
     void SetSlot(InfixStore &store, const uint32_t pos, const uint64_t value, const uint32_t width);
@@ -719,7 +744,7 @@ private:
     int32_t FindEmptySlotAfter(const InfixStore &store, const uint32_t runend_pos) const;
     int32_t FindEmptySlotBefore(const InfixStore &store, const uint32_t runend_pos) const;
     void InsertRawIntoInfixStore(InfixStore &store, const uint64_t key,
-                                 const uint32_t total_implicit=infix_store_target_size,
+                                 const uint32_t total_implicit=kDefaultInfixStoreTargetSize,
                                  const uint64_t *payload=nullptr,
                                  const InfiniteByteString original_key={nullptr, 0},
                                  const uint32_t original_key_start_bit=0);
@@ -727,11 +752,11 @@ private:
                               const InfiniteByteString original_key,
                               const uint32_t original_key_start_bit,
                               const uint32_t adapt_length,
-                              const uint32_t total_implicit=infix_store_target_size,
+                              const uint32_t total_implicit=kDefaultInfixStoreTargetSize,
                               const uint64_t *payload=nullptr);
     // Assumes that `key` is a full length infix.
     void DeleteRawFromInfixStore(InfixStore &store, const uint64_t key,
-                                 const uint32_t total_implicit=infix_store_target_size,
+                                 const uint32_t total_implicit=kDefaultInfixStoreTargetSize,
                                  std::function<bool(const uint64_t *)> should_remove=nullptr,
                                  const InfiniteByteString original_key={nullptr, 0},
                                  const uint32_t original_key_start_bit=0);
@@ -743,41 +768,41 @@ private:
     std::pair<uint64_t, uint32_t> DeleteRawRangeFromInfixStore(InfixStore &store,
                                                                const uint64_t l_key,
                                                                const uint64_t r_key, 
-                                                               const uint32_t total_implicit=infix_store_target_size, 
+                                                               const uint32_t total_implicit=kDefaultInfixStoreTargetSize, 
                                                                std::function<bool(const uint64_t *)> should_remove=nullptr);
     // Assumes that `key` is a full length infix.
     int32_t GetLongestMatchingInfixSize(const InfixStore &store, const uint64_t key,
-                                        const uint32_t total_implicit=infix_store_target_size,
+                                        const uint32_t total_implicit=kDefaultInfixStoreTargetSize,
                                         std::function<bool(const uint64_t*)> should_consider=nullptr,
                                         const InfiniteByteString original_key={nullptr, 0},
                                         const uint32_t original_key_start_bit=0) const;
     // Assumes that `l_key` and `r_key` are full length infixes. Returnes true
     // if there is an infix that may lie within the range [`l_key`, `r_key`].
     bool RangeQueryInfixStore(InfixStore &store, const uint64_t l_key, const uint64_t r_key,
-                              const uint32_t total_implicit=infix_store_target_size,
+                              const uint32_t total_implicit=kDefaultInfixStoreTargetSize,
                               const InfiniteByteString original_l_key={nullptr, 0},
                               const InfiniteByteString original_r_key={nullptr, 0},
                               const uint32_t original_key_start_bit=0) const;
     // Assumes that `key` is a full length infix. Returns true if there is an
     // infix that may match `key`.
     bool PointQueryInfixStore(InfixStore &store, const uint64_t key,
-                              const uint32_t total_implicit=infix_store_target_size,
+                              const uint32_t total_implicit=kDefaultInfixStoreTargetSize,
                               const InfiniteByteString original_key={nullptr, 0},
                               const uint32_t original_key_start_bit=0) const;
     // Resizes the infix store to the appropriate size based on its number of
     // elements.
-    void ResizeInfixStore(InfixStore &store, const uint32_t total_implicit=infix_store_target_size);
+    void ResizeInfixStore(InfixStore &store, const uint32_t total_implicit=kDefaultInfixStoreTargetSize);
     void LoadListToInfixStore(InfixStore &store, const uint64_t *list, const uint32_t list_len,
-                              const uint32_t total_implicit=infix_store_target_size, const bool zero_out=false,
+                              const uint32_t total_implicit=kDefaultInfixStoreTargetSize, const bool zero_out=false,
                               const uint64_t *payload_list=nullptr);
     void LoadVectorToInfixStore(InfixStore &store, const std::vector<Infix>& vec,
-                                const uint32_t total_implicit=infix_store_target_size, const bool zero_out=false,
+                                const uint32_t total_implicit=kDefaultInfixStoreTargetSize, const bool zero_out=false,
                                 const uint64_t *payload_list=nullptr);
     InfixStore AllocateInfixStoreWithList(const uint64_t *list, const uint32_t list_len,
-                                          const uint32_t total_implicit=infix_store_target_size,
+                                          const uint32_t total_implicit=kDefaultInfixStoreTargetSize,
                                           const uint64_t *payload_list=nullptr);
     InfixStore AllocateInfixStoreWithVector(const std::vector<Infix>& vec,
-                                            const uint32_t total_implicit=infix_store_target_size,
+                                            const uint32_t total_implicit=kDefaultInfixStoreTargetSize,
                                             const uint64_t *payload_list=nullptr);
     uint32_t GetInfixList(const InfixStore &store, uint64_t *res, uint64_t *res_payload=nullptr) const;
     std::vector<Infix> GetInfixVector(const InfixStore &store, uint64_t *res_payload=nullptr) const;
@@ -795,13 +820,15 @@ private:
                                          const uint32_t implicit_size) const;
     void UpdateInfixListDelete(const uint32_t shared, const uint32_t ignore, const uint32_t implicit_size,
                                const InfiniteByteString left_key, const InfiniteByteString right_key,
-                               uint64_t *infix_list, const uint32_t infix_list_len) const;
+                               uint64_t *infix_list, const uint32_t infix_list_len,
+                               uint32_t occupied_logical_bits) const;
     std::vector<typename Diva<diva_type, payload_type>::Infix> UpdateInfixVectorDelete(const uint32_t shared,
                                                                                        const uint32_t ignore,
                                                                                        const uint32_t implicit_size,
                                                                                        const InfiniteByteString left_key,
                                                                                        const InfiniteByteString right_key, 
-                                                                                       std::vector<Infix>& infix_vec) const;
+                                                                                       std::vector<Infix>& infix_vec,
+                                                                                       uint32_t occupied_logical_bits) const;
 
     static bool CompareInfixes(uint64_t a, uint64_t b);
 
@@ -809,6 +836,7 @@ private:
     uint64_t SerializeInfixStore(char *out, const InfixStore& store) const;
     uint32_t DeserializeMetadata(const char *deser_buf);
     uint32_t DeserializeInfixStore(const char *deser_buf, InfixStore& store) const;
+    void EnsureBulkLoadStreamingCapacity(uint32_t required_keys);
 
 public:
     Iterator GetIterator(std::string_view start="", std::string_view end="",
@@ -826,7 +854,8 @@ template <DivaType diva_type, PayloadType payload_type>
 inline Diva<diva_type, payload_type>::Diva(const uint32_t infix_size, const uint32_t rng_seed,
                                            const float load_factor, const uint32_t payload_size,
                                            const bool setup_start_end_samples,
-                                           const uint32_t sample_payload_size):
+                                           const uint32_t sample_payload_size,
+                                           const uint32_t target_size):
             wh_(nullptr),
             better_tree_(nullptr),
             wh_int_(nullptr),
@@ -836,9 +865,12 @@ inline Diva<diva_type, payload_type>::Diva(const uint32_t infix_size, const uint
             rng_seed_(rng_seed),
             load_factor_(load_factor),
             load_factor_alt_(load_factor),
-            size_scalar_shrink_grow_sep(std::log(infix_store_target_size / 64) / std::log(1 / load_factor) + 1),
+            infix_store_target_size(target_size),
+            size_scalar_shrink_grow_sep(std::log(target_size / 64) / std::log(1 / load_factor) + 1),
             bulk_load_streaming_ind_(0),
             bulk_load_streaming_max_len_(0) {
+    assert(infix_store_target_size % 64 == 0 && "infix_store_target_size must be a multiple of 64");
+    assert((infix_store_target_size & (infix_store_target_size - 1)) == 0 && "infix_store_target_size must be a power of 2");
     if constexpr (diva_type == DivaType::Int) {
         wh_int_ = wh_int_create();
         better_tree_int_ = wh_int_ref(wh_int_);
@@ -851,7 +883,7 @@ inline Diva<diva_type, payload_type>::Diva(const uint32_t infix_size, const uint
         payload_size_ = payload_size;
         sample_payload_size_ = sample_payload_size;
         bulk_load_left_payload_ = new uint64_t[(payload_size_ + 63) / 64 + 1];
-        bulk_load_payload_list_ = new uint64_t[infix_store_target_size * ((payload_size_ + 63) / 64) + 1];
+        bulk_load_payload_list_ = nullptr;
     }
     else if constexpr (payload_type == PayloadType::None)
         assert(payload_size == 0);
@@ -878,7 +910,8 @@ template <DivaType diva_type, PayloadType payload_type>
 template <class t_itr>
 Diva<diva_type, payload_type>::Diva(const uint32_t infix_size, const t_itr begin, const t_itr end, const uint32_t key_len,
                                     const uint32_t rng_seed, const float load_factor,
-                                    const uint32_t payload_size, const uint64_t **payload_list):
+                                    const uint32_t payload_size, const uint64_t **payload_list,
+                                    const uint32_t target_size):
         wh_(nullptr),
         better_tree_(nullptr),
         wh_int_(nullptr),
@@ -886,11 +919,14 @@ Diva<diva_type, payload_type>::Diva(const uint32_t infix_size, const t_itr begin
         infix_size_(infix_size),
         payload_size_(0),
         rng_seed_(rng_seed),
-        load_factor_(load_factor), 
+        load_factor_(load_factor),
         load_factor_alt_(load_factor),
-        size_scalar_shrink_grow_sep(std::log(infix_store_target_size / 64) / std::log(1 / load_factor) + 1),
+        infix_store_target_size(target_size),
+        size_scalar_shrink_grow_sep(std::log(target_size / 64) / std::log(1 / load_factor) + 1),
         bulk_load_streaming_ind_(0),
         bulk_load_streaming_max_len_(0) {
+    assert(infix_store_target_size % 64 == 0 && "infix_store_target_size must be a multiple of 64");
+    assert((infix_store_target_size & (infix_store_target_size - 1)) == 0 && "infix_store_target_size must be a power of 2");
     if constexpr (diva_type == DivaType::Int) {
         wh_int_ = wh_int_create();
         better_tree_int_ = wh_int_ref(wh_int_);
@@ -902,7 +938,7 @@ Diva<diva_type, payload_type>::Diva(const uint32_t infix_size, const t_itr begin
     if constexpr (payload_type == PayloadType::FixedLength) {
         payload_size_ = payload_size;
         bulk_load_left_payload_ = new uint64_t[(payload_size_ + 63) / 64 + 1];
-        bulk_load_payload_list_ = new uint64_t[infix_store_target_size * ((payload_size_ + 63) / 64) + 1];
+        bulk_load_payload_list_ = nullptr;
     }
     else if constexpr (payload_type == PayloadType::None)
         assert(payload_size == 0);
@@ -922,9 +958,10 @@ Diva<diva_type, payload_type>::Diva(const uint32_t infix_size, const t_itr begin
 
 template <DivaType diva_type, PayloadType payload_type>
 template <class t_itr>
-Diva<diva_type, payload_type>::Diva(const uint32_t infix_size, const t_itr begin, const t_itr end, 
+Diva<diva_type, payload_type>::Diva(const uint32_t infix_size, const t_itr begin, const t_itr end,
                                     const uint32_t rng_seed, const float load_factor,
-                                    const uint32_t payload_size, const uint64_t **payload_list):
+                                    const uint32_t payload_size, const uint64_t **payload_list,
+                                    const uint32_t target_size):
         wh_(nullptr),
         better_tree_(nullptr),
         wh_int_(nullptr),
@@ -934,9 +971,12 @@ Diva<diva_type, payload_type>::Diva(const uint32_t infix_size, const t_itr begin
         rng_seed_(rng_seed),
         load_factor_(load_factor),
         load_factor_alt_(load_factor),
-        size_scalar_shrink_grow_sep(std::log(infix_store_target_size / 64) / std::log(1 / load_factor) + 1),
+        infix_store_target_size(target_size),
+        size_scalar_shrink_grow_sep(std::log(target_size / 64) / std::log(1 / load_factor) + 1),
         bulk_load_streaming_ind_(0),
         bulk_load_streaming_max_len_(0) {
+    assert(infix_store_target_size % 64 == 0 && "infix_store_target_size must be a multiple of 64");
+    assert((infix_store_target_size & (infix_store_target_size - 1)) == 0 && "infix_store_target_size must be a power of 2");
     if constexpr (diva_type == DivaType::Int) {
         wh_int_ = wh_int_create();
         better_tree_int_ = wh_int_ref(wh_int_);
@@ -961,9 +1001,11 @@ Diva<diva_type, payload_type>::Diva(const uint32_t infix_size, const t_itr begin
 }
 
 
-
 template <DivaType diva_type, PayloadType payload_type>
 inline void Diva<diva_type, payload_type>::SetupScaleFactors() {
+    bulk_load_streaming_capacity_ = infix_store_target_size;
+    implicit_scalars_.resize(infix_store_target_size / 2 + 1);
+    bulk_load_key_list_.resize(bulk_load_streaming_capacity_);
     double pw = 1.0;
     for (int32_t i = size_scalar_shrink_grow_sep - 1; i >= 0; i--) {
         size_scalars_[i] = static_cast<uint64_t>(pw * (1ULL << scale_shift));
@@ -983,6 +1025,29 @@ inline void Diva<diva_type, payload_type>::SetupScaleFactors() {
         size_scalars_[i] = std::numeric_limits<uint64_t>::max();
         scaled_sizes_[i] = std::numeric_limits<uint64_t>::max();
     }
+
+    // scaled_sizes_[i]: per-grade slot ceiling (= num_infixes for that grade).
+    // bitmap_target_sizes_[i]: occupied logical width = 2^ceil(log2(num_infixes)); physical occupied words come from OccupiedAlignedBits (>= 64 bits when occ > 0).
+    for (int32_t i = 0; i < size_scalar_count; i++) {
+        if (scaled_sizes_[i] == std::numeric_limits<uint64_t>::max()) {
+            bitmap_target_sizes_[i] = std::numeric_limits<uint64_t>::max();
+            continue;
+        }
+        uint64_t n = scaled_sizes_[i];
+        if (n == 0) {
+            bitmap_target_sizes_[i] = 1;
+            continue;
+        }
+        n--;
+        n |= n >> 1;
+        n |= n >> 2;
+        n |= n >> 4;
+        n |= n >> 8;
+        n |= n >> 16;
+        n |= n >> 32;
+        n++;
+        bitmap_target_sizes_[i] = n;
+    }
     
     for (int32_t i = 0; i < infix_store_target_size / 2; i++) {
         const double ratio = static_cast<double>(infix_store_target_size) 
@@ -990,6 +1055,72 @@ inline void Diva<diva_type, payload_type>::SetupScaleFactors() {
         implicit_scalars_[i] = static_cast<uint64_t>(ratio * (1ULL << scale_implicit_shift));
     }
     implicit_scalars_[infix_store_target_size / 2] = 1ULL << scale_implicit_shift;
+    if constexpr (payload_type == PayloadType::FixedLength) {
+        if (bulk_load_payload_list_ != nullptr) {
+            delete[] bulk_load_payload_list_;
+        }
+        bulk_load_payload_list_ = new uint64_t[
+            bulk_load_streaming_capacity_ * ((payload_size_ + 63) / 64) + 1];
+    }
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline uint32_t Diva<diva_type, payload_type>::InfixStoreTargetSizeFromShrinkGrowSep(uint32_t sep,
+                                                                                    float load_factor) {
+    uint32_t found = 0;
+    for (uint32_t t = 64; t <= (1u << 24); t *= 2) {
+        const uint32_t s = static_cast<uint32_t>(
+            std::log(t / 64) / std::log(1.0 / static_cast<double>(load_factor)) + 1.0);
+        if (s == sep && found == 0) {
+            found = t;
+            break;
+        }
+    }
+    assert(found != 0 &&
+           "Deserialize: size_scalar_shrink_grow_sep does not match any power-of-2 infix_store_target_size");
+    return found != 0 ? found : kDefaultInfixStoreTargetSize;
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline uint32_t Diva<diva_type, payload_type>::SlotStripBitOffsetInData(uint32_t size_grade) const {
+    const uint32_t occ = static_cast<uint32_t>(bitmap_target_sizes_[size_grade]);
+    return InfixStore::OccupiedAlignedBits(occ) + static_cast<uint32_t>(scaled_sizes_[size_grade]);
+}
+
+template <DivaType diva_type, PayloadType payload_type>
+inline uint32_t Diva<diva_type, payload_type>::SlotDataBaseBit(uint32_t size_grade) const {
+    return static_cast<uint32_t>(64u * num_metadata_offset_words) + SlotStripBitOffsetInData(size_grade);
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline void Diva<diva_type, payload_type>::EnsureBulkLoadStreamingCapacity(
+        uint32_t required_keys) {
+    if (required_keys <= bulk_load_streaming_capacity_) return;
+    uint32_t new_capacity = std::max(required_keys,
+                                     bulk_load_streaming_capacity_ * 2);
+    if (new_capacity == 0) {
+        new_capacity = std::max<uint32_t>(1, required_keys);
+    }
+    bulk_load_key_list_.resize(new_capacity);
+    if constexpr (payload_type == PayloadType::FixedLength) {
+        const uint32_t words_per_payload = (payload_size_ + 63) / 64;
+        uint64_t* new_payload_list =
+            new uint64_t[new_capacity * words_per_payload + 1];
+        memset(new_payload_list, 0,
+               sizeof(uint64_t) * (new_capacity * words_per_payload + 1));
+        if (bulk_load_payload_list_ != nullptr) {
+            if (bulk_load_streaming_ind_ > 0) {
+                copy_bitmap_to_bitmap(bulk_load_payload_list_, 0, new_payload_list, 0,
+                                      bulk_load_streaming_ind_ * payload_size_);
+            }
+            delete[] bulk_load_payload_list_;
+        }
+        bulk_load_payload_list_ = new_payload_list;
+    }
+    bulk_load_streaming_capacity_ = new_capacity;
 }
 
 
@@ -1365,7 +1496,8 @@ inline void Diva<diva_type, payload_type>::InsertSimple(const InfiniteByteString
         }
     }
 
-    auto [shared, ignore, implicit_size] = GetSharedIgnoreImplicitLengths(prev_key, next_key);
+    auto [shared, ignore, implicit_size] = GetSharedIgnoreImplicitLengths(
+        prev_key, next_key, bitmap_target_sizes_[infix_store.GetSizeGrade()]);
     // To insert into the binary tries
     const uint32_t key_start_bit = shared + ignore + implicit_size;
 
@@ -1437,7 +1569,8 @@ inline bool Diva<diva_type, payload_type>::RangeQuery(const uint8_t *input_l, co
     rwlock_lock_read(infix_store.rwlock);
     UnlockLeaves(leaves_to_unlock, it_write_lock);
 
-    auto [shared, ignore, implicit_size] = GetSharedIgnoreImplicitLengths(prev_key, next_key);
+    auto [shared, ignore, implicit_size] = GetSharedIgnoreImplicitLengths(
+        prev_key, next_key, bitmap_target_sizes_[infix_store.GetSizeGrade()]);
     // To query the binary tries
     const uint32_t key_start_bit = shared + ignore + implicit_size;
 
@@ -1542,7 +1675,8 @@ inline bool Diva<diva_type, payload_type>::PointQuery(const uint8_t *input_key, 
         return false;
     }
 
-    auto [shared, ignore, implicit_size] = GetSharedIgnoreImplicitLengths(prev_key, next_key);
+    auto [shared, ignore, implicit_size] = GetSharedIgnoreImplicitLengths(
+        prev_key, next_key, bitmap_target_sizes_[infix_store.GetSizeGrade()]);
     // To query the binary tries
     const uint32_t key_start_bit = shared + ignore + implicit_size;
 
@@ -1669,8 +1803,11 @@ inline bool Diva<diva_type, payload_type>::PointQueryWithBoundary(
     rwlock_lock_read(next_store_ptr->rwlock);    // next_key store: for block handle
     UnlockLeaves(leaves_to_unlock, it_write_lock);
 
+    const uint32_t occ_bits_boundary =
+        std::max(bitmap_target_sizes_[infix_store_ptr->GetSizeGrade()],
+                 bitmap_target_sizes_[next_store_ptr->GetSizeGrade()]);
     auto [shared, ignore, implicit_size] =
-        GetSharedIgnoreImplicitLengths(prev_key, next_key);
+        GetSharedIgnoreImplicitLengths(prev_key, next_key, occ_bits_boundary);
     const uint32_t key_start_bit = shared + ignore + implicit_size;
     const uint64_t extraction =
         ExtractPartialKey(key, shared, ignore, implicit_size, key.GetBit(shared));
@@ -1873,7 +2010,8 @@ inline bool Diva<diva_type, payload_type>::TrieBoundaryCursor::GetCurrent(std::v
 template <DivaType diva_type, PayloadType payload_type>
 inline void Diva<diva_type, payload_type>::AddTreeKey(const uint8_t *key, const uint32_t key_len, const uint64_t *payload) {
     InfixStore infix_store(scaled_sizes_[size_scalar_shrink_grow_sep], infix_size_,
-                           size_scalar_shrink_grow_sep, payload_size_);
+                           size_scalar_shrink_grow_sep,
+                           static_cast<uint32_t>(bitmap_target_sizes_[size_scalar_shrink_grow_sep]), payload_size_);
     if constexpr (payload_type == PayloadType::FixedLength) {
         if (payload)
             AddSamplePayload(infix_store, payload);
@@ -1910,6 +2048,7 @@ inline uint32_t Diva<diva_type, payload_type>::InsertSplit(const InfiniteByteStr
 
     rwlock_lock_write(infix_store_ptr->rwlock);
     InfixStore& infix_store = *infix_store_ptr;
+    const uint32_t occ_bits_insert = bitmap_target_sizes_[infix_store.GetSizeGrade()];
 
     if (prev_key == key) {
         if constexpr (payload_type == PayloadType::FixedLength) {
@@ -1927,7 +2066,8 @@ inline uint32_t Diva<diva_type, payload_type>::InsertSplit(const InfiniteByteStr
         }
     }
 
-    auto [shared, ignore, implicit_size] = GetSharedIgnoreImplicitLengths(prev_key, next_key);
+    auto [shared, ignore, implicit_size] =
+        GetSharedIgnoreImplicitLengths(prev_key, next_key, occ_bits_insert);
     uint64_t extraction = ExtractPartialKey(key, shared, ignore, implicit_size, key.GetBit(shared));
     uint64_t prev_extraction = ExtractPartialKey(prev_key, shared, ignore, implicit_size, 0);
     uint64_t next_extraction = ExtractPartialKey(next_key, shared, ignore, implicit_size, 1);
@@ -1989,7 +2129,8 @@ inline uint32_t Diva<diva_type, payload_type>::InsertSplit(const InfiniteByteStr
         const uint32_t shared_word_byte = (shared / 64) * 8;
         auto [shared_lt, ignore_lt, implicit_size_lt] = GetSharedIgnoreImplicitLengths(
                 {prev_key.str + shared_word_byte, prev_key.length < shared_word_byte ? 0 : prev_key.length - shared_word_byte},
-                {key.str + shared_word_byte, key.length < shared_word_byte ? 0 : key.length - shared_word_byte});
+                {key.str + shared_word_byte, key.length < shared_word_byte ? 0 : key.length - shared_word_byte},
+                occ_bits_insert);
         shared_lt += shared_word_byte * 8;
         const int32_t shamt_lt = shared_lt + ignore_lt + implicit_size_lt - shared - ignore - implicit_size;
         const uint64_t prev_extraction_lt = ExtractPartialKey(prev_key, shared_lt, ignore_lt, implicit_size_lt, 0);
@@ -2003,7 +2144,8 @@ inline uint32_t Diva<diva_type, payload_type>::InsertSplit(const InfiniteByteStr
 
         auto [shared_gt, ignore_gt, implicit_size_gt] = GetSharedIgnoreImplicitLengths(
                 {key.str + shared_word_byte, key.length < shared_word_byte ? 0 : key.length - shared_word_byte},
-                {next_key.str + shared_word_byte, next_key.length < shared_word_byte ? 0 : next_key.length - shared_word_byte});
+                {next_key.str + shared_word_byte, next_key.length < shared_word_byte ? 0 : next_key.length - shared_word_byte},
+                occ_bits_insert);
         shared_gt += shared_word_byte * 8;
         const int32_t shamt_gt = shared_gt + ignore_gt + implicit_size_gt - shared - ignore - implicit_size;
         const uint64_t extraction_gt = ExtractPartialKey(key, shared_gt, ignore_gt, implicit_size_gt, 0);
@@ -2110,7 +2252,8 @@ inline uint32_t Diva<diva_type, payload_type>::InsertSplit(const InfiniteByteStr
     const uint32_t shared_word_byte = (shared / 64) * 8;
     auto [shared_lt, ignore_lt, implicit_size_lt] = GetSharedIgnoreImplicitLengths(
             {prev_key.str + shared_word_byte, prev_key.length < shared_word_byte ? 0 : prev_key.length - shared_word_byte},
-            {key.str + shared_word_byte, key.length < shared_word_byte ? 0 : key.length - shared_word_byte});
+            {key.str + shared_word_byte, key.length < shared_word_byte ? 0 : key.length - shared_word_byte},
+            occ_bits_insert);
     shared_lt += shared_word_byte * 8;
     const int32_t shamt_lt = shared_lt + ignore_lt + implicit_size_lt - shared - ignore - implicit_size;
     const uint64_t prev_extraction_lt = ExtractPartialKey(prev_key, shared_lt, ignore_lt, implicit_size_lt, 0);
@@ -2122,7 +2265,8 @@ inline uint32_t Diva<diva_type, payload_type>::InsertSplit(const InfiniteByteStr
 
     auto [shared_gt, ignore_gt, implicit_size_gt] = GetSharedIgnoreImplicitLengths(
             {key.str + shared_word_byte, key.length < shared_word_byte ? 0 : key.length - shared_word_byte},
-            {next_key.str + shared_word_byte, next_key.length < shared_word_byte ? 0 : next_key.length - shared_word_byte});
+            {next_key.str + shared_word_byte, next_key.length < shared_word_byte ? 0 : next_key.length - shared_word_byte},
+            occ_bits_insert);
     shared_gt += shared_word_byte * 8;
     const int32_t shamt_gt = shared_gt + ignore_gt + implicit_size_gt - shared - ignore - implicit_size;
     const uint64_t extraction_gt = ExtractPartialKey(key, shared_gt, ignore_gt, implicit_size_gt, 0);
@@ -2420,7 +2564,8 @@ Diva<diva_type, payload_type>::UpdateInfixVector(const std::vector<Infix>& infix
 template <DivaType diva_type, PayloadType payload_type>
 inline std::tuple<uint32_t, uint32_t, uint32_t> 
 Diva<diva_type, payload_type>::GetSharedIgnoreImplicitLengths(const InfiniteByteString key_1,
-                                                              const InfiniteByteString key_2) const {
+                                                              const InfiniteByteString key_2,
+                                                              uint32_t occupied_logical_bits) const {
     uint32_t share = 0, ignore = 0;
 
     uint32_t ind = 0, delta;
@@ -2442,10 +2587,20 @@ Diva<diva_type, payload_type>::GetSharedIgnoreImplicitLengths(const InfiniteByte
         ind++;
     } while (delta == 64);
 
-    uint64_t implicit_size = base_implicit_size;
-    const uint64_t implicit_1 = key_1.BitsAt(share + ignore + 1, base_implicit_size - 1);
-    const uint64_t implicit_2 = (1ULL << (base_implicit_size - 1)) | key_2.BitsAt(share + ignore + 1, base_implicit_size - 1);
-    implicit_size += (2 * (implicit_2 - implicit_1 + 1) < (1ULL << base_implicit_size));
+    uint32_t base_implicit_bits = 0;
+    if (occupied_logical_bits > 1) {
+        assert((occupied_logical_bits & (occupied_logical_bits - 1)) == 0 &&
+               "occupied bitmap width must be a power of 2");
+        base_implicit_bits = __builtin_ctz(occupied_logical_bits);
+    }
+    uint32_t implicit_size = base_implicit_bits;
+    if (base_implicit_bits > 0) {
+        const uint64_t implicit_1 = key_1.BitsAt(share + ignore + 1, base_implicit_bits - 1);
+        const uint64_t implicit_2 =
+            (1ULL << (base_implicit_bits - 1)) | key_2.BitsAt(share + ignore + 1, base_implicit_bits - 1);
+        implicit_size += static_cast<uint32_t>(
+            2 * (implicit_2 - implicit_1 + 1) < (1ULL << base_implicit_bits));
+    }
 
     return {share, ignore, implicit_size};
 }
@@ -2453,8 +2608,7 @@ Diva<diva_type, payload_type>::GetSharedIgnoreImplicitLengths(const InfiniteByte
 
 template <DivaType diva_type, PayloadType payload_type>
 inline uint64_t Diva<diva_type, payload_type>::Size() const {
-    uint64_t res = sizeof(bool) + sizeof(infix_store_target_size) 
-                 + sizeof(base_implicit_size) + sizeof(scale_shift)
+    uint64_t res = sizeof(bool) + sizeof(scale_shift)
                  + sizeof(scale_implicit_shift) + sizeof(size_scalar_count)
                  + sizeof(size_scalar_shrink_grow_sep) + sizeof(load_factor_)
                  + sizeof(load_factor_alt_) + sizeof(infix_size_) 
@@ -2486,7 +2640,7 @@ inline uint64_t Diva<diva_type, payload_type>::Size() const {
                 res += (store->num_sample_payloads * sample_payload_size_ + 7) / 8;
             }
             if (store->ptr != nullptr) {
-                const uint64_t word_count = store->GetPtrWordCount(scaled_sizes_[store->GetSizeGrade()], infix_size_, payload_size_);
+                const uint64_t word_count = store->GetPtrWordCount(scaled_sizes_[store->GetSizeGrade()], infix_size_, bitmap_target_sizes_[store->GetSizeGrade()], payload_size_);
                 res += word_count * sizeof(uint64_t);
             }
         }
@@ -2509,7 +2663,7 @@ inline uint64_t Diva<diva_type, payload_type>::Size() const {
                 res += (store->num_sample_payloads * sample_payload_size_ + 7) / 8;
             }
             if (store->ptr != nullptr) {
-                const uint64_t word_count = store->GetPtrWordCount(scaled_sizes_[store->GetSizeGrade()], infix_size_, payload_size_);
+                const uint64_t word_count = store->GetPtrWordCount(scaled_sizes_[store->GetSizeGrade()], infix_size_, bitmap_target_sizes_[store->GetSizeGrade()], payload_size_);
                 res += word_count * sizeof(uint64_t);
             }
             last_tree_key = tree_key;
@@ -2581,12 +2735,9 @@ inline uint32_t Diva<diva_type, payload_type>::SerializeMetadata(char *out) cons
     // Diva Version
     out[res++] = static_cast<char>(diva_type);
 
-    // Global Metadata
-    memcpy(out + res, &infix_store_target_size, sizeof(infix_store_target_size));
-    res += sizeof(infix_store_target_size);
-
-    memcpy(out + res, &base_implicit_size, sizeof(base_implicit_size));
-    res += sizeof(base_implicit_size);
+    // infix_store_target_size is not stored: deserialize uses kDefaultInfixStoreTargetSize
+    // (must match builder if you rely on Serialize round-trip). Implicit prefix width follows
+    // bitmap_target_sizes_[size_grade] at each store.
 
     memcpy(out + res, &scale_shift, sizeof(scale_shift));
     res += sizeof(scale_shift);
@@ -2647,7 +2798,7 @@ inline uint64_t Diva<diva_type, payload_type>::SerializeInfixStore(char *out,
         offset += sizeof(store.num_sample_payloads);
     }
 
-    const uint64_t word_count = store.GetPtrWordCount(scaled_sizes_[store.GetSizeGrade()], infix_size_, payload_size_);
+    const uint64_t word_count = store.GetPtrWordCount(scaled_sizes_[store.GetSizeGrade()], infix_size_, bitmap_target_sizes_[store.GetSizeGrade()], payload_size_);
     memcpy(out + offset, store.ptr, word_count * sizeof(uint64_t));
     offset += word_count * sizeof(uint64_t);
 
@@ -2711,6 +2862,8 @@ inline Diva<diva_type, payload_type>::~Diva() {
 
 template <DivaType diva_type, PayloadType payload_type>
 inline Diva<diva_type, payload_type>::Diva(const char *deser_buf):
+        infix_store_target_size(kDefaultInfixStoreTargetSize),
+        size_scalar_shrink_grow_sep(0),
         bulk_load_streaming_ind_(0),
         bulk_load_streaming_max_len_(0) {
     uint32_t ind = DeserializeMetadata(deser_buf);
@@ -2764,15 +2917,6 @@ inline uint32_t Diva<diva_type, payload_type>::DeserializeMetadata(const char *d
     assert(static_cast<DivaType>(deser_buf[res]) == diva_type && "Mismatched Diva version");
     res++;
 
-    // Global Metadata
-    memcpy(&buf32, deser_buf + res, sizeof(infix_store_target_size));
-    assert(buf32 == infix_store_target_size && "Mismatched Diva version");
-    res += sizeof(infix_store_target_size);
-
-    memcpy(&buf32, deser_buf + res, sizeof(base_implicit_size));
-    assert(buf32 == base_implicit_size && "Mismatched Diva version");
-    res += sizeof(base_implicit_size);
-
     memcpy(&buf32, deser_buf + res, sizeof(scale_shift));
     assert(buf32 == scale_shift && "Mismatched Diva version");
     res += sizeof(scale_shift);
@@ -2785,17 +2929,26 @@ inline uint32_t Diva<diva_type, payload_type>::DeserializeMetadata(const char *d
     assert(buf32 == size_scalar_count && "Mismatched Diva version");
     res += sizeof(size_scalar_count);
 
-    memcpy((void *) &size_scalar_shrink_grow_sep, deser_buf + res, sizeof(size_scalar_shrink_grow_sep));
+    memcpy(&buf32, deser_buf + res, sizeof(size_scalar_shrink_grow_sep));
+    size_scalar_shrink_grow_sep = buf32;
     res += sizeof(size_scalar_shrink_grow_sep);
 
-    memcpy((void *) &load_factor_, deser_buf + res, sizeof(load_factor_));
+    float buff;
+    memcpy(&buff, deser_buf + res, sizeof(load_factor_));
+    assert(buff == load_factor_ && "Corrupted Diva version");
     res += sizeof(load_factor_);
 
-    assert(size_scalar_shrink_grow_sep == static_cast<uint32_t>(std::log(infix_store_target_size / 64) 
-                                                                / std::log(1 / load_factor_) + 1)
-            && "Corrupted Diva version");
+    infix_store_target_size =
+        InfixStoreTargetSizeFromShrinkGrowSep(size_scalar_shrink_grow_sep, load_factor_);
+#ifdef DEBUG
+    assert(size_scalar_shrink_grow_sep ==
+           static_cast<uint32_t>(std::log(infix_store_target_size / 64) /
+                                     std::log(1 / static_cast<double>(load_factor_)) +
+                                 1));
+#endif
 
-    memcpy((void *) &load_factor_alt_, deser_buf + res, sizeof(load_factor_alt_));
+    memcpy(&buff, deser_buf + res, sizeof(load_factor_alt_));
+    assert(buff == load_factor_alt_ && "Corrupted Diva version");
     res += sizeof(load_factor_alt_);
 
     // Infix Size, Payload Size, and Random Seed
@@ -2843,7 +2996,7 @@ inline uint32_t Diva<diva_type, payload_type>::DeserializeInfixStore(const char 
         offset += sizeof(store.num_sample_payloads);
     }
 
-    const uint64_t word_count = store.GetPtrWordCount(scaled_sizes_[store.GetSizeGrade()], infix_size_, payload_size_);
+    const uint64_t word_count = store.GetPtrWordCount(scaled_sizes_[store.GetSizeGrade()], infix_size_, bitmap_target_sizes_[store.GetSizeGrade()], payload_size_);
     store.ptr = new uint64_t[word_count];
     memcpy(store.ptr, deser_buf + offset, word_count * sizeof(uint64_t));
     offset += word_count * sizeof(uint64_t);
@@ -2946,7 +3099,8 @@ inline void Diva<diva_type, payload_type>::Delete(const uint8_t *input_key, cons
         }
     }
 
-    auto [shared, ignore, implicit_size] = GetSharedIgnoreImplicitLengths(prev_key, next_key);
+    auto [shared, ignore, implicit_size] = GetSharedIgnoreImplicitLengths(
+        prev_key, next_key, bitmap_target_sizes_[infix_store.GetSizeGrade()]);
     // To delete from the binary tries
     const uint32_t key_start_bit = shared + ignore + implicit_size;
 
@@ -3033,16 +3187,19 @@ inline void Diva<diva_type, payload_type>::DeleteMerge(InfiniteByteString key) {
     rwlock_lock_write(store_l->rwlock);
     rwlock_lock_write(store_r->rwlock);
 
-    auto [shared, ignore, implicit_size] = GetSharedIgnoreImplicitLengths(left_key, right_key);
+    const uint32_t occ_merge =
+        std::max(bitmap_target_sizes_[store_l->GetSizeGrade()],
+                 bitmap_target_sizes_[store_r->GetSizeGrade()]);
+    auto [shared, ignore, implicit_size] = GetSharedIgnoreImplicitLengths(left_key, right_key, occ_merge);
     const uint64_t implicit = ExtractPartialKey(left_key, shared, ignore, implicit_size, 0) >> infix_size_;
 
     if constexpr (diva_type == DivaType::BinaryTrie) {  // Handle the binary trie case
         auto infix_vec = GetInfixVector(*store_l);
         infix_vec = UpdateInfixVectorDelete(shared, ignore, implicit_size, 
-                left_key, middle_key, infix_vec);
+                left_key, middle_key, infix_vec, occ_merge);
         auto infix_vec_right = GetInfixVector(*store_r);
         infix_vec_right = UpdateInfixVectorDelete(shared, ignore, implicit_size, 
-                middle_key, right_key, infix_vec_right);
+                middle_key, right_key, infix_vec_right, occ_merge);
         for (const auto& infix : infix_vec_right)
             infix_vec.push_back(infix);
         std::stable_sort(infix_vec.begin(), infix_vec.end());   // Stable sort to maintain suffix ordering
@@ -3146,9 +3303,9 @@ inline void Diva<diva_type, payload_type>::DeleteMerge(InfiniteByteString key) {
     }
 
     UpdateInfixListDelete(shared, ignore, implicit_size, left_key, middle_key,
-                          infix_list, store_l->GetFullSlotCount());
+                          infix_list, store_l->GetFullSlotCount(), occ_merge);
     UpdateInfixListDelete(shared, ignore, implicit_size, middle_key, right_key,
-                          infix_list + store_l->GetFullSlotCount(), store_r->GetFullSlotCount());
+                          infix_list + store_l->GetFullSlotCount(), store_r->GetFullSlotCount(), occ_merge);
     for (int32_t i = 0; i < total_elem_count; i++)
         infix_list[i] -= implicit << infix_size_;
 
@@ -3261,12 +3418,14 @@ inline void Diva<diva_type, payload_type>::DeleteMerge(InfiniteByteString key) {
 template <DivaType diva_type, PayloadType payload_type>
 inline void Diva<diva_type, payload_type>::UpdateInfixListDelete(const uint32_t shared, const uint32_t ignore, const uint32_t implicit_size,
                                                                  const InfiniteByteString left_key, const InfiniteByteString right_key,
-                                                                 uint64_t *infix_list, const uint32_t infix_list_len) const {
+                                                                 uint64_t *infix_list, const uint32_t infix_list_len,
+                                                                 uint32_t occupied_logical_bits) const {
     const uint32_t shared_word_byte = (shared / 64) * 8;
 
     auto [old_shared, old_ignore, old_implicit_size] = GetSharedIgnoreImplicitLengths(
             {left_key.str + shared_word_byte, left_key.length < shared_word_byte ? 0 : left_key.length - shared_word_byte},
-            {right_key.str + shared_word_byte, right_key.length < shared_word_byte ? 0 : right_key.length - shared_word_byte});
+            {right_key.str + shared_word_byte, right_key.length < shared_word_byte ? 0 : right_key.length - shared_word_byte},
+            occupied_logical_bits);
     old_shared += shared_word_byte * 8;
 
     const uint64_t old_left_implicit = ExtractPartialKey(left_key, old_shared, old_ignore,
@@ -3343,7 +3502,8 @@ template <DivaType diva_type, PayloadType payload_type>
 inline std::vector<typename Diva<diva_type, payload_type>::Infix>
 Diva<diva_type, payload_type>::UpdateInfixVectorDelete(const uint32_t shared, const uint32_t ignore, const uint32_t implicit_size,
                                                        const InfiniteByteString left_key, const InfiniteByteString right_key,
-                                                       std::vector<Infix>& infix_vec) const {
+                                                       std::vector<Infix>& infix_vec,
+                                                       uint32_t occupied_logical_bits) const {
     std::vector<Infix> res;
     if (infix_vec.empty())
         return std::move(res);
@@ -3351,7 +3511,8 @@ Diva<diva_type, payload_type>::UpdateInfixVectorDelete(const uint32_t shared, co
 
     auto [old_shared, old_ignore, old_implicit_size] = GetSharedIgnoreImplicitLengths(
             {left_key.str + shared_word_byte, left_key.length < shared_word_byte ? 0 : left_key.length - shared_word_byte},
-            {right_key.str + shared_word_byte, right_key.length < shared_word_byte ? 0 : right_key.length - shared_word_byte});
+            {right_key.str + shared_word_byte, right_key.length < shared_word_byte ? 0 : right_key.length - shared_word_byte},
+            occupied_logical_bits);
     old_shared += shared_word_byte * 8;
     const uint64_t old_left_implicit = ExtractPartialKey(left_key, old_shared, old_ignore,
                                                          old_implicit_size, 0) >> infix_size_;
@@ -3483,7 +3644,8 @@ inline void Diva<diva_type, payload_type>::Adapt(const uint8_t *input_key, const
         return;
     }
 
-    auto [shared, ignore, implicit_size] = GetSharedIgnoreImplicitLengths(prev_key, next_key);
+    auto [shared, ignore, implicit_size] = GetSharedIgnoreImplicitLengths(
+        prev_key, next_key, bitmap_target_sizes_[infix_store.GetSizeGrade()]);
     // To adapt the binary tries
     const uint32_t key_start_bit = shared + ignore + implicit_size;
     if (new_prefix_len < key_start_bit + 1) {   // Nothing to adapt
@@ -3517,7 +3679,7 @@ inline void Diva<diva_type, payload_type>::BulkLoadFixedLength(const t_itr begin
         || std::is_same_v<std::decay_t<itr_type>, std::string_view>;
 
     void *dummy_locked_leaf_addrs[3] = {nullptr, nullptr, nullptr};
-    uint64_t infix_list[infix_store_target_size], int_opt_buf[infix_store_target_size + 3];
+    uint64_t infix_list[kDefaultInfixStoreTargetSize], int_opt_buf[kDefaultInfixStoreTargetSize + 3];
     std::vector<Infix> infix_vec;
     infix_vec.reserve(infix_store_target_size);
     uint32_t payload_list_size = 1;
@@ -3562,7 +3724,16 @@ inline void Diva<diva_type, payload_type>::BulkLoadFixedLength(const t_itr begin
             if constexpr (payload_type == PayloadType::FixedLength)
                 copy_bitmap_to_bitmap(payloads[cnt], 0, right_payload, 0, payload_size_);
 
-            const auto [shared, ignore, implicit_size] = GetSharedIgnoreImplicitLengths(left_key, right_key);
+            uint32_t bulk_occ_grade = size_scalar_shrink_grow_sep;
+            if constexpr (diva_type == DivaType::BinaryTrie) {
+                bulk_occ_grade = static_cast<uint32_t>(
+                    std::lower_bound(scaled_sizes_, scaled_sizes_ + size_scalar_count,
+                                     static_cast<uint64_t>(infix_store_target_size - 1)) -
+                    scaled_sizes_);
+            }
+            const uint32_t bulk_occ_bits = bitmap_target_sizes_[bulk_occ_grade];
+            const auto [shared, ignore, implicit_size] =
+                GetSharedIgnoreImplicitLengths(left_key, right_key, bulk_occ_bits);
             const uint32_t key_start_bit = shared + ignore + implicit_size + infix_size_ - 1;
             const uint64_t prev_implicit = ExtractPartialKey(left_key, shared, ignore, implicit_size, 0) >> infix_size_;
             const uint64_t next_implicit = ExtractPartialKey(right_key, shared, ignore, implicit_size, 1) >> infix_size_;
@@ -3571,7 +3742,7 @@ inline void Diva<diva_type, payload_type>::BulkLoadFixedLength(const t_itr begin
             uint32_t last_key_pos = 0, last_infix_pos = 0;
             if constexpr (payload_type == PayloadType::FixedLength)
                 last_key_pos = std::distance(begin, last_key_it);
-            InfiniteByteString keys[infix_store_target_size - 1];
+            InfiniteByteString keys[kDefaultInfixStoreTargetSize - 1];
             infix_vec.clear();
             for (int32_t i = 0; i < infix_store_target_size - 1; i++) {
                 if constexpr (diva_type == DivaType::Int) {
@@ -3626,7 +3797,7 @@ inline void Diva<diva_type, payload_type>::BulkLoadFixedLength(const t_itr begin
                 allocation_size_grade = std::lower_bound(scaled_sizes_, scaled_sizes_ + size_scalar_count, num_slots_filled) - scaled_sizes_;
             }
             InfixStore store(scaled_sizes_[allocation_size_grade], infix_size_,
-                             allocation_size_grade, payload_size_);
+                             allocation_size_grade, bitmap_target_sizes_[allocation_size_grade], payload_size_);
             if constexpr (diva_type == DivaType::BinaryTrie)
                 LoadVectorToInfixStore(store, infix_vec, total_implicit, true, payload_list);
             else
@@ -3671,7 +3842,15 @@ inline void Diva<diva_type, payload_type>::BulkLoadFixedLength(const t_itr begin
     n_keys_.fetch_add(1, std::memory_order_release);
 
     if (key_it != last_key_it) {
-        const auto [shared, ignore, implicit_size] = GetSharedIgnoreImplicitLengths(left_key, right_key);
+        const uint32_t tail_key_count = static_cast<uint32_t>(
+            std::max<int64_t>(0, std::distance(last_key_it, key_it) - 1));
+        uint32_t tail_occ_grade = static_cast<uint32_t>(
+            std::lower_bound(scaled_sizes_, scaled_sizes_ + size_scalar_count,
+                             static_cast<uint64_t>(tail_key_count)) -
+            scaled_sizes_);
+        const uint32_t tail_occ_bits = bitmap_target_sizes_[tail_occ_grade];
+        const auto [shared, ignore, implicit_size] =
+            GetSharedIgnoreImplicitLengths(left_key, right_key, tail_occ_bits);
         const uint32_t key_start_bit = shared + ignore + implicit_size + infix_size_ - 1;
         const uint64_t prev_implicit = ExtractPartialKey(left_key, shared, ignore, implicit_size, 0) >> infix_size_;
         const uint64_t next_implicit = ExtractPartialKey(right_key, shared, ignore, implicit_size, 1) >> infix_size_;
@@ -3682,7 +3861,7 @@ inline void Diva<diva_type, payload_type>::BulkLoadFixedLength(const t_itr begin
         uint32_t last_key_pos = 0, last_infix_pos = 0;
         if constexpr (payload_type == PayloadType::FixedLength)
             last_key_pos = std::distance(begin, last_key_it);
-        InfiniteByteString keys[infix_store_target_size - 1];
+        InfiniteByteString keys[kDefaultInfixStoreTargetSize - 1];
         infix_vec.clear();
         while (last_key_it != key_it) {
             if constexpr (diva_type == DivaType::Int) {
@@ -3737,7 +3916,7 @@ inline void Diva<diva_type, payload_type>::BulkLoadFixedLength(const t_itr begin
                 num_slots_filled += infix.GetNumSlots(infix_size_);
             allocation_size_grade = std::lower_bound(scaled_sizes_, scaled_sizes_ + size_scalar_count, num_slots_filled) - scaled_sizes_;
         }
-        InfixStore store(scaled_sizes_[allocation_size_grade], infix_size_, allocation_size_grade, payload_size_);
+        InfixStore store(scaled_sizes_[allocation_size_grade], infix_size_, allocation_size_grade, bitmap_target_sizes_[allocation_size_grade], payload_size_);
         if constexpr (diva_type == DivaType::BinaryTrie)
             LoadVectorToInfixStore(store, infix_vec, total_implicit, true, payload_list);
         else
@@ -3754,7 +3933,7 @@ inline void Diva<diva_type, payload_type>::BulkLoadFixedLength(const t_itr begin
 
         if constexpr (payload_type == PayloadType::FixedLength)
             AddTreeKey(right_key.str, right_key.length, right_payload);
-        else 
+        else
             AddTreeKey(right_key.str, right_key.length);
     }
 
@@ -3769,7 +3948,7 @@ template <class t_itr>
 inline void Diva<diva_type, payload_type>::BulkLoad(const t_itr begin, const t_itr end,
                                                     const uint64_t **payloads) {
     void *dummy_locked_leaf_addrs[3] = {nullptr, nullptr, nullptr};
-    uint64_t infix_list[infix_store_target_size];
+    uint64_t infix_list[kDefaultInfixStoreTargetSize];
     std::vector<Infix> infix_vec;
     infix_vec.reserve(infix_store_target_size);
     uint32_t payload_list_size = 1;
@@ -3802,7 +3981,16 @@ inline void Diva<diva_type, payload_type>::BulkLoad(const t_itr begin, const t_i
             if constexpr (payload_type == PayloadType::FixedLength)
                 copy_bitmap_to_bitmap(payloads[cnt], 0, right_payload, 0, payload_size_);
 
-            const auto [shared, ignore, implicit_size] = GetSharedIgnoreImplicitLengths(left_key, right_key);
+            uint32_t bulk_occ_grade = size_scalar_shrink_grow_sep;
+            if constexpr (diva_type == DivaType::BinaryTrie) {
+                bulk_occ_grade = static_cast<uint32_t>(
+                    std::lower_bound(scaled_sizes_, scaled_sizes_ + size_scalar_count,
+                                     static_cast<uint64_t>(infix_store_target_size - 1)) -
+                    scaled_sizes_);
+            }
+            const uint32_t bulk_occ_bits = bitmap_target_sizes_[bulk_occ_grade];
+            const auto [shared, ignore, implicit_size] =
+                GetSharedIgnoreImplicitLengths(left_key, right_key, bulk_occ_bits);
             const uint32_t key_start_bit = shared + ignore + implicit_size + tof_bit_count - 1;
             const uint64_t prev_implicit = ExtractPartialKey(left_key, shared, ignore, implicit_size, 0) >> infix_size_;
             const uint64_t next_implicit = ExtractPartialKey(right_key, shared, ignore, implicit_size, 1) >> infix_size_;
@@ -3811,7 +3999,7 @@ inline void Diva<diva_type, payload_type>::BulkLoad(const t_itr begin, const t_i
             uint32_t last_key_pos = 0, last_infix_pos = 0;
             if constexpr (payload_type == PayloadType::FixedLength)
                 last_key_pos = std::distance(begin, last_key_it);
-            InfiniteByteString keys[infix_store_target_size - 1];
+            InfiniteByteString keys[kDefaultInfixStoreTargetSize - 1];
             infix_vec.clear();
             for (int32_t i = 0; i < infix_store_target_size - 1; i++) {
                 sv = *last_key_it;
@@ -3861,10 +4049,10 @@ inline void Diva<diva_type, payload_type>::BulkLoad(const t_itr begin, const t_i
                 allocation_size_grade = std::lower_bound(scaled_sizes_, scaled_sizes_ + size_scalar_count, num_slots_filled) - scaled_sizes_;
             }
             InfixStore store(scaled_sizes_[allocation_size_grade], infix_size_,
-                             allocation_size_grade, payload_size_);
+                             allocation_size_grade, bitmap_target_sizes_[allocation_size_grade], payload_size_);
             if constexpr (diva_type == DivaType::BinaryTrie)
                 LoadVectorToInfixStore(store, infix_vec, total_implicit, true, payload_list);
-            else 
+            else
                 LoadListToInfixStore(store, infix_list, infix_store_target_size - 1, total_implicit, true, payload_list);
             if constexpr (payload_type == PayloadType::FixedLength) {
                 uint64_t *sample_payloads = reinterpret_cast<uint64_t *>(malloc(((payload_size_ + 63) / 64) * sizeof(uint64_t)));
@@ -3894,7 +4082,15 @@ inline void Diva<diva_type, payload_type>::BulkLoad(const t_itr begin, const t_i
     n_keys_.fetch_add(1, std::memory_order_release);
 
     if (key_it != last_key_it) {
-        const auto [shared, ignore, implicit_size] = GetSharedIgnoreImplicitLengths(left_key, right_key);
+        const uint32_t tail_key_count = static_cast<uint32_t>(
+            std::max<int64_t>(0, std::distance(last_key_it, key_it) - 1));
+        uint32_t tail_occ_grade = static_cast<uint32_t>(
+            std::lower_bound(scaled_sizes_, scaled_sizes_ + size_scalar_count,
+                             static_cast<uint64_t>(tail_key_count)) -
+            scaled_sizes_);
+        const uint32_t tail_occ_bits = bitmap_target_sizes_[tail_occ_grade];
+        const auto [shared, ignore, implicit_size] =
+            GetSharedIgnoreImplicitLengths(left_key, right_key, tail_occ_bits);
         const uint32_t key_start_bit = shared + ignore + implicit_size + tof_bit_count - 1;
         const uint64_t prev_implicit = ExtractPartialKey(left_key, shared, ignore, implicit_size, 0) >> infix_size_;
         const uint64_t next_implicit = ExtractPartialKey(right_key, shared, ignore, implicit_size, 1) >> infix_size_;
@@ -3905,7 +4101,7 @@ inline void Diva<diva_type, payload_type>::BulkLoad(const t_itr begin, const t_i
         uint32_t last_key_pos = 0, last_infix_pos = 0;
         if constexpr (payload_type == PayloadType::FixedLength)
             last_key_pos = std::distance(begin, last_key_it);
-        InfiniteByteString keys[infix_store_target_size - 1];
+        InfiniteByteString keys[kDefaultInfixStoreTargetSize - 1];
         infix_vec.clear();
         while (last_key_it != key_it) {
             sv = *last_key_it;
@@ -3955,10 +4151,10 @@ inline void Diva<diva_type, payload_type>::BulkLoad(const t_itr begin, const t_i
                 num_slots_filled += infix.GetNumSlots(infix_size_);
             allocation_size_grade = std::lower_bound(scaled_sizes_, scaled_sizes_ + size_scalar_count, num_slots_filled) - scaled_sizes_;
         }
-        InfixStore store(scaled_sizes_[allocation_size_grade], infix_size_, allocation_size_grade, payload_size_);
+        InfixStore store(scaled_sizes_[allocation_size_grade], infix_size_, allocation_size_grade, bitmap_target_sizes_[allocation_size_grade], payload_size_);
         if constexpr (diva_type == DivaType::BinaryTrie)
             LoadVectorToInfixStore(store, infix_vec, total_implicit, true, payload_list);
-        else 
+        else
             LoadListToInfixStore(store, infix_list, i, total_implicit, true, payload_list);
         if constexpr (payload_type == PayloadType::FixedLength) {
             uint64_t *sample_payloads = reinterpret_cast<uint64_t *>(malloc(((payload_size_ + 63) / 64) * sizeof(uint64_t)));
@@ -4019,12 +4215,19 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreaming(const uint8_t *key,
         return;
     }
 
+    // Auto-seal: buffer reached infix_store_target_size - 1 keys; seal this
+    // infix and start a new one with the current key as the new left boundary.
     InfiniteByteString bulk_load_right_key {key_copy, key_len};
-
-    uint64_t infix_list[infix_store_target_size];
+    std::vector<uint64_t> infix_list(bulk_load_streaming_ind_);
     std::vector<Infix> infix_vec;
     uint32_t last_infix_pos = 0;
-    const auto [shared, ignore, implicit_size] = GetSharedIgnoreImplicitLengths(bulk_load_left_key_, bulk_load_right_key);
+    const uint32_t stream_occ_grade = static_cast<uint32_t>(
+        std::lower_bound(scaled_sizes_, scaled_sizes_ + size_scalar_count,
+                         static_cast<uint64_t>(bulk_load_streaming_ind_)) -
+        scaled_sizes_);
+    const uint32_t stream_occ_bits = bitmap_target_sizes_[stream_occ_grade];
+    const auto [shared, ignore, implicit_size] =
+        GetSharedIgnoreImplicitLengths(bulk_load_left_key_, bulk_load_right_key, stream_occ_bits);
     const uint32_t key_start_bit = shared + ignore + implicit_size + infix_size_ - 1;
     const uint64_t prev_implicit = ExtractPartialKey(bulk_load_left_key_, shared, ignore, implicit_size, 0) >> infix_size_;
     const uint64_t next_implicit = ExtractPartialKey(bulk_load_right_key, shared, ignore, implicit_size, 1) >> infix_size_;
@@ -4037,7 +4240,7 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreaming(const uint8_t *key,
             if (infix_list[last_infix_pos] != infix_list[i]) {
                 infix_vec.emplace_back(infix_list[last_infix_pos]);
                 if (i - last_infix_pos > 1) {
-                    infix_vec.back().BuildTrieAndSuffixes(bulk_load_key_list_ + last_infix_pos,
+                    infix_vec.back().BuildTrieAndSuffixes(bulk_load_key_list_.data() + last_infix_pos,
                             i - last_infix_pos, key_start_bit, infix_size_,
                             false, false, true);
                 }
@@ -4048,50 +4251,42 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreaming(const uint8_t *key,
     if constexpr (diva_type == DivaType::BinaryTrie) {
         infix_vec.emplace_back(infix_list[last_infix_pos]);
         if (bulk_load_streaming_ind_ - last_infix_pos > 1) {
-            infix_vec.back().BuildTrieAndSuffixes(bulk_load_key_list_ + last_infix_pos,
+            infix_vec.back().BuildTrieAndSuffixes(bulk_load_key_list_.data() + last_infix_pos,
                     bulk_load_streaming_ind_ - last_infix_pos, key_start_bit, infix_size_,
                     false, false, true);
         }
         last_infix_pos = bulk_load_streaming_ind_;
     }
     void *dummy_locked_leaf_addrs[3] = {nullptr, nullptr, nullptr};
-    uint32_t allocation_size_grade = size_scalar_shrink_grow_sep;
+    uint32_t allocation_size_grade = std::lower_bound(
+            scaled_sizes_, scaled_sizes_ + size_scalar_count,
+            static_cast<uint64_t>(bulk_load_streaming_ind_)) - scaled_sizes_;
     if constexpr (diva_type == DivaType::BinaryTrie) {
         uint32_t num_slots_filled = 0;
         for (auto& infix : infix_vec)
             num_slots_filled += infix.GetNumSlots(infix_size_);
         allocation_size_grade = std::lower_bound(scaled_sizes_, scaled_sizes_ + size_scalar_count, num_slots_filled) - scaled_sizes_;
     }
-    InfixStore store(scaled_sizes_[allocation_size_grade], infix_size_,
-                     allocation_size_grade, payload_size_);
+    InfixStore store(scaled_sizes_[allocation_size_grade], infix_size_, allocation_size_grade, bitmap_target_sizes_[allocation_size_grade], payload_size_);
     if constexpr (diva_type == DivaType::BinaryTrie)
         LoadVectorToInfixStore(store, infix_vec, total_implicit, true, bulk_load_payload_list_);
-    else 
-        LoadListToInfixStore(store, infix_list, bulk_load_streaming_ind_, total_implicit, true, bulk_load_payload_list_);
+    else
+        LoadListToInfixStore(store, infix_list.data(), bulk_load_streaming_ind_, total_implicit, true, bulk_load_payload_list_);
     if constexpr (payload_type == PayloadType::FixedLength) {
         uint64_t *sample_payloads = reinterpret_cast<uint64_t *>(malloc(((payload_size_ + 63) / 64) * sizeof(uint64_t)));
         store.ptr[1] = reinterpret_cast<uint64_t>(sample_payloads);
         AddSamplePayload(store, bulk_load_left_payload_);
     }
-    if constexpr (diva_type == DivaType::Int) {
-        wh_int_put(better_tree_int_, bulk_load_left_key_.str,
-                bulk_load_left_key_.length, &store,
-                sizeof(store),
-                dummy_locked_leaf_addrs);
-    }
-    else {
-        wh_put(better_tree_, bulk_load_left_key_.str,
-                bulk_load_left_key_.length, &store,
-                sizeof(store),
-                dummy_locked_leaf_addrs);
-    }
+    if constexpr (diva_type == DivaType::Int)
+        wh_int_put(better_tree_int_, bulk_load_left_key_.str, bulk_load_left_key_.length, &store, sizeof(store), dummy_locked_leaf_addrs);
+    else
+        wh_put(better_tree_, bulk_load_left_key_.str, bulk_load_left_key_.length, &store, sizeof(store), dummy_locked_leaf_addrs);
 
     delete[] bulk_load_left_key_.str;
     bulk_load_left_key_ = bulk_load_right_key;
     if constexpr (payload_type == PayloadType::FixedLength)
         copy_bitmap_to_bitmap(payload, 0, bulk_load_left_payload_, 0, payload_size_);
     bulk_load_streaming_ind_ = 0;
-
     n_keys_.fetch_add(infix_store_target_size, std::memory_order_release);
 }
 
@@ -4152,17 +4347,13 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreamingToCurrentInfix(
     bulk_load_streaming_max_len_ = std::max(
         bulk_load_streaming_max_len_,
         std::max(key_len, bulk_load_left_key_.length));
-    if (bulk_load_streaming_ind_ < infix_store_target_size - 1) {
-        delete[] bulk_load_key_list_[bulk_load_streaming_ind_].str;
-        bulk_load_key_list_[bulk_load_streaming_ind_] = {key_copy, key_len};
-        if constexpr (payload_type == PayloadType::FixedLength)
-            copy_bitmap_to_bitmap(payload, 0, bulk_load_payload_list_,
-                                  bulk_load_streaming_ind_ * payload_size_, payload_size_);
-        bulk_load_streaming_ind_++;
-        return;
-    }
-
-    delete[] key_copy;
+    EnsureBulkLoadStreamingCapacity(bulk_load_streaming_ind_ + 1);
+    delete[] bulk_load_key_list_[bulk_load_streaming_ind_].str;
+    bulk_load_key_list_[bulk_load_streaming_ind_] = {key_copy, key_len};
+    if constexpr (payload_type == PayloadType::FixedLength)
+        copy_bitmap_to_bitmap(payload, 0, bulk_load_payload_list_,
+                              bulk_load_streaming_ind_ * payload_size_, payload_size_);
+    bulk_load_streaming_ind_++;
 }
 
 // Seals the current infix store at the LEFT boundary key (matching regular
@@ -4216,7 +4407,7 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreamingSealWithBoundary(
         // payload for the next materialized boundary store.
         save_boundary_payload();
         // Drain buffered keys for this degenerate boundary case.
-        for (int32_t i = 0; i < infix_store_target_size; i++) {
+        for (uint32_t i = 0; i < bulk_load_streaming_capacity_; i++) {
             delete[] bulk_load_key_list_[i].str;
             bulk_load_key_list_[i] = {};
         }
@@ -4237,11 +4428,16 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreamingSealWithBoundary(
     }
 
     // 3. regular case the boundary is different than the last key in the boundary
-    uint64_t infix_list[infix_store_target_size];
+    std::vector<uint64_t> infix_list(infix_key_count);
     std::vector<Infix> infix_vec;
     uint32_t last_infix_pos = 0;
+    const uint32_t seal_occ_grade = static_cast<uint32_t>(
+        std::lower_bound(scaled_sizes_, scaled_sizes_ + size_scalar_count,
+                         static_cast<uint64_t>(infix_key_count)) -
+        scaled_sizes_);
+    const uint32_t seal_occ_bits = bitmap_target_sizes_[seal_occ_grade];
     const auto [shared, ignore, implicit_size] =
-        GetSharedIgnoreImplicitLengths(bulk_load_left_key_, bulk_load_right_key);
+        GetSharedIgnoreImplicitLengths(bulk_load_left_key_, bulk_load_right_key, seal_occ_bits);
     const uint32_t key_start_bit = shared + ignore + implicit_size + infix_size_ - 1;
     const uint64_t prev_implicit =
         ExtractPartialKey(bulk_load_left_key_, shared, ignore, implicit_size, 0) >> infix_size_;
@@ -4258,7 +4454,7 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreamingSealWithBoundary(
             if (infix_list[last_infix_pos] != infix_list[i]) {
                 infix_vec.emplace_back(infix_list[last_infix_pos]);
                 if (i - last_infix_pos > 1) {
-                    infix_vec.back().BuildTrieAndSuffixes(bulk_load_key_list_ + last_infix_pos,
+                    infix_vec.back().BuildTrieAndSuffixes(bulk_load_key_list_.data() + last_infix_pos,
                             i - last_infix_pos, key_start_bit, infix_size_,
                             false, false, true);
                 }
@@ -4270,7 +4466,7 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreamingSealWithBoundary(
         if (infix_key_count > 0) {
             infix_vec.emplace_back(infix_list[last_infix_pos]);
             if (infix_key_count - last_infix_pos > 1) {
-                infix_vec.back().BuildTrieAndSuffixes(bulk_load_key_list_ + last_infix_pos,
+                infix_vec.back().BuildTrieAndSuffixes(bulk_load_key_list_.data() + last_infix_pos,
                         infix_key_count - last_infix_pos, key_start_bit, infix_size_,
                         false, false, true);
             }
@@ -4279,7 +4475,9 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreamingSealWithBoundary(
     }
 
     void *dummy_locked_leaf_addrs[3] = {nullptr, nullptr, nullptr};
-    uint32_t allocation_size_grade = size_scalar_shrink_grow_sep;
+    uint32_t allocation_size_grade = std::lower_bound(
+            scaled_sizes_, scaled_sizes_ + size_scalar_count,
+            static_cast<uint64_t>(infix_key_count)) - scaled_sizes_;
     if constexpr (diva_type == DivaType::BinaryTrie) {
         uint32_t num_slots_filled = 0;
         for (auto& infix : infix_vec)
@@ -4288,7 +4486,7 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreamingSealWithBoundary(
     }
     // Use payload_size_ (0) so per-slot overhead is zero; block handle goes in ptr[1].
     InfixStore store(scaled_sizes_[allocation_size_grade], infix_size_,
-                     allocation_size_grade, payload_size_);
+                     allocation_size_grade, bitmap_target_sizes_[allocation_size_grade], payload_size_);
     if constexpr (diva_type == DivaType::BinaryTrie) {
         if (!infix_vec.empty()) {
             LoadVectorToInfixStore(store, infix_vec, total_implicit, true,
@@ -4336,7 +4534,7 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreamingSealWithBoundary(
     delete[] bulk_load_left_key_.str;
     bulk_load_left_key_ = bulk_load_right_key;  // transfer ownership
     bulk_load_streaming_ind_ = 0;
-    for (int32_t i = 0; i < infix_store_target_size; i++) {
+    for (uint32_t i = 0; i < bulk_load_streaming_capacity_; i++) {
         delete[] bulk_load_key_list_[i].str;
         bulk_load_key_list_[i] = {};
     }
@@ -4355,8 +4553,10 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreamingSealFinish() {
     // call (where it was used as the initial left boundary).
     if (bulk_load_left_key_.str != nullptr) {
         void *dummy_locked_leaf_addrs[3] = {nullptr, nullptr, nullptr};
-        InfixStore store(scaled_sizes_[size_scalar_shrink_grow_sep], infix_size_,
-                         size_scalar_shrink_grow_sep, payload_size_);
+        const uint32_t allocation_size_grade = std::lower_bound(
+                scaled_sizes_, scaled_sizes_ + size_scalar_count, 0ULL) - scaled_sizes_;
+        InfixStore store(scaled_sizes_[allocation_size_grade], infix_size_,
+                         allocation_size_grade, bitmap_target_sizes_[allocation_size_grade], payload_size_);
         if (prev_seal_payload_ != nullptr) {
             store.ptr[1] = reinterpret_cast<uint64_t>(prev_seal_payload_);
             store.num_sample_payloads = 1;
@@ -4404,11 +4604,16 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreamingFinish() {
         bulk_load_key_list_[bulk_load_streaming_ind_ - 1] = {};
         bulk_load_streaming_ind_--;
 
-        uint64_t infix_list[infix_store_target_size];
+        std::vector<uint64_t> infix_list(bulk_load_streaming_ind_);
         std::vector<Infix> infix_vec;
         uint32_t last_infix_pos = 0;
-        const auto [shared, ignore, implicit_size] = 
-            GetSharedIgnoreImplicitLengths(bulk_load_left_key_, bulk_load_right_key);
+        const uint32_t finish_occ_grade = static_cast<uint32_t>(
+            std::lower_bound(scaled_sizes_, scaled_sizes_ + size_scalar_count,
+                             static_cast<uint64_t>(bulk_load_streaming_ind_)) -
+            scaled_sizes_);
+        const uint32_t finish_occ_bits = bitmap_target_sizes_[finish_occ_grade];
+        const auto [shared, ignore, implicit_size] =
+            GetSharedIgnoreImplicitLengths(bulk_load_left_key_, bulk_load_right_key, finish_occ_bits);
         const uint32_t key_start_bit = shared + ignore + implicit_size + infix_size_ - 1;
         const uint64_t prev_implicit = ExtractPartialKey(bulk_load_left_key_, shared, ignore, implicit_size, 0) >> infix_size_;
         const uint64_t next_implicit = ExtractPartialKey(bulk_load_right_key, shared, ignore, implicit_size, 1) >> infix_size_;
@@ -4421,7 +4626,7 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreamingFinish() {
                 if (infix_list[last_infix_pos] != infix_list[i]) {
                     infix_vec.emplace_back(infix_list[last_infix_pos]);
                     if (i - last_infix_pos > 1) {
-                        infix_vec.back().BuildTrieAndSuffixes(bulk_load_key_list_ + last_infix_pos,
+                        infix_vec.back().BuildTrieAndSuffixes(bulk_load_key_list_.data() + last_infix_pos,
                                 i - last_infix_pos, key_start_bit, infix_size_,
                                 false, false, true);
                     }
@@ -4432,7 +4637,7 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreamingFinish() {
         if constexpr (diva_type == DivaType::BinaryTrie) {
             infix_vec.emplace_back(infix_list[last_infix_pos]);
             if (bulk_load_streaming_ind_ - last_infix_pos > 1) {
-                infix_vec.back().BuildTrieAndSuffixes(bulk_load_key_list_ + last_infix_pos,
+                infix_vec.back().BuildTrieAndSuffixes(bulk_load_key_list_.data() + last_infix_pos,
                         bulk_load_streaming_ind_ - last_infix_pos, key_start_bit, infix_size_,
                         false, false, true);
             }
@@ -4446,11 +4651,12 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreamingFinish() {
                 num_slots_filled += infix.GetNumSlots(infix_size_);
             allocation_size_grade = std::lower_bound(scaled_sizes_, scaled_sizes_ + size_scalar_count, num_slots_filled) - scaled_sizes_;
         }
-        InfixStore store(scaled_sizes_[allocation_size_grade], infix_size_, allocation_size_grade, payload_size_);
+        InfixStore store(scaled_sizes_[allocation_size_grade], infix_size_, allocation_size_grade, bitmap_target_sizes_[allocation_size_grade], payload_size_);
         if constexpr (diva_type == DivaType::BinaryTrie)
             LoadVectorToInfixStore(store, infix_vec, total_implicit, true, bulk_load_payload_list_);
-        else 
-            LoadListToInfixStore(store, infix_list, bulk_load_streaming_ind_, total_implicit, true, bulk_load_payload_list_);
+        else
+            LoadListToInfixStore(store, infix_list.data(), bulk_load_streaming_ind_, total_implicit, true,
+                                 bulk_load_payload_list_);
         if constexpr (payload_type == PayloadType::FixedLength) {
             uint64_t *sample_payloads = reinterpret_cast<uint64_t *>(malloc(((payload_size_ + 63) / 64) * sizeof(uint64_t)));
             store.ptr[1] = reinterpret_cast<uint64_t>(sample_payloads);
@@ -4480,7 +4686,7 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreamingFinish() {
     delete[] bulk_load_left_key_.str;
     bulk_load_streaming_ind_ = 0;
     bulk_load_left_key_ = {};
-    for (int32_t i = 0; i < infix_store_target_size; i++) {
+    for (uint32_t i = 0; i < bulk_load_streaming_capacity_; i++) {
         delete[] bulk_load_key_list_[i].str;
         bulk_load_key_list_[i] = {};
     }
@@ -4500,10 +4706,12 @@ template <DivaType diva_type, PayloadType payload_type>
 inline uint32_t Diva<diva_type, payload_type>::RankOccupieds(const InfixStore &store, const uint32_t pos) const {
     const uint32_t *popcnts = reinterpret_cast<const uint32_t *>(store.ptr);
     const uint64_t *occupieds = store.ptr + num_metadata_offset_words;
+    const uint32_t size_grade = store.GetSizeGrade();
+    const uint32_t occ_bits = static_cast<uint32_t>(bitmap_target_sizes_[size_grade]);
 
-    const bool cond = infix_store_target_size / 2 <= pos;
+    const bool cond = occ_bits / 2 <= pos;
     uint32_t res = cond ? popcnts[0] : 0;
-    for (int32_t i = cond ? infix_store_target_size / 128 : 0; i < pos / 64; i++)
+    for (int32_t i = cond ? occ_bits / 128 : 0; i < pos / 64; i++)
         res += __builtin_popcountll(occupieds[i]);
     return res + bit_rank(occupieds[pos / 64], pos % 64);
 }
@@ -4514,14 +4722,28 @@ template <DivaType diva_type, PayloadType payload_type>
 inline uint32_t Diva<diva_type, payload_type>::SelectRunends(const InfixStore &store, const uint32_t rank) const {
     const uint32_t *popcnts = reinterpret_cast<const uint32_t *>(store.ptr);
     const uint32_t size_grade = store.GetSizeGrade();
-    const uint32_t total_words = (scaled_sizes_[size_grade] + 63) / 64;
-    const uint64_t *runends = store.ptr + num_metadata_offset_words + infix_store_target_size / 64;
+    const uint32_t occ_bits = static_cast<uint32_t>(bitmap_target_sizes_[size_grade]);
+    const uint32_t occ_al = InfixStore::OccupiedAlignedBits(occ_bits);
+    const uint32_t re_bits = static_cast<uint32_t>(scaled_sizes_[size_grade]);
+    const uint32_t total_words = (re_bits + 63) / 64;
+    const uint64_t *runends = store.ptr + num_metadata_offset_words + occ_al / 64;
 
     const bool cond = popcnts[1] <= rank;
-    uint32_t old_total_set_bits = cond ? popcnts[1] - __builtin_popcountll(runends[infix_store_target_size / 128 - 1]) : 0;
-    uint32_t total_set_bits = cond ? popcnts[1] : 0;
+    const uint32_t start_word = re_bits / 128;
+    uint32_t old_total_set_bits = 0;
+    uint32_t total_set_bits = 0;
+    if (cond) {
+        if (start_word > 0) {
+            total_set_bits = popcnts[1];
+            old_total_set_bits = popcnts[1] - __builtin_popcountll(runends[start_word - 1]);
+        } else {
+            // No "right-half" cache window when bitmap width < 128 bits.
+            total_set_bits = 0;
+            old_total_set_bits = 0;
+        }
+    }
     uint32_t i;
-    for (i = cond ? infix_store_target_size / 128 : 0; total_set_bits <= rank && i < total_words; i++) {
+    for (i = cond ? start_word : 0; total_set_bits <= rank && i < total_words; i++) {
         old_total_set_bits = total_set_bits;
         total_set_bits += __builtin_popcountll(runends[i]);
     }
@@ -4533,11 +4755,13 @@ inline uint32_t Diva<diva_type, payload_type>::SelectRunends(const InfixStore &s
 template <DivaType diva_type, PayloadType payload_type>
 inline int32_t Diva<diva_type, payload_type>::NextOccupied(const InfixStore &store, const uint32_t pos) const {
     const uint64_t *occupieds = store.ptr + num_metadata_offset_words;
+    const uint32_t size_grade = store.GetSizeGrade();
+    const uint32_t occ_bits = static_cast<uint32_t>(bitmap_target_sizes_[size_grade]);
     int32_t res = pos + 1, lb_pos;
     do {
         lb_pos = lowbit_pos(occupieds[res / 64] & (~BITMASK(res % 64)));
         res += lb_pos - res % 64;
-    } while (lb_pos == 64 && res < infix_store_target_size);
+    } while (lb_pos == 64 && res < static_cast<int32_t>(occ_bits));
     return res;
 }
 
@@ -4562,14 +4786,15 @@ inline int32_t Diva<diva_type, payload_type>::PreviousOccupied(const InfixStore 
 template <DivaType diva_type, PayloadType payload_type>
 //__attribute__((always_inline))
 inline int32_t Diva<diva_type, payload_type>::NextRunend(const InfixStore &store, const uint32_t pos) const {
-    const uint64_t *runends = store.ptr + num_metadata_offset_words + infix_store_target_size / 64;
     const uint32_t size_grade = store.GetSizeGrade();
-    const uint32_t runends_size = scaled_sizes_[size_grade];
+    const uint32_t occ_bits = static_cast<uint32_t>(bitmap_target_sizes_[size_grade]);
+    const uint32_t slots = static_cast<uint32_t>(scaled_sizes_[size_grade]);
+    const uint64_t *runends = store.ptr + num_metadata_offset_words + InfixStore::OccupiedAlignedBits(occ_bits) / 64;
     int32_t res = pos + 1, lb_pos;
     do {
         lb_pos = lowbit_pos(runends[res / 64] & (~BITMASK(res % 64)));
         res += lb_pos - res % 64;
-    } while (lb_pos == 64 && res < runends_size);
+    } while (lb_pos == 64 && res < static_cast<int32_t>(slots));
     return res;
 }
 
@@ -4577,7 +4802,9 @@ inline int32_t Diva<diva_type, payload_type>::NextRunend(const InfixStore &store
 template <DivaType diva_type, PayloadType payload_type>
 //__attribute__((always_inline))
 inline int32_t Diva<diva_type, payload_type>::PreviousRunend(const InfixStore &store, const uint32_t pos) const {
-    const uint64_t *runends = store.ptr + num_metadata_offset_words + infix_store_target_size / 64;
+    const uint32_t size_grade = store.GetSizeGrade();
+    const uint32_t occ_bits = static_cast<uint32_t>(bitmap_target_sizes_[size_grade]);
+    const uint64_t *runends = store.ptr + num_metadata_offset_words + InfixStore::OccupiedAlignedBits(occ_bits) / 64;
     int32_t res = pos - 1, hb_pos;
     do {
         const int32_t offset = res % 64;
@@ -4600,13 +4827,20 @@ inline int32_t Diva<diva_type, payload_type>::GetMappedPos(const uint32_t implic
     return std::min<uint32_t>(scaled_sizes_[size_grade] - 1, res);
 }
 
+template <DivaType diva_type, PayloadType payload_type>
+inline uint64_t Diva<diva_type, payload_type>::GetImplicitScalar(
+        const uint32_t total_implicit, const uint32_t target_size) const {
+    const double ratio = static_cast<double>(target_size) /
+                         static_cast<double>(total_implicit);
+    return static_cast<uint64_t>(ratio * (1ULL << scale_implicit_shift));
+}
+
 
 template <DivaType diva_type, PayloadType payload_type>
 //__attribute__((always_inline))
 inline uint64_t Diva<diva_type, payload_type>::GetSlot(const InfixStore &store, const uint32_t pos) const {
     const uint32_t size_grade = store.GetSizeGrade();
-    const uint32_t bit_pos = 64 * num_metadata_offset_words + infix_store_target_size 
-                           + scaled_sizes_[size_grade] + pos * infix_size_;
+    const uint32_t bit_pos = SlotDataBaseBit(size_grade) + pos * infix_size_;
     const uint8_t *ptr = ((uint8_t *) store.ptr) + bit_pos / 8;
     uint64_t value;
     memcpy(&value, ptr, sizeof(value));
@@ -4618,8 +4852,7 @@ template <DivaType diva_type, PayloadType payload_type>
 //__attribute__((always_inline))
 inline void Diva<diva_type, payload_type>::SetSlot(InfixStore &store, const uint32_t pos, const uint64_t value) {
     const uint32_t size_grade = store.GetSizeGrade();
-    const uint32_t bit_pos = 64 * num_metadata_offset_words + infix_store_target_size 
-                           + scaled_sizes_[size_grade] + pos * infix_size_;
+    const uint32_t bit_pos = SlotDataBaseBit(size_grade) + pos * infix_size_;
     uint8_t *ptr = ((uint8_t *) store.ptr) + bit_pos / 8;
     uint64_t stamp;
     memcpy(&stamp, ptr, sizeof(stamp));
@@ -4637,8 +4870,7 @@ inline void Diva<diva_type, payload_type>::SetSlot(InfixStore &store, const uint
     assert(value > 0);
 #endif // DEBUG
     const uint32_t size_grade = store.GetSizeGrade();
-    const uint32_t bit_pos = 64 * num_metadata_offset_words + infix_store_target_size 
-                           + scaled_sizes_[size_grade] + pos * width;
+    const uint32_t bit_pos = SlotDataBaseBit(size_grade) + pos * width;
     uint8_t *ptr = ((uint8_t *) store.ptr) + bit_pos / 8;
     uint64_t stamp;
     memcpy(&stamp, ptr, sizeof(stamp));
@@ -4657,8 +4889,8 @@ inline void Diva<diva_type, payload_type>::GetPayload(const InfixStore &store, c
     assert(payload != nullptr);
 #endif // DEBUG
     const uint32_t size_grade = store.GetSizeGrade();
-    const uint32_t bit_pos = 64 * num_metadata_offset_words + infix_store_target_size 
-                           + scaled_sizes_[size_grade] * (infix_size_ + 1) + pos * payload_size_;
+    const uint32_t slots = static_cast<uint32_t>(scaled_sizes_[size_grade]);
+    const uint32_t bit_pos = SlotDataBaseBit(size_grade) + slots * (infix_size_ + 1) + pos * payload_size_;
     copy_bitmap_to_bitmap(store.ptr, bit_pos, payload, payload_offset, payload_size_);
 }
 
@@ -4682,8 +4914,8 @@ inline void Diva<diva_type, payload_type>::SetPayload(InfixStore &store, const u
     assert(payload != nullptr);
 #endif // DEBUG
     const uint32_t size_grade = store.GetSizeGrade();
-    const uint32_t bit_pos = 64 * num_metadata_offset_words + infix_store_target_size 
-                           + scaled_sizes_[size_grade] * (infix_size_ + 1) + pos * payload_size_;
+    const uint32_t slots = static_cast<uint32_t>(scaled_sizes_[size_grade]);
+    const uint32_t bit_pos = SlotDataBaseBit(size_grade) + slots * (infix_size_ + 1) + pos * payload_size_;
     copy_bitmap_to_bitmap(payload, payload_offset, store.ptr, bit_pos, payload_size_);
 }
 
@@ -4743,7 +4975,9 @@ template <DivaType diva_type, PayloadType payload_type>
 inline void Diva<diva_type, payload_type>::SetOccupiedBit(InfixStore &store, const uint32_t pos) {
     uint32_t *popcnts = reinterpret_cast<uint32_t *>(store.ptr);
     uint64_t *occupieds = store.ptr + num_metadata_offset_words;
-    popcnts[0] += pos < infix_store_target_size / 2 ? 1 - get_bitmap_bit(occupieds, pos) : 0;
+    const uint32_t size_grade = store.GetSizeGrade();
+    const uint32_t occ_bits = static_cast<uint32_t>(bitmap_target_sizes_[size_grade]);
+    popcnts[0] += pos < occ_bits / 2 ? 1 - get_bitmap_bit(occupieds, pos) : 0;
     set_bitmap_bit(occupieds, pos);
 }
 
@@ -4752,14 +4986,18 @@ __attribute__((always_inline))
 inline void Diva<diva_type, payload_type>::ResetOccupiedBit(InfixStore &store, const uint32_t pos) {
     uint32_t *popcnts = reinterpret_cast<uint32_t *>(store.ptr);
     uint64_t *occupieds = store.ptr + num_metadata_offset_words;
-    popcnts[0] -= pos < infix_store_target_size / 2 ? get_bitmap_bit(occupieds, pos) : 0;
+    const uint32_t size_grade = store.GetSizeGrade();
+    const uint32_t occ_bits = static_cast<uint32_t>(bitmap_target_sizes_[size_grade]);
+    popcnts[0] -= pos < occ_bits / 2 ? get_bitmap_bit(occupieds, pos) : 0;
     reset_bitmap_bit(occupieds, pos);
 }
 
 template <DivaType diva_type, PayloadType payload_type>
 //__attribute__((always_inline))
 inline bool Diva<diva_type, payload_type>::GetRunendBit(const InfixStore &store, const uint32_t pos) const {
-    const uint64_t *runends = store.ptr + num_metadata_offset_words + infix_store_target_size / 64;
+    const uint32_t size_grade = store.GetSizeGrade();
+    const uint32_t occ_bits = static_cast<uint32_t>(bitmap_target_sizes_[size_grade]);
+    const uint64_t *runends = store.ptr + num_metadata_offset_words + InfixStore::OccupiedAlignedBits(occ_bits) / 64;
     return get_bitmap_bit(runends, pos);
 }
 
@@ -4767,8 +5005,11 @@ template <DivaType diva_type, PayloadType payload_type>
 __attribute__((always_inline))
 inline void Diva<diva_type, payload_type>::SetRunendBit(InfixStore &store, const uint32_t pos) {
     uint32_t *popcnts = reinterpret_cast<uint32_t *>(store.ptr);
-    uint64_t *runends = store.ptr + num_metadata_offset_words + infix_store_target_size / 64;
-    popcnts[1] += pos < infix_store_target_size / 2 ? 1 - get_bitmap_bit(runends, pos) : 0;
+    const uint32_t size_grade = store.GetSizeGrade();
+    const uint32_t occ_bits = static_cast<uint32_t>(bitmap_target_sizes_[size_grade]);
+    const uint32_t re_bits = static_cast<uint32_t>(scaled_sizes_[size_grade]);
+    uint64_t *runends = store.ptr + num_metadata_offset_words + InfixStore::OccupiedAlignedBits(occ_bits) / 64;
+    popcnts[1] += pos < re_bits / 2 ? 1 - get_bitmap_bit(runends, pos) : 0;
     set_bitmap_bit(runends, pos);
 }
 
@@ -4776,8 +5017,11 @@ template <DivaType diva_type, PayloadType payload_type>
 __attribute__((always_inline))
 inline void Diva<diva_type, payload_type>::ResetRunendBit(InfixStore &store, const uint32_t pos) {
     uint32_t *popcnts = reinterpret_cast<uint32_t *>(store.ptr);
-    uint64_t *runends = store.ptr + num_metadata_offset_words + infix_store_target_size / 64;
-    popcnts[1] -= pos < infix_store_target_size / 2 ? get_bitmap_bit(runends, pos) : 0;
+    const uint32_t size_grade = store.GetSizeGrade();
+    const uint32_t occ_bits = static_cast<uint32_t>(bitmap_target_sizes_[size_grade]);
+    const uint32_t re_bits = static_cast<uint32_t>(scaled_sizes_[size_grade]);
+    uint64_t *runends = store.ptr + num_metadata_offset_words + InfixStore::OccupiedAlignedBits(occ_bits) / 64;
+    popcnts[1] -= pos < re_bits / 2 ? get_bitmap_bit(runends, pos) : 0;
     reset_bitmap_bit(runends, pos);
 }
 
@@ -4787,14 +5031,22 @@ inline void Diva<diva_type, payload_type>::UpdatePopcnts(InfixStore& store) {
     uint32_t *popcnts = reinterpret_cast<uint32_t *>(store.ptr);
     popcnts[0] = popcnts[1] = 0;
     const uint64_t *occupieds = store.ptr + num_metadata_offset_words;
-    const uint64_t *runends = store.ptr + num_metadata_offset_words + infix_store_target_size / 64;
     const uint32_t size_grade = store.GetSizeGrade();
-    for (int32_t i = 0; i < infix_store_target_size / 128; i++) {
-        popcnts[0] += __builtin_popcountll(occupieds[i]);
-        if (static_cast<int32_t>(scaled_sizes_[size_grade]) - i * 64 > 0) {
-            const uint64_t mask = BITMASK(std::min(64UL, scaled_sizes_[size_grade] - i * 64));
-            popcnts[1] += __builtin_popcountll(runends[i] & mask);
-        }
+    const uint32_t occ_bits = static_cast<uint32_t>(bitmap_target_sizes_[size_grade]);
+    const uint32_t re_bits = static_cast<uint32_t>(scaled_sizes_[size_grade]);
+    const uint64_t *runends = store.ptr + num_metadata_offset_words + InfixStore::OccupiedAlignedBits(occ_bits) / 64;
+    // Matches SetOccupiedBit / SetRunendBit: cache popcount only for the low half of each bitmap.
+    uint32_t occ_half = occ_bits / 2u;
+    for (uint32_t w = 0; occ_half > 0; ++w) {
+        const uint32_t chunk = std::min(64u, occ_half);
+        popcnts[0] += __builtin_popcountll(occupieds[w] & BITMASK(chunk));
+        occ_half -= chunk;
+    }
+    uint32_t re_half = re_bits / 2u;
+    for (uint32_t w = 0; re_half > 0; ++w) {
+        const uint32_t chunk = std::min(64u, re_half);
+        popcnts[1] += __builtin_popcountll(runends[w] & BITMASK(chunk));
+        re_half -= chunk;
     }
 }
 
@@ -4803,10 +5055,9 @@ template <DivaType diva_type, PayloadType payload_type>
 inline void Diva<diva_type, payload_type>::ShiftSlotsRight(InfixStore &store, const uint32_t l, const uint32_t r,
                                                            const uint32_t shamt) {
     const uint32_t size_grade = store.GetSizeGrade();
-    const uint32_t l_bit_pos = 64 * num_metadata_offset_words + infix_store_target_size 
-                             + scaled_sizes_[size_grade] + l * infix_size_;
-    const uint32_t r_bit_pos = 64 * num_metadata_offset_words + infix_store_target_size 
-                             + scaled_sizes_[size_grade] + r * infix_size_ - 1;
+    const uint32_t base = SlotDataBaseBit(size_grade);
+    const uint32_t l_bit_pos = base + l * infix_size_;
+    const uint32_t r_bit_pos = base + r * infix_size_ - 1;
     shift_bitmap_right(store.ptr, l_bit_pos, r_bit_pos, shamt * infix_size_);
 }
 
@@ -4816,10 +5067,9 @@ template <DivaType diva_type, PayloadType payload_type>
 inline void Diva<diva_type, payload_type>::ShiftSlotsLeft(InfixStore &store, const uint32_t l, const uint32_t r,
                                                           const uint32_t shamt) {
     const uint32_t size_grade = store.GetSizeGrade();
-    const uint32_t l_bit_pos = 64 * num_metadata_offset_words + infix_store_target_size 
-                             + scaled_sizes_[size_grade] + l * infix_size_;
-    const uint32_t r_bit_pos = 64 * num_metadata_offset_words + infix_store_target_size 
-                             + scaled_sizes_[size_grade] + r * infix_size_ - 1;
+    const uint32_t base = SlotDataBaseBit(size_grade);
+    const uint32_t l_bit_pos = base + l * infix_size_;
+    const uint32_t r_bit_pos = base + r * infix_size_ - 1;
     shift_bitmap_left(store.ptr, l_bit_pos, r_bit_pos, shamt * infix_size_);
 }
 
@@ -4829,10 +5079,10 @@ template <DivaType diva_type, PayloadType payload_type>
 inline void Diva<diva_type, payload_type>::ShiftPayloadsRight(InfixStore &store, const uint32_t l, const uint32_t r,
                                                               const uint32_t shamt) {
     const uint32_t size_grade = store.GetSizeGrade();
-    const uint32_t l_bit_pos = 64 * num_metadata_offset_words + infix_store_target_size 
-                             + scaled_sizes_[size_grade] * (infix_size_ + 1) + payload_size_ * l;
-    const uint32_t r_bit_pos = 64 * num_metadata_offset_words + infix_store_target_size 
-                             + scaled_sizes_[size_grade] * (infix_size_ + 1) + payload_size_ * r - 1;
+    const uint32_t slots = static_cast<uint32_t>(scaled_sizes_[size_grade]);
+    const uint32_t base = SlotDataBaseBit(size_grade) + slots * (infix_size_ + 1);
+    const uint32_t l_bit_pos = base + payload_size_ * l;
+    const uint32_t r_bit_pos = base + payload_size_ * r - 1;
     shift_bitmap_right(store.ptr, l_bit_pos, r_bit_pos, shamt * payload_size_);
 }
 
@@ -4842,10 +5092,10 @@ template <DivaType diva_type, PayloadType payload_type>
 inline void Diva<diva_type, payload_type>::ShiftPayloadsLeft(InfixStore &store, const uint32_t l, const uint32_t r,
                                                              const uint32_t shamt) {
     const uint32_t size_grade = store.GetSizeGrade();
-    const uint32_t l_bit_pos = 64 * num_metadata_offset_words + infix_store_target_size 
-                             + scaled_sizes_[size_grade] * (infix_size_ + 1) + payload_size_ * l;
-    const uint32_t r_bit_pos = 64 * num_metadata_offset_words + infix_store_target_size 
-                             + scaled_sizes_[size_grade] * (infix_size_ + 1) + payload_size_ * r - 1;
+    const uint32_t slots = static_cast<uint32_t>(scaled_sizes_[size_grade]);
+    const uint32_t base = SlotDataBaseBit(size_grade) + slots * (infix_size_ + 1);
+    const uint32_t l_bit_pos = base + payload_size_ * l;
+    const uint32_t r_bit_pos = base + payload_size_ * r - 1;
     shift_bitmap_left(store.ptr, l_bit_pos, r_bit_pos, shamt * payload_size_);
 }
 
@@ -4855,10 +5105,9 @@ template <DivaType diva_type, PayloadType payload_type>
 inline void Diva<diva_type, payload_type>::MoveSlotsRight(InfixStore &store, const uint32_t l, const uint32_t r,
                                                           const uint32_t shamt) {
     const uint32_t size_grade = store.GetSizeGrade();
-    const uint32_t l_bit_pos = 64 * num_metadata_offset_words + infix_store_target_size 
-                             + scaled_sizes_[size_grade] + l * infix_size_;
-    const uint32_t r_bit_pos = 64 * num_metadata_offset_words + infix_store_target_size 
-                             + scaled_sizes_[size_grade] + r * infix_size_ - 1;
+    const uint32_t base = SlotDataBaseBit(size_grade);
+    const uint32_t l_bit_pos = base + l * infix_size_;
+    const uint32_t r_bit_pos = base + r * infix_size_ - 1;
     move_bitmap_right(store.ptr, l_bit_pos, r_bit_pos, shamt * infix_size_);
     zero_out_bitmap(store.ptr, l_bit_pos, std::min(r_bit_pos, l_bit_pos + shamt * infix_size_ - 1));
 }
@@ -4869,10 +5118,9 @@ template <DivaType diva_type, PayloadType payload_type>
 inline void Diva<diva_type, payload_type>::MoveSlotsLeft(InfixStore &store, const uint32_t l, const uint32_t r,
                                                          const uint32_t shamt) {
     const uint32_t size_grade = store.GetSizeGrade();
-    const uint32_t l_bit_pos = 64 * num_metadata_offset_words + infix_store_target_size 
-                             + scaled_sizes_[size_grade] + l * infix_size_;
-    const uint32_t r_bit_pos = 64 * num_metadata_offset_words + infix_store_target_size 
-                             + scaled_sizes_[size_grade] + r * infix_size_ - 1;
+    const uint32_t base = SlotDataBaseBit(size_grade);
+    const uint32_t l_bit_pos = base + l * infix_size_;
+    const uint32_t r_bit_pos = base + r * infix_size_ - 1;
     move_bitmap_left(store.ptr, l_bit_pos, r_bit_pos, shamt * infix_size_);
     zero_out_bitmap(store.ptr, std::max(l_bit_pos, r_bit_pos - shamt * infix_size_ + 1), r_bit_pos);
 }
@@ -4883,10 +5131,10 @@ template <DivaType diva_type, PayloadType payload_type>
 inline void Diva<diva_type, payload_type>::MovePayloadsRight(InfixStore &store, const uint32_t l, const uint32_t r,
                                                              const uint32_t shamt) {
     const uint32_t size_grade = store.GetSizeGrade();
-    const uint32_t l_bit_pos = 64 * num_metadata_offset_words + infix_store_target_size 
-                             + scaled_sizes_[size_grade] * (infix_size_ + 1) + payload_size_ * l;
-    const uint32_t r_bit_pos = 64 * num_metadata_offset_words + infix_store_target_size 
-                             + scaled_sizes_[size_grade] * (infix_size_ + 1) + payload_size_ * r - 1;
+    const uint32_t slots = static_cast<uint32_t>(scaled_sizes_[size_grade]);
+    const uint32_t base = SlotDataBaseBit(size_grade) + slots * (infix_size_ + 1);
+    const uint32_t l_bit_pos = base + payload_size_ * l;
+    const uint32_t r_bit_pos = base + payload_size_ * r - 1;
     move_bitmap_right(store.ptr, l_bit_pos, r_bit_pos, shamt * payload_size_);
     zero_out_bitmap(store.ptr, l_bit_pos, std::min(r_bit_pos, l_bit_pos + shamt * payload_size_ - 1));
 }
@@ -4897,10 +5145,10 @@ template <DivaType diva_type, PayloadType payload_type>
 inline void Diva<diva_type, payload_type>::MovePayloadsLeft(InfixStore &store, const uint32_t l, const uint32_t r,
                                                             const uint32_t shamt) {
     const uint32_t size_grade = store.GetSizeGrade();
-    const uint32_t l_bit_pos = 64 * num_metadata_offset_words + infix_store_target_size 
-                             + scaled_sizes_[size_grade] * (infix_size_ + 1) + payload_size_ * l;
-    const uint32_t r_bit_pos = 64 * num_metadata_offset_words + infix_store_target_size 
-                             + scaled_sizes_[size_grade] * (infix_size_ + 1) + payload_size_ * r - 1;
+    const uint32_t slots = static_cast<uint32_t>(scaled_sizes_[size_grade]);
+    const uint32_t base = SlotDataBaseBit(size_grade) + slots * (infix_size_ + 1);
+    const uint32_t l_bit_pos = base + payload_size_ * l;
+    const uint32_t r_bit_pos = base + payload_size_ * r - 1;
     move_bitmap_left(store.ptr, l_bit_pos, r_bit_pos, shamt * payload_size_);
     zero_out_bitmap(store.ptr, std::max(l_bit_pos, r_bit_pos - shamt * payload_size_ + 1), r_bit_pos);
 }
@@ -4910,10 +5158,9 @@ template <DivaType diva_type, PayloadType payload_type>
 //__attribute__((always_inline))
 inline void Diva<diva_type, payload_type>::ZeroOutSlots(InfixStore &store, const uint32_t l, const uint32_t r) {
     const uint32_t size_grade = store.GetSizeGrade();
-    const uint32_t l_bit_pos = 64 * num_metadata_offset_words + infix_store_target_size 
-                             + scaled_sizes_[size_grade] + l * infix_size_;
-    const uint32_t r_bit_pos = 64 * num_metadata_offset_words + infix_store_target_size 
-                             + scaled_sizes_[size_grade] + r * infix_size_ - 1;
+    const uint32_t base = SlotDataBaseBit(size_grade);
+    const uint32_t l_bit_pos = base + l * infix_size_;
+    const uint32_t r_bit_pos = base + r * infix_size_ - 1;
     zero_out_bitmap(store.ptr, l_bit_pos, r_bit_pos);
 }
 
@@ -4922,10 +5169,10 @@ template <DivaType diva_type, PayloadType payload_type>
 //__attribute__((always_inline))
 inline void Diva<diva_type, payload_type>::ZeroOutPayloads(InfixStore &store, const uint32_t l, const uint32_t r) {
     const uint32_t size_grade = store.GetSizeGrade();
-    const uint32_t l_bit_pos = 64 * num_metadata_offset_words + infix_store_target_size 
-                             + scaled_sizes_[size_grade] * (infix_size_ + 1) + payload_size_ * l;
-    const uint32_t r_bit_pos = 64 * num_metadata_offset_words + infix_store_target_size 
-                             + scaled_sizes_[size_grade] * (infix_size_ + 1) + payload_size_ * r - 1;
+    const uint32_t slots = static_cast<uint32_t>(scaled_sizes_[size_grade]);
+    const uint32_t base = SlotDataBaseBit(size_grade) + slots * (infix_size_ + 1);
+    const uint32_t l_bit_pos = base + payload_size_ * l;
+    const uint32_t r_bit_pos = base + payload_size_ * r - 1;
     zero_out_bitmap(store.ptr, l_bit_pos, r_bit_pos);
 }
 
@@ -4936,12 +5183,15 @@ inline void Diva<diva_type, payload_type>::ShiftRunendsRight(InfixStore &store, 
                                                              const uint32_t shamt) {
     if (l >= r)
         return;
+    const uint32_t size_grade = store.GetSizeGrade();
+    const uint32_t occ_bits = static_cast<uint32_t>(bitmap_target_sizes_[size_grade]);
+    const uint32_t re_bits = static_cast<uint32_t>(scaled_sizes_[size_grade]);
     uint32_t *popcnts = reinterpret_cast<uint32_t *>(store.ptr);
-    uint64_t *runends = store.ptr + num_metadata_offset_words + infix_store_target_size / 64;
+    uint64_t *runends = store.ptr + num_metadata_offset_words + InfixStore::OccupiedAlignedBits(occ_bits) / 64;
     // Update `popcnts`
-    const uint32_t num_bits_to_read = std::max<int32_t>(r + shamt - std::max(infix_store_target_size / 2, l + shamt), 0)
-                                    - std::max<int32_t>(r - std::max(infix_store_target_size / 2, l), 0);
-    uint32_t read_bit_pos = infix_store_target_size / 2 - num_bits_to_read;
+    const uint32_t num_bits_to_read = std::max<int32_t>(r + shamt - std::max(re_bits / 2, l + shamt), 0)
+                                    - std::max<int32_t>(r - std::max(re_bits / 2, l), 0);
+    uint32_t read_bit_pos = re_bits / 2 - num_bits_to_read;
     uint64_t read_buf = 0;
     uint32_t read_buf_filled_len = 0, num_bits_read = 0;
     while (num_bits_read < num_bits_to_read) {
@@ -4965,12 +5215,15 @@ inline void Diva<diva_type, payload_type>::ShiftRunendsLeft(InfixStore &store, c
                                                             const uint32_t shamt) {
     if (l >= r)
         return;
+    const uint32_t size_grade = store.GetSizeGrade();
+    const uint32_t occ_bits = static_cast<uint32_t>(bitmap_target_sizes_[size_grade]);
+    const uint32_t re_bits = static_cast<uint32_t>(scaled_sizes_[size_grade]);
     uint32_t *popcnts = reinterpret_cast<uint32_t *>(store.ptr);
-    uint64_t *runends = store.ptr + num_metadata_offset_words + infix_store_target_size / 64;
+    uint64_t *runends = store.ptr + num_metadata_offset_words + InfixStore::OccupiedAlignedBits(occ_bits) / 64;
     // Update `popcnts`
-    const uint32_t num_bits_to_read = std::max<int32_t>(std::min(r - shamt, infix_store_target_size / 2) - (l - shamt), 0)
-                                    - std::max<int32_t>(std::min(r, infix_store_target_size / 2) - l, 0);
-    uint32_t read_bit_pos = infix_store_target_size / 2;
+    const uint32_t num_bits_to_read = std::max<int32_t>(std::min(r - shamt, re_bits / 2) - (l - shamt), 0)
+                                    - std::max<int32_t>(std::min(r, re_bits / 2) - l, 0);
+    uint32_t read_bit_pos = re_bits / 2;
     uint64_t read_buf = 0;
     uint32_t read_buf_filled_len = 0, num_bits_read = 0;
     while (num_bits_read < num_bits_to_read) {
@@ -5115,7 +5368,7 @@ inline std::pair<bool, uint32_t> Diva<diva_type, payload_type>::FindInfixInRun(c
             if constexpr (diva_type == DivaType::BinaryTrie) {
                 if (SlotHasTrie(store, i, runend_pos)) {
                     const Infix infix_to_skip(store.ptr + num_metadata_offset_words,
-                                              infix_store_target_size + scaled_sizes_[size_grade] + infix_size_ * i,
+                                              SlotStripBitOffsetInData(size_grade) + infix_size_ * i,
                                               infix_size_);
                     i += infix_to_skip.GetNumSlots(infix_size_) - 1;
                 }
@@ -5147,7 +5400,8 @@ inline void Diva<diva_type, payload_type>::InsertRawIntoInfixStore(InfixStore &s
 
     const uint64_t implicit_part = key >> infix_size_;
     const uint64_t explicit_part = key & BITMASK(infix_size_);
-    const uint64_t implicit_scalar = implicit_scalars_[total_implicit - infix_store_target_size / 2];
+    const uint32_t target_size = scaled_sizes_[size_grade];
+    const uint64_t implicit_scalar = GetImplicitScalar(total_implicit, target_size);
 #ifdef DEBUG
     assert(implicit_part < total_implicit);
 #endif // DEBUG
@@ -5210,7 +5464,7 @@ inline void Diva<diva_type, payload_type>::InsertRawIntoInfixStore(InfixStore &s
                 uint32_t original_num_slots = 1;
                 if (SlotHasTrie(store, insert_pos, runend_pos)) {
                     infix_to_update = Infix(store.ptr + num_metadata_offset_words,
-                                            infix_store_target_size + scaled_sizes_[size_grade] + infix_size_ * insert_pos,
+                                            SlotStripBitOffsetInData(size_grade) + infix_size_ * insert_pos,
                                             infix_size_);
                     original_num_slots = infix_to_update.GetNumSlots(infix_size_);
                 }
@@ -5230,7 +5484,9 @@ inline void Diva<diva_type, payload_type>::InsertRawIntoInfixStore(InfixStore &s
                 num_slots_filled = new_num_slots - original_num_slots;
                 if (new_num_slots > original_num_slots)
                     insert_pos = MakeRoomFromSlot(store, insert_pos, runend_pos, new_num_slots - original_num_slots);
-                infix_to_update.SerializeToInfixStore(store, insert_pos, scaled_sizes_[size_grade], infix_size_);
+                infix_to_update.SerializeToInfixStore(
+                        store, static_cast<uint32_t>(bitmap_target_sizes_[size_grade]), insert_pos,
+                        static_cast<uint32_t>(scaled_sizes_[size_grade]), infix_size_);
             }
             else {
                 insert_pos = MakeRoomFromSlot(store, insert_pos, runend_pos, 1);
@@ -5267,17 +5523,25 @@ inline void Diva<diva_type, payload_type>::InsertRawIntoInfixStore(InfixStore &s
     {
         const uint32_t *store_popcnts = reinterpret_cast<const uint32_t *>(store.ptr);
         const uint64_t *occupieds = store.ptr + num_metadata_offset_words;
-        const uint64_t *runends = store.ptr + num_metadata_offset_words + infix_store_target_size / 64;
+        const uint32_t occ_bits = static_cast<uint32_t>(bitmap_target_sizes_[size_grade]);
+        const uint32_t re_bits = static_cast<uint32_t>(scaled_sizes_[size_grade]);
+        const uint64_t *runends = store.ptr + num_metadata_offset_words + InfixStore::OccupiedAlignedBits(occ_bits) / 64;
         uint32_t occupied_count = 0, runend_count = 0, popcnts[2] = {};
-        for (int32_t i = 0; i < infix_store_target_size / 64; i++) {
-            if (i < infix_store_target_size / 128)
-                popcnts[0] += __builtin_popcountll(occupieds[i]);
-            occupied_count += __builtin_popcountll(occupieds[i]);
+        for (uint32_t p = 0; p < occ_bits; p++)
+            occupied_count += get_bitmap_bit(occupieds, p);
+        for (uint32_t p = 0; p < re_bits; p++)
+            runend_count += get_bitmap_bit(runends, p);
+        uint32_t occ_half = occ_bits / 2u;
+        for (uint32_t w = 0; occ_half > 0; ++w) {
+            const uint32_t chunk = std::min(64u, occ_half);
+            popcnts[0] += __builtin_popcountll(occupieds[w] & BITMASK(chunk));
+            occ_half -= chunk;
         }
-        for (int32_t i = 0; i < scaled_sizes_[size_grade]; i++) {
-            if (i < infix_store_target_size / 2)
-                popcnts[1] += get_bitmap_bit(runends, i);
-            runend_count += get_bitmap_bit(runends, i);
+        uint32_t re_half = re_bits / 2u;
+        for (uint32_t w = 0; re_half > 0; ++w) {
+            const uint32_t chunk = std::min(64u, re_half);
+            popcnts[1] += __builtin_popcountll(runends[w] & BITMASK(chunk));
+            re_half -= chunk;
         }
         assert(occupied_count == runend_count);
         assert(store_popcnts[0] == popcnts[0]);
@@ -5325,7 +5589,7 @@ inline void Diva<diva_type, payload_type>::AdaptRawInInfixStore(InfixStore &stor
         if ((current_slot | mask) == (explicit_part | mask)) {
             if (SlotHasTrie(store, current_pos, runend_pos)) {
                 infix_to_adapt = Infix(store.ptr + num_metadata_offset_words, 
-                                       infix_store_target_size + scaled_sizes_[size_grade] + infix_size_ * current_pos,
+                                       SlotStripBitOffsetInData(size_grade) + infix_size_ * current_pos,
                                        infix_size_);
                 const uint32_t key_start_bit = original_key_start_bit + infix_size_ - mask_size;
                 adapt_pos = infix_to_adapt.GetLongestMatch(original_key, key_start_bit, infix_size_) >= 0 ? current_pos
@@ -5340,7 +5604,7 @@ inline void Diva<diva_type, payload_type>::AdaptRawInInfixStore(InfixStore &stor
         }
         else if (SlotHasTrie(store, current_pos, runend_pos)) {
             const Infix infix_to_skip = Infix(store.ptr + num_metadata_offset_words, 
-                                              infix_store_target_size + scaled_sizes_[size_grade] + infix_size_ * current_pos,
+                                              SlotStripBitOffsetInData(size_grade) + infix_size_ * current_pos,
                                               infix_size_);
             current_pos += infix_to_skip.GetNumSlots(infix_size_);
         }
@@ -5370,7 +5634,9 @@ inline void Diva<diva_type, payload_type>::AdaptRawInInfixStore(InfixStore &stor
         }
         if (new_num_slots > original_num_slots)
             adapt_pos = MakeRoomFromSlot(store, adapt_pos, runend_pos, new_num_slots - original_num_slots);
-        infix_to_adapt.SerializeToInfixStore(store, adapt_pos, scaled_sizes_[size_grade], infix_size_);
+        infix_to_adapt.SerializeToInfixStore(
+                store, static_cast<uint32_t>(bitmap_target_sizes_[size_grade]), adapt_pos,
+                static_cast<uint32_t>(scaled_sizes_[size_grade]), infix_size_);
     }
     else {
         infix_to_adapt = Infix(explicit_part);
@@ -5390,7 +5656,9 @@ inline void Diva<diva_type, payload_type>::AdaptRawInInfixStore(InfixStore &stor
             }
             adapt_pos = MakeRoomFromSlot(store, adapt_pos, runend_pos, num_slots_filled);
         }
-        infix_to_adapt.SerializeToInfixStore(store, adapt_pos, scaled_sizes_[size_grade], infix_size_);
+        infix_to_adapt.SerializeToInfixStore(
+                store, static_cast<uint32_t>(bitmap_target_sizes_[size_grade]), adapt_pos,
+                static_cast<uint32_t>(scaled_sizes_[size_grade]), infix_size_);
     }
     store.UpdateFullSlotCount(num_slots_filled);
 
@@ -5398,17 +5666,25 @@ inline void Diva<diva_type, payload_type>::AdaptRawInInfixStore(InfixStore &stor
     {
         const uint32_t *store_popcnts = reinterpret_cast<const uint32_t *>(store.ptr);
         const uint64_t *occupieds = store.ptr + num_metadata_offset_words;
-        const uint64_t *runends = store.ptr + num_metadata_offset_words + infix_store_target_size / 64;
+        const uint32_t occ_bits = static_cast<uint32_t>(bitmap_target_sizes_[size_grade]);
+        const uint32_t re_bits = static_cast<uint32_t>(scaled_sizes_[size_grade]);
+        const uint64_t *runends = store.ptr + num_metadata_offset_words + InfixStore::OccupiedAlignedBits(occ_bits) / 64;
         uint32_t occupied_count = 0, runend_count = 0, popcnts[2] = {};
-        for (int32_t i = 0; i < infix_store_target_size / 64; i++) {
-            if (i < infix_store_target_size / 128)
-                popcnts[0] += __builtin_popcountll(occupieds[i]);
-            occupied_count += __builtin_popcountll(occupieds[i]);
+        for (uint32_t p = 0; p < occ_bits; p++)
+            occupied_count += get_bitmap_bit(occupieds, p);
+        for (uint32_t p = 0; p < re_bits; p++)
+            runend_count += get_bitmap_bit(runends, p);
+        uint32_t occ_half = occ_bits / 2u;
+        for (uint32_t w = 0; occ_half > 0; ++w) {
+            const uint32_t chunk = std::min(64u, occ_half);
+            popcnts[0] += __builtin_popcountll(occupieds[w] & BITMASK(chunk));
+            occ_half -= chunk;
         }
-        for (int32_t i = 0; i < scaled_sizes_[size_grade]; i++) {
-            if (i < infix_store_target_size / 2)
-                popcnts[1] += get_bitmap_bit(runends, i);
-            runend_count += get_bitmap_bit(runends, i);
+        uint32_t re_half = re_bits / 2u;
+        for (uint32_t w = 0; re_half > 0; ++w) {
+            const uint32_t chunk = std::min(64u, re_half);
+            popcnts[1] += __builtin_popcountll(runends[w] & BITMASK(chunk));
+            re_half -= chunk;
         }
         assert(occupied_count == runend_count);
         assert(store_popcnts[0] == popcnts[0]);
@@ -5430,10 +5706,12 @@ inline void Diva<diva_type, payload_type>::DeleteRawFromInfixStore(InfixStore &s
         ResizeInfixStore(store, total_implicit);
     size_grade = store.GetSizeGrade();
     const uint64_t store_size = scaled_sizes_[size_grade];
+    const uint32_t occ_bits_del = static_cast<uint32_t>(bitmap_target_sizes_[size_grade]);
 
     const uint64_t implicit_part = key >> infix_size_;
     const uint64_t explicit_part = key & BITMASK(infix_size_);
-    const uint64_t implicit_scalar = implicit_scalars_[total_implicit - infix_store_target_size / 2];
+    const uint32_t target_size = scaled_sizes_[size_grade];
+    const uint64_t implicit_scalar = GetImplicitScalar(total_implicit, target_size);
 
     uint32_t current_implicit = implicit_part;
     const bool is_occupied = GetOccupiedBit(store, implicit_part);
@@ -5451,12 +5729,12 @@ inline void Diva<diva_type, payload_type>::DeleteRawFromInfixStore(InfixStore &s
     assert(runstart_pos < store_size);
     assert(runend_pos < store_size);
 #endif // DEBUG
-    uint32_t implicits[2 * infix_store_target_size] = {static_cast<uint32_t>(current_implicit), 0};
-    int32_t mapped_poses[2 * infix_store_target_size] = {GetMappedPos(current_implicit, size_grade, implicit_scalar), 0};
-    int32_t l[2 * infix_store_target_size] = {runstart_pos, 0};
-    int32_t orig_l[2 * infix_store_target_size] = {runstart_pos, 0};
-    int32_t r[2 * infix_store_target_size] = {runend_pos + 1, 0};
-    int32_t orig_r[2 * infix_store_target_size] = {runend_pos + 1, 0};
+    uint32_t implicits[2 * kDefaultInfixStoreTargetSize] = {static_cast<uint32_t>(current_implicit), 0};
+    int32_t mapped_poses[2 * kDefaultInfixStoreTargetSize] = {GetMappedPos(current_implicit, size_grade, implicit_scalar), 0};
+    int32_t l[2 * kDefaultInfixStoreTargetSize] = {runstart_pos, 0};
+    int32_t orig_l[2 * kDefaultInfixStoreTargetSize] = {runstart_pos, 0};
+    int32_t r[2 * kDefaultInfixStoreTargetSize] = {runend_pos + 1, 0};
+    int32_t orig_r[2 * kDefaultInfixStoreTargetSize] = {runend_pos + 1, 0};
     int32_t candidate_run_ind = 0;
     int32_t current_pos = l[candidate_run_ind], current_runend_pos = runend_pos; 
     int32_t to_remove = -1;
@@ -5475,7 +5753,7 @@ inline void Diva<diva_type, payload_type>::DeleteRawFromInfixStore(InfixStore &s
         if constexpr (diva_type == DivaType::BinaryTrie) {  // TODO: Figure out integration of this with payloads
             if (remove && SlotHasTrie(store, current_pos, current_runend_pos)) {
                 const Infix infix_to_get_longest_match(store.ptr + num_metadata_offset_words,
-                        infix_store_target_size + store_size + infix_size_ * current_pos,
+                        SlotStripBitOffsetInData(size_grade) + infix_size_ * current_pos,
                         infix_size_);
                 const uint32_t mask_size = lowbit_pos(infix_to_get_longest_match.infix_) + 1;
                 const uint32_t key_start_bit = original_key_start_bit + infix_size_ - mask_size;
@@ -5488,7 +5766,7 @@ inline void Diva<diva_type, payload_type>::DeleteRawFromInfixStore(InfixStore &s
         if constexpr (diva_type == DivaType::BinaryTrie) {
             if (SlotHasTrie(store, current_pos, current_runend_pos)) {
                 const Infix infix_to_skip(store.ptr + num_metadata_offset_words,
-                        infix_store_target_size + store_size + infix_size_ * current_pos,
+                        SlotStripBitOffsetInData(size_grade) + infix_size_ * current_pos,
                         infix_size_);
                 current_pos += infix_to_skip.GetNumSlots(infix_size_);
             }
@@ -5536,7 +5814,7 @@ inline void Diva<diva_type, payload_type>::DeleteRawFromInfixStore(InfixStore &s
             orig_l[candidate_run_ind] = l[candidate_run_ind];
         }
 #ifdef DEBUG
-        assert(candidate_run_ind <= infix_store_target_size);
+        assert(candidate_run_ind <= store_size);
 #endif // DEBUG
 
         num_runs_to_left = (candidate_run_ind - orig_candidate_run_ind);
@@ -5551,7 +5829,7 @@ inline void Diva<diva_type, payload_type>::DeleteRawFromInfixStore(InfixStore &s
             const uint32_t orig_size = (orig_candidate_run_ind + 1) * sizeof(uint32_t);
             const uint32_t added_size = num_runs_to_left * sizeof(uint32_t);
 #ifdef DEBUG
-            assert(num_runs_to_left <= infix_store_target_size);
+            assert(num_runs_to_left <= store_size);
 #endif // DEBUG
             // Shift right
             memmove(implicits + num_runs_to_left, implicits, orig_size + added_size);
@@ -5578,7 +5856,7 @@ inline void Diva<diva_type, payload_type>::DeleteRawFromInfixStore(InfixStore &s
     if constexpr (diva_type == DivaType::BinaryTrie) {  // TODO: Figure out integration of this with payloads
         if ((slot_to_remove & 1) && SlotHasTrie(store, to_remove, runend_pos)) {
             Infix infix_to_delete_from(store.ptr + num_metadata_offset_words,
-                    infix_store_target_size + store_size + infix_size_ * to_remove,
+                    SlotStripBitOffsetInData(size_grade) + infix_size_ * to_remove,
                     infix_size_);
             deleted_count = infix_to_delete_from.GetNumSlots(infix_size_);
             const uint32_t mask_size = lowbit_pos(infix_to_delete_from.infix_) + 1;
@@ -5587,7 +5865,8 @@ inline void Diva<diva_type, payload_type>::DeleteRawFromInfixStore(InfixStore &s
             deleted_count -= infix_to_delete_from.GetNumSlots(infix_size_) - (infix_to_delete_from.num_trie_bits_ == 0);
             ShiftSlotsLeft(store, to_remove + deleted_count, r[num_runs_to_left], deleted_count);
             if (infix_to_delete_from.num_trie_bits_ > 0)
-                infix_to_delete_from.SerializeToInfixStore(store, to_remove, store_size, infix_size_);
+                infix_to_delete_from.SerializeToInfixStore(
+                        store, occ_bits_del, to_remove, static_cast<uint32_t>(store_size), infix_size_);
         }
         else {
             ShiftSlotsLeft(store, to_remove + deleted_count, r[num_runs_to_left], deleted_count);
@@ -5721,10 +6000,12 @@ Diva<diva_type, payload_type>::DeleteRawRangeFromInfixStore(InfixStore &store,
     const uint64_t explicit_part_l = (l_key & BITMASK(infix_size_)) - 1;  // Remove the age counter bit
     const uint64_t implicit_part_r = r_key >> infix_size_;
     const uint64_t explicit_part_r = r_key & BITMASK(infix_size_);
-    const uint64_t implicit_scalar = implicit_scalars_[total_implicit - infix_store_target_size / 2];
+    const uint32_t slots = static_cast<uint32_t>(scaled_sizes_[size_grade]);
+    const uint32_t occ_bits = static_cast<uint32_t>(bitmap_target_sizes_[size_grade]);
+    const uint64_t implicit_scalar = GetImplicitScalar(total_implicit, slots);
 
     uint64_t *occupieds = store.ptr + num_metadata_offset_words;
-    uint64_t *runends = store.ptr + num_metadata_offset_words + infix_store_target_size / 64;
+    uint64_t *runends = store.ptr + num_metadata_offset_words + InfixStore::OccupiedAlignedBits(occ_bits) / 64;
     uint32_t current_implicit = implicit_part_l;
     if (!get_bitmap_bit(occupieds, current_implicit))
         current_implicit = NextOccupied(store, implicit_part_l);
@@ -5743,12 +6024,12 @@ Diva<diva_type, payload_type>::DeleteRawRangeFromInfixStore(InfixStore &store,
     assert(runstart_pos < scaled_sizes_[size_grade]);
     assert(runend_pos < scaled_sizes_[size_grade]);
 #endif // DEBUG
-    uint32_t implicits[2 * infix_store_target_size] = {static_cast<uint32_t>(current_implicit), 0};
-    int32_t mapped_poses[2 * infix_store_target_size] = {GetMappedPos(current_implicit, size_grade, implicit_scalar), 0};
-    int32_t l[2 * infix_store_target_size] = {runstart_pos, 0};
-    int32_t orig_l[2 * infix_store_target_size] = {runstart_pos, 0};
-    int32_t r[2 * infix_store_target_size] = {runend_pos + 1, 0};
-    int32_t orig_r[2 * infix_store_target_size] = {runend_pos + 1, 0};
+    uint32_t implicits[2 * kDefaultInfixStoreTargetSize] = {static_cast<uint32_t>(current_implicit), 0};
+    int32_t mapped_poses[2 * kDefaultInfixStoreTargetSize] = {GetMappedPos(current_implicit, size_grade, implicit_scalar), 0};
+    int32_t l[2 * kDefaultInfixStoreTargetSize] = {runstart_pos, 0};
+    int32_t orig_l[2 * kDefaultInfixStoreTargetSize] = {runstart_pos, 0};
+    int32_t r[2 * kDefaultInfixStoreTargetSize] = {runend_pos + 1, 0};
+    int32_t orig_r[2 * kDefaultInfixStoreTargetSize] = {runend_pos + 1, 0};
     int32_t candidate_run_ind = 0;
     int32_t current_pos = l[candidate_run_ind]; 
     int32_t last_removed = l[candidate_run_ind] - 1;
@@ -5850,7 +6131,7 @@ Diva<diva_type, payload_type>::DeleteRawRangeFromInfixStore(InfixStore &store,
             orig_l[candidate_run_ind] = l[candidate_run_ind];
         }
 #ifdef DEBUG
-        assert(candidate_run_ind <= infix_store_target_size);
+        assert(candidate_run_ind <= store_size);
 #endif // DEBUG
 
         const uint32_t num_runs_to_left = (candidate_run_ind - orig_candidate_run_ind);
@@ -5866,7 +6147,7 @@ Diva<diva_type, payload_type>::DeleteRawRangeFromInfixStore(InfixStore &store,
             const uint32_t orig_size = (orig_candidate_run_ind + 1) * sizeof(uint32_t);
             const uint32_t added_size = num_runs_to_left * sizeof(uint32_t);
 #ifdef DEBUG
-            assert(num_runs_to_left <= infix_store_target_size);
+            assert(num_runs_to_left <= store_size);
 #endif // DEBUG
             // Shift right
             memmove(implicits + num_runs_to_left, implicits, orig_size + added_size);
@@ -6016,6 +6297,7 @@ inline int32_t Diva<diva_type, payload_type>::GetLongestMatchingInfixSize(const 
                                                                           const InfiniteByteString original_key,
                                                                           const uint32_t original_key_start_bit) const {
     const uint32_t store_size = scaled_sizes_[store.GetSizeGrade()];
+    const uint32_t size_grade_glm = store.GetSizeGrade();
     const uint64_t implicit_part = key >> infix_size_;
     const uint64_t explicit_part = key & BITMASK(infix_size_);
 
@@ -6034,7 +6316,7 @@ inline int32_t Diva<diva_type, payload_type>::GetLongestMatchingInfixSize(const 
             if ((current_slot | mask) == (explicit_part | mask)) {
                 if (SlotHasTrie(store, i, runend_pos)) {
                     const Infix infix_to_query(store.ptr + num_metadata_offset_words,
-                            infix_store_target_size + store_size + infix_size_ * i,
+                            SlotStripBitOffsetInData(size_grade_glm) + infix_size_ * i,
                             infix_size_);
                     const uint32_t mask_size = lowbit_pos(infix_to_query.infix_) + 1;
                     const uint32_t key_start_bit = original_key_start_bit + infix_size_ - mask_size;
@@ -6087,7 +6369,8 @@ inline bool Diva<diva_type, payload_type>::RangeQueryInfixStore(InfixStore &stor
                                                                 const InfiniteByteString original_l_key,
                                                                 const InfiniteByteString original_r_key,
                                                                 const uint32_t original_key_start_bit) const {
-    const uint32_t store_size = scaled_sizes_[store.GetSizeGrade()];
+    const uint32_t size_grade_rq = store.GetSizeGrade();
+    const uint32_t store_size = scaled_sizes_[size_grade_rq];
     const uint64_t l_implicit_part = l_key >> infix_size_;
     const uint64_t l_explicit_part = l_key & BITMASK(infix_size_);
     const uint64_t r_implicit_part = r_key >> infix_size_;
@@ -6107,7 +6390,7 @@ inline bool Diva<diva_type, payload_type>::RangeQueryInfixStore(InfixStore &stor
                 if (current_slot_l <= r_explicit_part) {
                     if (SlotHasTrie(store, runstart_pos, runend_pos)) {
                         const Infix infix_to_query(store.ptr + num_metadata_offset_words,
-                                infix_store_target_size + store_size + infix_size_ * runstart_pos,
+                                SlotStripBitOffsetInData(size_grade_rq) + infix_size_ * runstart_pos,
                                 infix_size_);
                         const uint32_t mask_size = lowbit_pos(infix_to_query.infix_) + 1;
                         const uint8_t zero_key[1] = {0};
@@ -6137,7 +6420,7 @@ inline bool Diva<diva_type, payload_type>::RangeQueryInfixStore(InfixStore &stor
                     const uint64_t current_slot_r = current_slot | (current_slot - 1);
                     if (SlotHasTrie(store, pos, runend_pos)) {
                         const Infix infix(store.ptr + num_metadata_offset_words,
-                                infix_store_target_size + store_size + infix_size_ * pos,
+                                SlotStripBitOffsetInData(size_grade_rq) + infix_size_ * pos,
                                 infix_size_);
                         if (current_slot_r >= l_explicit_part) {
                                 const uint32_t mask_size = lowbit_pos(infix.infix_) + 1;
@@ -6184,7 +6467,7 @@ inline bool Diva<diva_type, payload_type>::RangeQueryInfixStore(InfixStore &stor
                 break;
             else if (SlotHasTrie(store, i, runend_pos)) {
                 const Infix infix(store.ptr + num_metadata_offset_words,
-                        infix_store_target_size + store_size + infix_size_ * i,
+                        SlotStripBitOffsetInData(size_grade_rq) + infix_size_ * i,
                         infix_size_);
                 if (current_slot_r >= l_explicit_part && current_slot_l <= r_explicit_part - 1) {
                     const uint32_t max_key_len = (original_key_start_bit + infix_size_
@@ -6247,7 +6530,7 @@ inline bool Diva<diva_type, payload_type>::PointQueryInfixStore(InfixStore &stor
             if ((explicit_part | mask) == (slot_value | mask)) {
                 if (SlotHasTrie(store, i, runend_pos)) {
                     const Infix infix_to_query(store.ptr + num_metadata_offset_words,
-                            infix_store_target_size + scaled_sizes_[size_grade] + infix_size_ * i, infix_size_);
+                            SlotStripBitOffsetInData(size_grade) + infix_size_ * i, infix_size_);
                     const uint32_t key_start_bit = original_key_start_bit + infix_size_ - mask_size;
                     if (infix_to_query.QueryTrie(original_key, original_key, key_start_bit, infix_size_))
                         return true;
@@ -6326,8 +6609,8 @@ inline void Diva<diva_type, payload_type>::ResizeInfixStore(InfixStore &store, c
 
     store.SetSizeGrade(size_grade);
     const uint32_t next_size = scaled_sizes_[size_grade];
-    const uint64_t word_count = InfixStore::GetPtrWordCount(next_size,
-            infix_size_, payload_size_);
+    const uint64_t word_count = InfixStore::GetPtrWordCount(
+            next_size, infix_size_, bitmap_target_sizes_[size_grade], payload_size_);
     store.ptr = new uint64_t[word_count];
     if constexpr (diva_type == DivaType::BinaryTrie)
         LoadVectorToInfixStore(store, infix_vec, total_implicit, true, payload_list);
@@ -6347,17 +6630,25 @@ inline void Diva<diva_type, payload_type>::ResizeInfixStore(InfixStore &store, c
     {
         const uint32_t *store_popcnts = reinterpret_cast<const uint32_t *>(store.ptr);
         const uint64_t *occupieds = store.ptr + num_metadata_offset_words;
-        const uint64_t *runends = store.ptr + num_metadata_offset_words + infix_store_target_size / 64;
+        const uint32_t occ_bits = static_cast<uint32_t>(bitmap_target_sizes_[size_grade]);
+        const uint32_t re_bits = static_cast<uint32_t>(scaled_sizes_[size_grade]);
+        const uint64_t *runends = store.ptr + num_metadata_offset_words + InfixStore::OccupiedAlignedBits(occ_bits) / 64;
         uint32_t occupied_count = 0, runend_count = 0, popcnts[2] = {};
-        for (int32_t i = 0; i < infix_store_target_size / 64; i++) {
-            if (i < infix_store_target_size / 128)
-                popcnts[0] += __builtin_popcountll(occupieds[i]);
-            occupied_count += __builtin_popcountll(occupieds[i]);
+        for (uint32_t p = 0; p < occ_bits; p++)
+            occupied_count += get_bitmap_bit(occupieds, p);
+        for (uint32_t p = 0; p < re_bits; p++)
+            runend_count += get_bitmap_bit(runends, p);
+        uint32_t occ_half = occ_bits / 2u;
+        for (uint32_t w = 0; occ_half > 0; ++w) {
+            const uint32_t chunk = std::min(64u, occ_half);
+            popcnts[0] += __builtin_popcountll(occupieds[w] & BITMASK(chunk));
+            occ_half -= chunk;
         }
-        for (int32_t i = 0; i < scaled_sizes_[size_grade]; i++) {
-            if (i < infix_store_target_size / 2)
-                popcnts[1] += get_bitmap_bit(runends, i);
-            runend_count += get_bitmap_bit(runends, i);
+        uint32_t re_half = re_bits / 2u;
+        for (uint32_t w = 0; re_half > 0; ++w) {
+            const uint32_t chunk = std::min(64u, re_half);
+            popcnts[1] += __builtin_popcountll(runends[w] & BITMASK(chunk));
+            re_half -= chunk;
         }
         assert(occupied_count == runend_count);
         assert(store_popcnts[0] == popcnts[0]);
@@ -6373,18 +6664,19 @@ inline void Diva<diva_type, payload_type>::LoadListToInfixStore(InfixStore &stor
                                                                 const uint64_t *payload_list) {
     const uint32_t size_grade = store.GetSizeGrade();
     const uint32_t total_size = scaled_sizes_[size_grade];
+    const uint32_t occ_bits = static_cast<uint32_t>(bitmap_target_sizes_[size_grade]);
 #ifdef DEBUG
-    assert(total_implicit >= infix_store_target_size / 2);
+    assert(total_implicit >= total_size / 2);
 #endif // DEBUG
-    const uint64_t implicit_scalar = implicit_scalars_[total_implicit - infix_store_target_size / 2];
+    const uint64_t implicit_scalar = GetImplicitScalar(total_implicit, total_size);
 
     if (zero_out)
-        store.Reset(total_size, infix_size_, payload_size_);
+        store.Reset(total_size, infix_size_, occ_bits, payload_size_);
     store.SetFullSlotCount(list_len);
     if (list_len == 0)
         return;
 
-    int32_t l[infix_store_target_size + 1], r[infix_store_target_size + 1], ind = 0;
+    int32_t l[kDefaultInfixStoreTargetSize + 1], r[kDefaultInfixStoreTargetSize + 1], ind = 0;
     // Make sure everything is in increasing order
 #ifdef DEBUG
     for (int32_t i = 1; i < list_len; i++)
@@ -6396,7 +6688,7 @@ inline void Diva<diva_type, payload_type>::LoadListToInfixStore(InfixStore &stor
 #endif // DEBUG
 
     uint64_t *occupieds = store.ptr + num_metadata_offset_words;
-    uint64_t *runends = store.ptr + num_metadata_offset_words + infix_store_target_size / 64;
+    uint64_t *runends = store.ptr + num_metadata_offset_words + InfixStore::OccupiedAlignedBits(occ_bits) / 64;
     uint64_t old_implicit_part = list[0] >> infix_size_;
     l[0] = GetMappedPos(old_implicit_part, size_grade, implicit_scalar);
     r[0] = l[0];
@@ -6440,22 +6732,15 @@ inline void Diva<diva_type, payload_type>::LoadListToInfixStore(InfixStore &stor
         set_bitmap_bit(runends, r[i] - 1);
     }
 
-    uint32_t *popcnts = reinterpret_cast<uint32_t *>(store.ptr);
-    for (int32_t i = 0; i < infix_store_target_size / 128; i++) {
-        popcnts[0] += __builtin_popcountll(occupieds[i]);
-        if (static_cast<int32_t>(scaled_sizes_[size_grade]) - i * 64 > 0) {
-            const uint64_t mask = BITMASK(std::min(64UL, scaled_sizes_[size_grade] - i * 64));
-            popcnts[1] += __builtin_popcountll(runends[i] & mask);
-        }
-    }
+    UpdatePopcnts(store);
 
 #ifdef DEBUG
     {
         uint32_t occupied_count = 0, runend_count = 0;
-        for (int32_t i = 0; i < infix_store_target_size / 64; i++)
-            occupied_count += __builtin_popcountll(occupieds[i]);
-        for (int32_t i = 0; i < scaled_sizes_[size_grade]; i++)
-            runend_count += get_bitmap_bit(runends, i);
+        for (uint32_t p = 0; p < occ_bits; p++)
+            occupied_count += get_bitmap_bit(occupieds, p);
+        for (uint32_t p = 0; p < total_size; p++)
+            runend_count += get_bitmap_bit(runends, p);
         assert(occupied_count == runend_count);
         uint64_t retrieved_infix_list[2 * list_len];
         uint64_t retrieved_payload_list[2 * list_len * (payload_size_ + 63) / 64];
@@ -6471,15 +6756,15 @@ template <DivaType diva_type, PayloadType payload_type>
 inline void Diva<diva_type, payload_type>::LoadVectorToInfixStore(InfixStore &store, const std::vector<Infix>& vec,
                                                                   const uint32_t total_implicit, const bool zero_out,
                                                                   const uint64_t *payload_list) {
-#ifdef DEBUG
-    assert(total_implicit >= infix_store_target_size / 2);
-#endif // DEBUG
-
     const uint32_t size_grade = store.GetSizeGrade();
     const uint32_t total_size = scaled_sizes_[size_grade];
-    const uint64_t implicit_scalar = implicit_scalars_[total_implicit - infix_store_target_size / 2];
+    const uint32_t occ_bits = static_cast<uint32_t>(bitmap_target_sizes_[size_grade]);
+#ifdef DEBUG
+    assert(total_implicit >= total_size / 2);
+#endif // DEBUG
+    const uint64_t implicit_scalar = GetImplicitScalar(total_implicit, total_size);
     if (zero_out)
-        store.Reset(total_size, infix_size_, payload_size_);
+        store.Reset(total_size, infix_size_, occ_bits, payload_size_);
 
     // Make sure everything is in increasing order
 #ifdef DEBUG
@@ -6493,7 +6778,7 @@ inline void Diva<diva_type, payload_type>::LoadVectorToInfixStore(InfixStore &st
     l.reserve(vec.size());
     r.reserve(vec.size());
     uint64_t *occupieds = store.ptr + num_metadata_offset_words;
-    uint64_t *runends = store.ptr + num_metadata_offset_words + infix_store_target_size / 64;
+    uint64_t *runends = store.ptr + num_metadata_offset_words + InfixStore::OccupiedAlignedBits(occ_bits) / 64;
     uint64_t old_implicit_part = vec[0].infix_ >> infix_size_;
     l.push_back(GetMappedPos(old_implicit_part, size_grade, implicit_scalar));
     r.push_back(l.back());
@@ -6527,7 +6812,9 @@ inline void Diva<diva_type, payload_type>::LoadVectorToInfixStore(InfixStore &st
             assert(implicit_part < total_implicit);
 #endif // DEBUG
             set_bitmap_bit(occupieds, implicit_part);
-            vec[write_head].SerializeToInfixStore(store, j, scaled_sizes_[size_grade], infix_size_);
+            vec[write_head].SerializeToInfixStore(
+                    store, static_cast<uint32_t>(bitmap_target_sizes_[size_grade]), j,
+                    static_cast<uint32_t>(scaled_sizes_[size_grade]), infix_size_);
             if constexpr (payload_type == PayloadType::FixedLength) {
                 if (payload_list != nullptr) {
                     const uint32_t num_payloads = vec[write_head].num_trie_bits_ == 0 ? 1
@@ -6555,12 +6842,14 @@ inline typename Diva<diva_type, payload_type>::InfixStore Diva<diva_type, payloa
     uint32_t size_grade;
     for (size_grade = 0; size_grade < size_scalar_count && scaled_sizes_[size_grade] < scaled_len; size_grade++);
     if constexpr (payload_type == PayloadType::FixedLength) {
-        InfixStore res(scaled_sizes_[size_grade], infix_size_, size_grade, payload_size_);
+        InfixStore res(scaled_sizes_[size_grade], infix_size_, size_grade,
+                       static_cast<uint32_t>(bitmap_target_sizes_[size_grade]), payload_size_);
         LoadListToInfixStore(res, list, list_len, total_implicit, true, payload_list);
         return res;
     }
     else {
-        InfixStore res(scaled_sizes_[size_grade], infix_size_, size_grade);
+        InfixStore res(scaled_sizes_[size_grade], infix_size_, size_grade,
+                       static_cast<uint32_t>(bitmap_target_sizes_[size_grade]));
         LoadListToInfixStore(res, list, list_len, total_implicit);
         return res;
     }
@@ -6577,7 +6866,8 @@ inline typename Diva<diva_type, payload_type>::InfixStore Diva<diva_type, payloa
     const uint32_t scaled_num_full_slots = (size_scalars_[size_scalar_shrink_grow_sep] * num_full_slots) >> scale_shift;
     uint32_t size_grade;
     for (size_grade = 0; size_grade < size_scalar_count && scaled_sizes_[size_grade] < scaled_num_full_slots; size_grade++);
-    InfixStore res(scaled_sizes_[size_grade], infix_size_, size_grade, payload_size_);
+    InfixStore res(scaled_sizes_[size_grade], infix_size_, size_grade,
+                   static_cast<uint32_t>(bitmap_target_sizes_[size_grade]), payload_size_);
     LoadVectorToInfixStore(res, vec, total_implicit, true, payload_list);
     return res;
 }
@@ -6598,11 +6888,11 @@ inline uint32_t Diva<diva_type, payload_type>::GetInfixList(const InfixStore &st
         const uint64_t explicit_part = GetSlot(store, i);
         if (explicit_part) {
 #ifdef DEBUG
-            assert(implicit_part < infix_store_target_size);
+            assert(implicit_part < store_size);
 #endif // DEBUG
             res[ind] = (implicit_part << infix_size_) | explicit_part;
             if constexpr (payload_type == PayloadType::FixedLength) {
-                const uint32_t slot_and_bitmap_size = 64 * num_metadata_offset_words + infix_store_target_size 
+                const uint32_t slot_and_bitmap_size = SlotDataBaseBit(size_grade)
                                                     + store_size * (infix_size_ + 1);
                 const uint32_t pos_in = slot_and_bitmap_size + payload_size_ * i;
                 const uint32_t pos_out = payload_size_ * ind;
@@ -6635,20 +6925,20 @@ Diva<diva_type, payload_type>::GetInfixVector(const InfixStore &store, uint64_t 
         const uint64_t explicit_part = GetSlot(store, i);
         if (explicit_part) {
 #ifdef DEBUG
-            assert(implicit_part < infix_store_target_size);
+            assert(implicit_part < store_size);
 #endif // DEBUG
             res.emplace_back((implicit_part << infix_size_) | explicit_part);
             if constexpr (diva_type == DivaType::BinaryTrie) {
                 if (SlotHasTrie(store, i, runend_pos)) {
                     res.back() = Infix(store.ptr + num_metadata_offset_words, 
-                                       infix_store_target_size + scaled_sizes_[size_grade] + infix_size_ * i,
+                                       SlotStripBitOffsetInData(size_grade) + infix_size_ * i,
                                        infix_size_);
                     res.back().infix_ |= (implicit_part << infix_size_);
                     i += res.back().GetNumSlots(infix_size_) - 1;
                 }
             }
             if constexpr (payload_type == PayloadType::FixedLength) {
-                const uint32_t slot_and_bitmap_size = 64 * num_metadata_offset_words + infix_store_target_size 
+                const uint32_t slot_and_bitmap_size = SlotDataBaseBit(size_grade)
                                                     + store_size * (infix_size_ + 1);
                 const uint32_t pos_in = slot_and_bitmap_size + payload_size_ * i;
                 const uint32_t pos_out = payload_size_ * (res.size() - 1);
@@ -7008,7 +7298,8 @@ IteratorRefetchLowerUpperBounds:
         }
     }
 
-    auto [shared, ignore, implicit_size] = filter_->GetSharedIgnoreImplicitLengths(prev_key, next_key);
+    auto [shared, ignore, implicit_size] = filter_->GetSharedIgnoreImplicitLengths(
+        prev_key, next_key, filter_->bitmap_target_sizes_[infix_store.GetSizeGrade()]);
     const uint64_t prev_implicit = filter_->ExtractPartialKey(prev_key, shared, ignore, implicit_size, 0) >> filter_->infix_size_;
     const uint64_t next_implicit = filter_->ExtractPartialKey(next_key, shared, ignore, implicit_size, 1) >> filter_->infix_size_;
     const uint64_t total_implicit = next_implicit - prev_implicit + 1;
@@ -7164,7 +7455,8 @@ inline void Diva<diva_type, payload_type>::Iterator::FetchDelete() {
         }
     }
 
-    auto [shared, ignore, implicit_size] = filter_->GetSharedIgnoreImplicitLengths(prev_key, next_key);
+    auto [shared, ignore, implicit_size] = filter_->GetSharedIgnoreImplicitLengths(
+        prev_key, next_key, filter_->bitmap_target_sizes_[infix_store.GetSizeGrade()]);
     const uint64_t prev_implicit = filter_->ExtractPartialKey(prev_key, shared, ignore, implicit_size, 0) >> filter_->infix_size_;
     const uint64_t next_implicit = filter_->ExtractPartialKey(next_key, shared, ignore, implicit_size, 1) >> filter_->infix_size_;
     const uint64_t total_implicit = next_implicit - prev_implicit + 1;
@@ -8981,10 +9273,11 @@ void Diva<diva_type, payload_type>::Infix::PrependPrefixToTrie(const InfiniteByt
 
 template <DivaType diva_type, PayloadType payload_type>
 void Diva<diva_type, payload_type>::Infix::SerializeToInfixStore(InfixStore& store,
+                                                                 uint32_t occupied_bits,
                                                                  uint32_t pos,
                                                                  uint32_t store_size,
                                                                  uint32_t slot_size) const {
-    const uint32_t bit_pos = infix_store_target_size + store_size + slot_size * pos;
+    const uint32_t bit_pos = InfixStore::OccupiedAlignedBits(occupied_bits) + store_size + slot_size * pos;
     SerializeToPtr(store.ptr + num_metadata_offset_words, bit_pos, slot_size);
 }
 

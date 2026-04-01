@@ -22,6 +22,21 @@
 #include "diva.hpp"
 #include "util.hpp"
 
+namespace {
+
+struct InfixPayloadPredicateTrue {
+    bool operator()(const uint64_t *) const { return true; }
+};
+struct InfixPayloadPredicateFalse {
+    bool operator()(const uint64_t *) const { return false; }
+};
+struct InfixPayloadFirstWordEq {
+    uint64_t expected_;
+    bool operator()(const uint64_t *p) const { return p[0] == expected_; }
+};
+
+}  // namespace
+
 namespace diva {
 
 typedef Diva<DivaType::Standard, PayloadType::FixedLength> PayloadDiva;
@@ -35,11 +50,13 @@ public:
         const float load_factor = 0.95;
         Diva<> s(infix_size, seed, load_factor);
         Diva<>::InfixStore store(s.scaled_sizes_[s.size_scalar_shrink_grow_sep],
-                s.infix_size_, s.size_scalar_shrink_grow_sep);
+                s.infix_size_, s.size_scalar_shrink_grow_sep, s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep],
+                s.payload_size_);
 
-        const uint32_t total_words = (Diva<>::infix_store_target_size + 
-                                        (s.infix_size_ + 1) * s.scaled_sizes_[s.size_scalar_shrink_grow_sep] + 63) / 64;
-        for (int32_t i = 0; i < total_words; i++)
+        const uint64_t total_words = Diva<>::InfixStore::GetPtrWordCount(
+            s.scaled_sizes_[s.size_scalar_shrink_grow_sep], s.infix_size_,
+            s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep], s.payload_size_);
+        for (uint64_t i = 0; i < total_words; i++)
             REQUIRE_EQ(store.ptr[i], 0);
     }
 
@@ -49,7 +66,8 @@ public:
         const float load_factor = 0.95;
         Diva<> s(infix_size, seed, load_factor);
         Diva<>::InfixStore store(s.scaled_sizes_[s.size_scalar_shrink_grow_sep],
-                s.infix_size_, s.size_scalar_shrink_grow_sep);
+                s.infix_size_, s.size_scalar_shrink_grow_sep, s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep],
+                s.payload_size_);
 
         const uint32_t total_slots = s.scaled_sizes_[s.size_scalar_shrink_grow_sep];
         for (int32_t i = 0; i < total_slots; i++)
@@ -172,10 +190,11 @@ public:
         const float load_factor = 0.95;
         Diva<> s(infix_size, seed, load_factor);
         Diva<>::InfixStore store(s.scaled_sizes_[s.size_scalar_shrink_grow_sep],
-                s.infix_size_, s.size_scalar_shrink_grow_sep);
+                s.infix_size_, s.size_scalar_shrink_grow_sep, s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep],
+                s.payload_size_);
 
         uint64_t *runends = store.ptr + Diva<>::num_metadata_offset_words +
-            Diva<>::infix_store_target_size / 64;
+            s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep] / 64;
         runends[0] = 0b1000100010001000100010001000100010001000100010001000100010001000;
         runends[1] = 0b0101010101010101010101010101010101010101010101010101010101010101;
         runends[2] = 0b1010101010101010101010101010101010101010101010101010101010101010;
@@ -252,9 +271,10 @@ public:
         const float load_factor = 0.95;
         Diva<> s(infix_size, seed, load_factor);
         Diva<>::InfixStore store(s.scaled_sizes_[s.size_scalar_shrink_grow_sep],
-                s.infix_size_, s.size_scalar_shrink_grow_sep);
-        uint64_t *runends = store.ptr + Diva<>::num_metadata_offset_words 
-                            + Diva<>::infix_store_target_size / 64;
+                s.infix_size_, s.size_scalar_shrink_grow_sep, s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep],
+                s.payload_size_);
+        uint64_t *runends = store.ptr + Diva<>::num_metadata_offset_words
+                            + s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep] / 64;
         uint64_t inserts[100];
 
         inserts[0] = 0b0100000000001100;
@@ -403,7 +423,8 @@ public:
         const float load_factor = 0.95;
         Diva<> s(infix_size, seed, load_factor);
         Diva<>::InfixStore store(s.scaled_sizes_[s.size_scalar_shrink_grow_sep],
-                s.infix_size_, s.size_scalar_shrink_grow_sep);
+                s.infix_size_, s.size_scalar_shrink_grow_sep, s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep],
+                s.payload_size_);
 
         const uint32_t rng_seed = 20;
         std::mt19937_64 rng(rng_seed);
@@ -424,7 +445,7 @@ public:
             0b111111111100011};
         while (keys.size() < s.scaled_sizes_[store.GetSizeGrade() - 1]) {
             const uint64_t candidate =
-                rng() & BITMASK(Diva<>::base_implicit_size + infix_size);
+                rng() & BITMASK(s.base_implicit_size + infix_size);
             if (candidate & BITMASK(infix_size))
                 keys.push_back(candidate);
         }
@@ -512,7 +533,8 @@ public:
         const float load_factor = 0.95;
         Diva<> s(infix_size, seed, load_factor);
         Diva<>::InfixStore store(s.scaled_sizes_[s.size_scalar_shrink_grow_sep],
-                s.infix_size_, s.size_scalar_shrink_grow_sep);
+                s.infix_size_, s.size_scalar_shrink_grow_sep, s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep],
+                s.payload_size_);
 
         const std::vector<uint64_t> keys{ 0b000000010011000,
             0b000000010010100, 0b000000010010110,
@@ -548,7 +570,8 @@ public:
         const float load_factor = 0.95;
         Diva<> s(infix_size, seed, load_factor);
         Diva<>::InfixStore store(s.scaled_sizes_[s.size_scalar_shrink_grow_sep], s.infix_size_,
-                s.size_scalar_shrink_grow_sep);
+                s.size_scalar_shrink_grow_sep, s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep],
+                s.payload_size_);
 
         const std::vector<uint64_t> keys {0b000000000000001, 0b000000000000101,
             0b000000000010101, 0b000000000100001, 0b000000000100011,
@@ -574,7 +597,8 @@ public:
         const float load_factor = 0.95;
         Diva<> s(infix_size, seed, load_factor);
         Diva<>::InfixStore store(s.scaled_sizes_[s.size_scalar_shrink_grow_sep], s.infix_size_,
-                                 s.size_scalar_shrink_grow_sep);
+                s.size_scalar_shrink_grow_sep, s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep],
+                s.payload_size_);
 
         SUBCASE("fetch") {
             const std::vector<uint64_t> keys {0b0000000000000001,
@@ -600,12 +624,12 @@ public:
         }
 
         SUBCASE("vs. insert one by one") {
-            const uint32_t n_keys = Diva<>::infix_store_target_size;
+            const uint32_t n_keys = s.infix_store_target_size;
             const uint32_t rng_seed = 1;
             std::mt19937_64 rng(rng_seed);
             std::vector<uint64_t> keys;
             for (int32_t i = 0; i < n_keys; i++)
-                keys.push_back((rng() & BITMASK(Diva<>::base_implicit_size + infix_size)) | 1ULL);
+                keys.push_back((rng() & BITMASK(s.base_implicit_size + infix_size)) | 1ULL);
             std::sort(keys.begin(), keys.end(), 
                     [&](uint64_t a, uint64_t b) { return s.CompareInfixes(a, b); } );
             s.LoadListToInfixStore(store, keys.data(), keys.size());
@@ -622,9 +646,9 @@ public:
         const uint32_t seed = 1;
         const float load_factor = 0.95;
         Diva<> s(infix_size, seed, load_factor);
-        Diva<>::InfixStore store(s.scaled_sizes_[s.size_scalar_shrink_grow_sep],
-                                 s.infix_size_,
-                                 s.size_scalar_shrink_grow_sep);
+        Diva<>::InfixStore store(s.scaled_sizes_[s.size_scalar_shrink_grow_sep], s.infix_size_,
+                s.size_scalar_shrink_grow_sep, s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep],
+                s.payload_size_);
 
         const std::vector<uint64_t> keys {0b000000000000001,
             0b000000000000101, 0b000000000010101,
@@ -656,7 +680,7 @@ public:
 
         SUBCASE("negatives") {
             std::vector<uint64_t> queries;
-            for (uint64_t query_key = 0; query_key < (1ULL << (s.infix_size_ + Diva<>::base_implicit_size)); query_key++) {
+            for (uint64_t query_key = 0; query_key < (1ULL << (s.infix_size_ + s.base_implicit_size)); query_key++) {
                 bool valid = true;
                 for (uint64_t key : keys)
                     if (key - (key & -key) <= query_key && query_key <= (key | (key - 1))) {
@@ -677,9 +701,9 @@ public:
         const uint32_t seed = 1;
         const float load_factor = 0.95;
         Diva<> s(infix_size, seed, load_factor);
-        Diva<>::InfixStore store(s.scaled_sizes_[s.size_scalar_shrink_grow_sep],
-                                 s.infix_size_,
-                                 s.size_scalar_shrink_grow_sep);
+        Diva<>::InfixStore store(s.scaled_sizes_[s.size_scalar_shrink_grow_sep], s.infix_size_,
+                s.size_scalar_shrink_grow_sep, s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep],
+                s.payload_size_);
         
         const uint32_t n_queries = 100000;
         const uint32_t rng_seed = 2;
@@ -702,8 +726,8 @@ public:
         SUBCASE("no false negatives") {
             std::vector<std::pair<uint64_t, uint64_t>> queries;
             while (queries.size() < n_queries) {
-                uint64_t l = rng() & BITMASK(s.infix_size_ + Diva<>::base_implicit_size);
-                uint64_t r = rng() & BITMASK(s.infix_size_ + Diva<>::base_implicit_size);
+                uint64_t l = rng() & BITMASK(s.infix_size_ + s.base_implicit_size);
+                uint64_t r = rng() & BITMASK(s.infix_size_ + s.base_implicit_size);
                 if (l > r)
                     std::swap(l, r);
 
@@ -726,8 +750,8 @@ public:
         SUBCASE("negatives") {
             std::vector<std::pair<uint64_t, uint64_t>> queries;
             while (queries.size() < n_queries) {
-                uint64_t l = rng() & BITMASK(s.infix_size_ + Diva<>::base_implicit_size);
-                uint64_t r = rng() & BITMASK(s.infix_size_ + Diva<>::base_implicit_size);
+                uint64_t l = rng() & BITMASK(s.infix_size_ + s.base_implicit_size);
+                uint64_t r = rng() & BITMASK(s.infix_size_ + s.base_implicit_size);
                 if (l > r)
                     std::swap(l, r);
 
@@ -758,13 +782,14 @@ public:
 
         Diva<> s(infix_size, seed, load_factor);
         Diva<>::InfixStore store(s.scaled_sizes_[s.size_scalar_shrink_grow_sep], s.infix_size_,
-                                 s.size_scalar_shrink_grow_sep);
+                s.size_scalar_shrink_grow_sep, s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep],
+                s.payload_size_);
         
         SUBCASE("expand") {
             const uint32_t n_keys = s.scaled_sizes_[s.size_scalar_shrink_grow_sep] - 1;
             std::vector<uint64_t> keys;
             for (int32_t i = 0; i < n_keys; i++) {
-                keys.push_back((rng() & BITMASK(Diva<>::base_implicit_size + infix_size)) | 1UL);
+                keys.push_back((rng() & BITMASK(s.base_implicit_size + infix_size)) | 1UL);
                 s.InsertRawIntoInfixStore(store, keys.back());
                 REQUIRE_EQ(store.GetFullSlotCount(), i + 1);
                 uint64_t infix_list[n_keys];
@@ -783,7 +808,7 @@ public:
         SUBCASE("contract") {
             const uint32_t n_keys = s.scaled_sizes_[s.size_scalar_shrink_grow_sep] - 500;
             for (int32_t i = 0; i < n_keys; i++)
-                s.InsertRawIntoInfixStore(store, (rng() & BITMASK(Diva<>::base_implicit_size + infix_size)) | 1ULL);
+                s.InsertRawIntoInfixStore(store, (rng() & BITMASK(s.base_implicit_size + infix_size)) | 1ULL);
             s.ResizeInfixStore(store);
 
             const auto [occupieds_pos, checks] =
@@ -832,7 +857,8 @@ public:
 
         PayloadDiva s(infix_size, seed, load_factor, payload_size);
         PayloadDiva::InfixStore store(s.scaled_sizes_[s.size_scalar_shrink_grow_sep], s.infix_size_,
-                                      s.size_scalar_shrink_grow_sep, payload_size);
+                                      s.size_scalar_shrink_grow_sep,
+                                      s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep], payload_size);
         
         SUBCASE("allocation") {
             const std::vector<uint32_t> occupieds_pos = {};
@@ -929,7 +955,7 @@ public:
         const uint32_t infix_size = 5;
         const uint32_t seed = 1;
         const uint32_t payload_size = 100;
-        const uint32_t infix_store_target_size = PayloadDiva::infix_store_target_size;
+        constexpr uint32_t infix_store_target_size = PayloadDiva::kDefaultInfixStoreTargetSize;
         const float load_factor = 0.95;
 
         const uint32_t rng_seed = 20;
@@ -937,8 +963,10 @@ public:
 
         PayloadDiva s(infix_size, seed, load_factor, payload_size);
         const uint32_t total_slots = s.scaled_sizes_[s.size_scalar_shrink_grow_sep];
-        PayloadDiva::InfixStore store(total_slots, s.infix_size_, s.size_scalar_shrink_grow_sep, payload_size);
-        uint64_t *runends = store.ptr + PayloadDiva::num_metadata_offset_words + PayloadDiva::infix_store_target_size / 64;
+        PayloadDiva::InfixStore store(total_slots, s.infix_size_, s.size_scalar_shrink_grow_sep,
+                s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep], payload_size);
+        uint64_t *runends = store.ptr + PayloadDiva::num_metadata_offset_words
+            + s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep] / 64;
         uint64_t inserts[100], payloads[100][payload_size / 64 + 2];
         uint64_t read_payload[payload_size / 64 + 2];
         memset(payloads, 0, sizeof(payloads));
@@ -1157,7 +1185,7 @@ public:
         const uint32_t infix_size = 5;
         const uint32_t seed = 1;
         const uint32_t payload_size = 100;
-        const uint32_t infix_store_target_size = PayloadDiva::infix_store_target_size;
+        constexpr uint32_t infix_store_target_size = PayloadDiva::kDefaultInfixStoreTargetSize;
         const float load_factor = 0.95;
 
         const uint32_t rng_seed = 20;
@@ -1165,7 +1193,8 @@ public:
 
         PayloadDiva s(infix_size, seed, load_factor, payload_size);
         const uint32_t total_slots = s.scaled_sizes_[s.size_scalar_shrink_grow_sep];
-        PayloadDiva::InfixStore store(total_slots, s.infix_size_, s.size_scalar_shrink_grow_sep, payload_size);
+        PayloadDiva::InfixStore store(total_slots, s.infix_size_, s.size_scalar_shrink_grow_sep,
+                s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep], payload_size);
 
         const std::vector<uint64_t> keys {0b000000000000001,
             0b000000000000101, 0b000000000010101,
@@ -1220,7 +1249,7 @@ public:
         const uint32_t infix_size = 5;
         const uint32_t seed = 1;
         const uint32_t payload_size = 100;
-        const uint32_t infix_store_target_size = PayloadDiva::infix_store_target_size;
+        constexpr uint32_t infix_store_target_size = PayloadDiva::kDefaultInfixStoreTargetSize;
         const float load_factor = 0.95;
 
         const uint32_t rng_seed = 20;
@@ -1228,7 +1257,8 @@ public:
 
         PayloadDiva s(infix_size, seed, load_factor, payload_size);
         const uint32_t total_slots = s.scaled_sizes_[s.size_scalar_shrink_grow_sep];
-        PayloadDiva::InfixStore store(total_slots, s.infix_size_, s.size_scalar_shrink_grow_sep, payload_size);
+        PayloadDiva::InfixStore store(total_slots, s.infix_size_, s.size_scalar_shrink_grow_sep,
+                s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep], payload_size);
 
         uint64_t payloads[(infix_store_target_size + 1) * (payload_size / 64 + 2)];
         for (uint32_t i = 0; i < (infix_store_target_size + 1) * (payload_size / 64 + 2); i++)
@@ -1265,7 +1295,7 @@ public:
             std::mt19937_64 rng(rng_seed);
             std::vector<uint64_t> keys;
             for (int32_t i = 0; i < n_keys; i++) {
-                keys.push_back((rng() & BITMASK(PayloadDiva::base_implicit_size + infix_size)) | 1ULL);
+                keys.push_back((rng() & BITMASK(s.base_implicit_size + infix_size)) | 1ULL);
 
                 uint64_t tmp_payload[payload_size / 64 + 2];
                 copy_bitmap_to_bitmap(payloads, payload_size * i, tmp_payload, 0, payload_size);
@@ -1290,13 +1320,14 @@ public:
     static void PayloadsDeleteRaw() {
         const uint32_t infix_size = 5;
         const uint32_t payload_size = 100;
-        const uint32_t infix_store_target_size = PayloadDiva::infix_store_target_size;
+        constexpr uint32_t infix_store_target_size = PayloadDiva::kDefaultInfixStoreTargetSize;
         const uint32_t seed = 1;
         const float load_factor = 0.95;
 
         PayloadDiva s(infix_size, seed, load_factor, payload_size);
         const uint32_t total_slots = s.scaled_sizes_[s.size_scalar_shrink_grow_sep];
-        PayloadDiva::InfixStore store(total_slots, s.infix_size_, s.size_scalar_shrink_grow_sep, payload_size);
+        PayloadDiva::InfixStore store(total_slots, s.infix_size_, s.size_scalar_shrink_grow_sep,
+                s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep], payload_size);
 
         const uint32_t rng_seed = 20;
         std::mt19937_64 rng(rng_seed);
@@ -1316,7 +1347,7 @@ public:
             0b111111111011111, 0b111111111100001,
             0b111111111100011};
         while (keys.size() < infix_store_target_size) {
-            const uint64_t candidate = rng() & BITMASK(Diva<>::base_implicit_size + infix_size);
+            const uint64_t candidate = rng() & BITMASK(s.base_implicit_size + infix_size);
             if (candidate & BITMASK(infix_size))
                 keys.push_back(candidate);
         }
@@ -1344,7 +1375,7 @@ public:
 
         SUBCASE("choose from multiple matches, shift left") {
             s.DeleteRawFromInfixStore(store, 0b000000010010101, infix_store_target_size, 
-                    [](const uint64_t *payload) { return payload[0] == 0xb45c4694c48e921f; });
+                    InfixPayloadFirstWordEq{0xb45c4694c48e921fULL});
             {
                 const auto [occupieds_pos, checks] =
                     ReadStoreContentsFromFile("payloads/delete/multiple_matches/shift_left/1");
@@ -1371,7 +1402,7 @@ public:
 
         SUBCASE("destroy run, shift left") {
             s.DeleteRawFromInfixStore(store, 0b00000011111011, infix_store_target_size, 
-                                      [](const uint64_t *payload) { return payload[0] == 0x10c8fd5b4b0459bc; });
+                                      InfixPayloadFirstWordEq{0x10c8fd5b4b0459bcULL});
             {
                 const auto [occupieds_pos, checks] =
                     ReadStoreContentsFromFile("payloads/delete/destroy_run/shift_left/1");
@@ -1383,7 +1414,7 @@ public:
                 AssertStoreContents(s, store, occupieds_pos, checks, check_payloads);
             }
             s.DeleteRawFromInfixStore(store, 0b00000011111011, infix_store_target_size, 
-                                      [](const uint64_t *payload) { return payload[0] == 0x19b28ae9e8437575; });
+                                      InfixPayloadFirstWordEq{0x19b28ae9e8437575ULL});
             {
                 const auto [occupieds_pos, checks] =
                     ReadStoreContentsFromFile("payloads/delete/destroy_run/shift_left/2");
@@ -1398,7 +1429,7 @@ public:
 
         SUBCASE("end of run, shift left") {
             s.DeleteRawFromInfixStore(store, 0b000000010011111, infix_store_target_size, 
-                                      [](const uint64_t *payload) { return payload[0] == 0xfb9c2e1f14d77d65; });
+                                      InfixPayloadFirstWordEq{0xfb9c2e1f14d77d65ULL});
             const auto [occupieds_pos, checks] =
                 ReadStoreContentsFromFile("payloads/delete/end_of_run/shift_left");
             uint64_t check_payloads_contents[infix_store_target_size + 100][payload_size / 64 + 2] = {};
@@ -1411,7 +1442,7 @@ public:
 
         SUBCASE("single match, shift right") {
             s.DeleteRawFromInfixStore(store, 0b111111111011111, infix_store_target_size, 
-                                      [](const uint64_t *payload) { return payload[0] == 0xbfe6180250364ecf; });
+                                      InfixPayloadFirstWordEq{0xbfe6180250364ecfULL});
             const auto [occupieds_pos, checks] =
                 ReadStoreContentsFromFile("payloads/delete/single_match/shift_right");
             uint64_t check_payloads_contents[infix_store_target_size + 100][payload_size / 64 + 2] = {};
@@ -1424,7 +1455,7 @@ public:
 
         SUBCASE("multiple matches, shift right") {
             s.DeleteRawFromInfixStore(store, 0b111111111010101, infix_store_target_size, 
-                                      [](const uint64_t *payload) { return payload[0] == 0x5a53fa59c2975c9; });
+                                      InfixPayloadFirstWordEq{0x5a53fa59c2975c9ULL});
             {
                 const auto [occupieds_pos, checks] =
                     ReadStoreContentsFromFile("payloads/delete/multiple_matches/shift_right/1");
@@ -1450,7 +1481,7 @@ public:
 
         SUBCASE("destroy run, shift right") {
             s.DeleteRawFromInfixStore(store, 0b111111110110101, infix_store_target_size, 
-                                      [](const uint64_t *payload) { return payload[0] == 0xb71307c72019bed6; });
+                                      InfixPayloadFirstWordEq{0xb71307c72019bed6ULL});
             {
                 const auto [occupieds_pos, checks] =
                     ReadStoreContentsFromFile("payloads/delete/destroy_run/shift_right/1");
@@ -1462,7 +1493,7 @@ public:
                 AssertStoreContents(s, store, occupieds_pos, checks, check_payloads);
             }
             s.DeleteRawFromInfixStore(store, 0b111111110110101, infix_store_target_size, 
-                                      [](const uint64_t *payload) { return payload[0] == 0xa9822db95c22d90e; });
+                                      InfixPayloadFirstWordEq{0xa9822db95c22d90eULL});
             {
                 const auto [occupieds_pos, checks] =
                     ReadStoreContentsFromFile("payloads/delete/destroy_run/shift_right/2");
@@ -1477,7 +1508,7 @@ public:
 
         SUBCASE("end of run, shift right") {
             s.DeleteRawFromInfixStore(store, 0b111111111100011, infix_store_target_size, 
-                                      [](const uint64_t *payload) { return payload[0] == 0xa84843ffeafb62b2; });
+                                      InfixPayloadFirstWordEq{0xa84843ffeafb62b2ULL});
             const auto [occupieds_pos, checks] =
                 ReadStoreContentsFromFile("payloads/delete/end_of_run/shift_right");
             uint64_t check_payloads_contents[infix_store_target_size + 100][payload_size / 64 + 2] = {};
@@ -1494,7 +1525,7 @@ public:
         s.InsertRawIntoInfixStore(store, 0b010000000010101, infix_store_target_size, lone_payload);
         SUBCASE("lone run with single slot") {
             s.DeleteRawFromInfixStore(store, 0b010000000010101, infix_store_target_size, 
-                                      [=](const uint64_t *payload) { return payload[0] == lone_payload[0]; });
+                                      InfixPayloadFirstWordEq{lone_payload[0]});
             const auto [occupieds_pos, checks] =
                 ReadStoreContentsFromFile("payloads/delete/lone_run_with_single_slot");
             uint64_t check_payloads_contents[infix_store_target_size + 100][payload_size / 64 + 2] = {};
@@ -1510,13 +1541,14 @@ public:
     static void PayloadsGetLongestMatchingInfixSize() {
         const uint32_t infix_size = 5;
         const uint32_t payload_size = 100;
-        const uint32_t infix_store_target_size = PayloadDiva::infix_store_target_size;
+        constexpr uint32_t infix_store_target_size = PayloadDiva::kDefaultInfixStoreTargetSize;
         const uint32_t seed = 1;
         const float load_factor = 0.95;
 
         PayloadDiva s(infix_size, seed, load_factor, payload_size);
         const uint32_t total_slots = s.scaled_sizes_[s.size_scalar_shrink_grow_sep];
-        PayloadDiva::InfixStore store(total_slots, s.infix_size_, s.size_scalar_shrink_grow_sep, payload_size);
+        PayloadDiva::InfixStore store(total_slots, s.infix_size_, s.size_scalar_shrink_grow_sep,
+                s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep], payload_size);
 
         const uint32_t rng_seed = 20;
         std::mt19937_64 rng(rng_seed);
@@ -1543,46 +1575,46 @@ public:
         s.LoadListToInfixStore(store, keys.data(), keys.size(), infix_store_target_size, true, payloads);
 
         REQUIRE_EQ(s.GetLongestMatchingInfixSize(store, 0b000100111110011, infix_store_target_size,
-                    [] (const uint64_t *payload) { return true; }),
+                    InfixPayloadPredicateTrue{}),
                 infix_size - 1);
         REQUIRE_EQ(s.GetLongestMatchingInfixSize(store, 0b000100111110011, infix_store_target_size,
-                    [] (const uint64_t *payload) { return payload[0] == 0x8edaa78f2fc77d78; }),
+                    InfixPayloadFirstWordEq{0x8edaa78f2fc77d78ULL}),
                 infix_size - 1);
         REQUIRE_EQ(s.GetLongestMatchingInfixSize(store, 0b000100111110011, infix_store_target_size,
-                    [] (const uint64_t *payload) { return payload[0] == 0x513480a1777ab79; }),
+                    InfixPayloadFirstWordEq{0x513480a1777ab79ULL}),
                 infix_size - 2);
         REQUIRE_EQ(s.GetLongestMatchingInfixSize(store, 0b000100111110011, infix_store_target_size,
-                    [] (const uint64_t *payload) { return payload[0] == 0x88158666844a4c73; }),
+                    InfixPayloadFirstWordEq{0x88158666844a4c73ULL}),
                 infix_size - 5);
         REQUIRE_EQ(s.GetLongestMatchingInfixSize(store, 0b000100111110011, infix_store_target_size,
-                    [] (const uint64_t *payload) { return false; }),
+                    InfixPayloadPredicateFalse{}),
                 -1);
 
         REQUIRE_EQ(s.GetLongestMatchingInfixSize(store, 0b000100111110001, infix_store_target_size,
-                    [] (const uint64_t *payload) { return true; }),
+                    InfixPayloadPredicateTrue{}),
                 infix_size - 2);
         REQUIRE_EQ(s.GetLongestMatchingInfixSize(store, 0b000100111110001, infix_store_target_size,
-                    [] (const uint64_t *payload) { return payload[0] == 0x513480a1777ab79; }),
+                    InfixPayloadFirstWordEq{0x513480a1777ab79ULL}),
                 infix_size - 2);
         REQUIRE_EQ(s.GetLongestMatchingInfixSize(store, 0b000100111110001, infix_store_target_size,
-                    [] (const uint64_t *payload) { return payload[0] == 0x88158666844a4c73; }),
+                    InfixPayloadFirstWordEq{0x88158666844a4c73ULL}),
                 infix_size - 5);
         REQUIRE_EQ(s.GetLongestMatchingInfixSize(store, 0b000100111110001, infix_store_target_size,
-                    [] (const uint64_t *payload) { return false; }),
+                    InfixPayloadPredicateFalse{}),
                 -1);
 
         REQUIRE_EQ(s.GetLongestMatchingInfixSize(store, 0b000100111100001, infix_store_target_size,
-                    [] (const uint64_t *payload) { return true; }),
+                    InfixPayloadPredicateTrue{}),
                 infix_size - 5);
         REQUIRE_EQ(s.GetLongestMatchingInfixSize(store, 0b000100111100001, infix_store_target_size,
-                    [] (const uint64_t *payload) { return payload[0] == 0x88158666844a4c73; }),
+                    InfixPayloadFirstWordEq{0x88158666844a4c73ULL}),
                 infix_size - 5);
         REQUIRE_EQ(s.GetLongestMatchingInfixSize(store, 0b000100111100001, infix_store_target_size,
-                    [] (const uint64_t *payload) { return false; }),
+                    InfixPayloadPredicateFalse{}),
                 -1);
 
         REQUIRE_EQ(s.GetLongestMatchingInfixSize(store, 0b111111111111111, infix_store_target_size,
-                    [] (const uint64_t *payload) { return true; }),
+                    InfixPayloadPredicateTrue{}),
                 -1);
     }
 
@@ -1590,7 +1622,7 @@ public:
     static void PayloadsResize() {
         const uint32_t infix_size = 5;
         const uint32_t payload_size = 100;
-        const uint32_t infix_store_target_size = PayloadDiva::infix_store_target_size;
+        constexpr uint32_t infix_store_target_size = PayloadDiva::kDefaultInfixStoreTargetSize;
         const uint32_t seed = 1;
         const float load_factor = 0.95;
         const uint32_t rng_seed = 2;
@@ -1598,7 +1630,8 @@ public:
         
         PayloadDiva s(infix_size, seed, load_factor, payload_size);
         const uint32_t total_slots = s.scaled_sizes_[s.size_scalar_shrink_grow_sep];
-        PayloadDiva::InfixStore store(total_slots, s.infix_size_, s.size_scalar_shrink_grow_sep, payload_size);
+        PayloadDiva::InfixStore store(total_slots, s.infix_size_, s.size_scalar_shrink_grow_sep,
+                s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep], payload_size);
 
         SUBCASE("expand") {
             const uint32_t n_keys = s.scaled_sizes_[s.size_scalar_shrink_grow_sep] - 1;
@@ -1606,7 +1639,7 @@ public:
                 uint64_t payload[payload_size / 64 + 2];
                 for (uint32_t i = 0; i < payload_size / 64 + 2; i++)
                     payload[i] = rng();
-                s.InsertRawIntoInfixStore(store, (rng() & BITMASK(Diva<>::base_implicit_size + infix_size)) | 1ULL,
+                s.InsertRawIntoInfixStore(store, (rng() & BITMASK(s.base_implicit_size + infix_size)) | 1ULL,
                                           infix_store_target_size, payload);
             }
             s.ResizeInfixStore(store);
@@ -1627,7 +1660,7 @@ public:
                 uint64_t payload[payload_size / 64 + 2];
                 for (uint32_t i = 0; i < payload_size / 64 + 2; i++)
                     payload[i] = rng();
-                s.InsertRawIntoInfixStore(store, (rng() & BITMASK(Diva<>::base_implicit_size + infix_size)) | 1ULL,
+                s.InsertRawIntoInfixStore(store, (rng() & BITMASK(s.base_implicit_size + infix_size)) | 1ULL,
                                           infix_store_target_size, payload);
             }
             s.ResizeInfixStore(store);
@@ -1652,7 +1685,7 @@ public:
         const uint32_t max_key_len = 17;
         const uint32_t max_num_keys_in_infix = 16;
         const uint32_t infix_size = 5;
-        const uint32_t infix_store_target_size = BinaryTrieDiva::infix_store_target_size;
+        constexpr uint32_t infix_store_target_size = BinaryTrieDiva::kDefaultInfixStoreTargetSize;
         const uint32_t seed = 1;
         const float load_factor = 0.95;
         const uint32_t rng_seed = 2;
@@ -1686,7 +1719,8 @@ public:
         BinaryTrieDiva s(infix_size, seed, load_factor);
         const uint32_t total_slots = s.scaled_sizes_[s.size_scalar_shrink_grow_sep];
         BinaryTrieDiva::InfixStore store(total_slots, s.infix_size_,
-                s.size_scalar_shrink_grow_sep);
+                s.size_scalar_shrink_grow_sep, s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep],
+                s.payload_size_);
         s.LoadVectorToInfixStore(store, infix_vec);
 
         const auto [occupieds_pos, checks] = 
@@ -1702,7 +1736,7 @@ public:
         const uint32_t max_key_len = 17;
         const uint32_t max_num_keys_in_infix = 16;
         const uint32_t infix_size = 5;
-        const uint32_t infix_store_target_size = BinaryTrieDiva::infix_store_target_size;
+        constexpr uint32_t infix_store_target_size = BinaryTrieDiva::kDefaultInfixStoreTargetSize;
         const uint32_t seed = 1;
         const float load_factor = 0.95;
         const uint32_t rng_seed = 2;
@@ -1736,7 +1770,8 @@ public:
         BinaryTrieDiva s(infix_size, seed, load_factor);
         const uint32_t total_slots = s.scaled_sizes_[s.size_scalar_shrink_grow_sep];
         BinaryTrieDiva::InfixStore store(total_slots, s.infix_size_,
-                s.size_scalar_shrink_grow_sep);
+                s.size_scalar_shrink_grow_sep, s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep],
+                s.payload_size_);
         s.LoadVectorToInfixStore(store, infix_vec);
 
         auto reconstructed_infix_vec = s.GetInfixVector(store);
@@ -1754,7 +1789,7 @@ public:
         const uint32_t max_key_len = 17;
         const uint32_t max_num_keys_in_infix = 10;
         const uint32_t infix_size = 5;
-        const uint32_t infix_store_target_size = BinaryTrieDiva::infix_store_target_size;
+        constexpr uint32_t infix_store_target_size = BinaryTrieDiva::kDefaultInfixStoreTargetSize;
         const uint32_t seed = 1;
         const float load_factor = 0.95;
         const uint32_t rng_seed = 2;
@@ -1788,7 +1823,8 @@ public:
         BinaryTrieDiva s(infix_size, seed, load_factor);
         const uint32_t total_slots = s.scaled_sizes_[s.size_scalar_shrink_grow_sep];
         BinaryTrieDiva::InfixStore store(total_slots, s.infix_size_,
-                s.size_scalar_shrink_grow_sep);
+                s.size_scalar_shrink_grow_sep, s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep],
+                s.payload_size_);
         s.LoadVectorToInfixStore(store, infix_vec);
 
         // To make sure that the strings stored in the tries after the infix is aligned with the input
@@ -1924,7 +1960,7 @@ public:
         const uint32_t max_key_len = 17;
         const uint32_t max_num_keys_in_infix = 16;
         const uint32_t infix_size = 5;
-        const uint32_t infix_store_target_size = BinaryTrieDiva::infix_store_target_size;
+        constexpr uint32_t infix_store_target_size = BinaryTrieDiva::kDefaultInfixStoreTargetSize;
         const uint32_t seed = 1;
         const float load_factor = 0.95;
         const uint32_t rng_seed = 2;
@@ -1961,7 +1997,8 @@ public:
         BinaryTrieDiva s(infix_size, seed, load_factor);
         const uint32_t total_slots = s.scaled_sizes_[s.size_scalar_shrink_grow_sep];
         BinaryTrieDiva::InfixStore store(total_slots, s.infix_size_,
-                s.size_scalar_shrink_grow_sep);
+                s.size_scalar_shrink_grow_sep, s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep],
+                s.payload_size_);
         s.LoadVectorToInfixStore(store, infix_vec);
 
         SUBCASE("no false negatives") {
@@ -2035,7 +2072,7 @@ public:
         const uint32_t max_key_len = 17;
         const uint32_t max_num_keys_in_infix = 16;
         const uint32_t infix_size = 5;
-        const uint32_t infix_store_target_size = BinaryTrieDiva::infix_store_target_size;
+        constexpr uint32_t infix_store_target_size = BinaryTrieDiva::kDefaultInfixStoreTargetSize;
         const uint32_t seed = 1;
         const float load_factor = 0.95;
         const uint32_t rng_seed = 2;
@@ -2072,7 +2109,8 @@ public:
         BinaryTrieDiva s(infix_size, seed, load_factor);
         const uint32_t total_slots = s.scaled_sizes_[s.size_scalar_shrink_grow_sep];
         BinaryTrieDiva::InfixStore store(total_slots, s.infix_size_,
-                s.size_scalar_shrink_grow_sep);
+                s.size_scalar_shrink_grow_sep, s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep],
+                s.payload_size_);
         s.LoadVectorToInfixStore(store, infix_vec);
 
         SUBCASE("no false negatives") {
@@ -2245,7 +2283,7 @@ public:
         const uint32_t max_key_len = 17;
         const uint32_t max_num_keys_in_infix = 10;
         const uint32_t infix_size = 5;
-        const uint32_t infix_store_target_size = BinaryTrieDiva::infix_store_target_size;
+        constexpr uint32_t infix_store_target_size = BinaryTrieDiva::kDefaultInfixStoreTargetSize;
         const uint32_t seed = 1;
         const float load_factor = 0.95;
         const uint32_t rng_seed = 2;
@@ -2287,7 +2325,8 @@ public:
         BinaryTrieDiva s(infix_size, seed, load_factor);
         const uint32_t total_slots = s.scaled_sizes_[s.size_scalar_shrink_grow_sep];
         BinaryTrieDiva::InfixStore store(total_slots, s.infix_size_,
-                s.size_scalar_shrink_grow_sep);
+                s.size_scalar_shrink_grow_sep, s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep],
+                s.payload_size_);
         s.LoadVectorToInfixStore(store, infix_vec);
 
         // To make sure that the strings stored in the tries after the infix is aligned with the input
@@ -2498,7 +2537,7 @@ public:
         const uint32_t max_key_len = 17;
         const uint32_t max_num_keys_in_infix = 10;
         const uint32_t infix_size = 5;
-        const uint32_t infix_store_target_size = BinaryTrieDiva::infix_store_target_size;
+        constexpr uint32_t infix_store_target_size = BinaryTrieDiva::kDefaultInfixStoreTargetSize;
         const uint32_t seed = 1;
         const float load_factor = 0.95;
         const uint32_t rng_seed = 2;
@@ -2539,7 +2578,8 @@ public:
         BinaryTrieDiva s(infix_size, seed, load_factor);
         const uint32_t total_slots = s.scaled_sizes_[s.size_scalar_shrink_grow_sep];
         BinaryTrieDiva::InfixStore store(total_slots, s.infix_size_,
-                s.size_scalar_shrink_grow_sep);
+                s.size_scalar_shrink_grow_sep, s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep],
+                s.payload_size_);
         s.LoadVectorToInfixStore(store, infix_vec);
 
         // To make sure that the strings stored in the tries after the infix is aligned with the input
@@ -2614,7 +2654,7 @@ public:
         const uint32_t max_key_len = 17;
         const uint32_t max_num_keys_in_infix = 16;
         const uint32_t infix_size = 5;
-        const uint32_t infix_store_target_size = BinaryTrieDiva::infix_store_target_size;
+        constexpr uint32_t infix_store_target_size = BinaryTrieDiva::kDefaultInfixStoreTargetSize;
         const uint32_t seed = 1;
         const float load_factor = 0.95;
         const uint32_t rng_seed = 2;
@@ -2649,7 +2689,8 @@ public:
         BinaryTrieDiva s(infix_size, seed, load_factor);
         const uint32_t total_slots = s.scaled_sizes_[s.size_scalar_shrink_grow_sep];
         BinaryTrieDiva::InfixStore store(total_slots, s.infix_size_,
-                s.size_scalar_shrink_grow_sep);
+                s.size_scalar_shrink_grow_sep, s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep],
+                s.payload_size_);
         s.LoadVectorToInfixStore(store, infix_vec);
         
         // To make sure that the strings stored in the tries after the infix is aligned with the input
@@ -3008,7 +3049,8 @@ public:
         BinaryTrieDiva s(infix_size, seed, load_factor);
         const uint32_t total_slots = s.scaled_sizes_[s.size_scalar_shrink_grow_sep];
         BinaryTrieDiva::InfixStore store(total_slots, s.infix_size_,
-                s.size_scalar_shrink_grow_sep);
+                s.size_scalar_shrink_grow_sep, s.bitmap_target_sizes_[s.size_scalar_shrink_grow_sep],
+                s.payload_size_);
         s.LoadVectorToInfixStore(store, infix_vec);
 
         SUBCASE("add suffix") {
@@ -3162,12 +3204,13 @@ private:
             REQUIRE_EQ(store.GetFullSlotCount(), checks.size());
         if constexpr (payload_type == PayloadType::FixedLength)
             assert(check_payloads != nullptr);
+        const uint32_t bitmap_w = static_cast<uint32_t>(s.bitmap_target_sizes_[store.GetSizeGrade()]);
         const uint32_t *popcnts = reinterpret_cast<const uint32_t *>(store.ptr);
         const uint64_t *occupieds = store.ptr + Diva<diva_type, payload_type>::num_metadata_offset_words;
         const uint64_t *runends = store.ptr + Diva<diva_type, payload_type>::num_metadata_offset_words
-                                    + Diva<>::infix_store_target_size / 64;
+                                    + bitmap_w / 64;
         uint32_t ind = 0;
-        for (uint32_t i = 0; i < Diva<>::infix_store_target_size; i++) {
+        for (uint32_t i = 0; i < bitmap_w; i++) {
             if (ind < occupieds_pos.size() && i == occupieds_pos[ind]) {
                 REQUIRE_EQ(get_bitmap_bit(occupieds, i), 1);
                 ind++;
@@ -3206,7 +3249,7 @@ private:
         REQUIRE_EQ(occupieds_pos.size(), runend_count);
 
         uint32_t check_popcnts[2] = {};
-        for (int32_t i = 0; i < Diva<>::infix_store_target_size / 128; i++) {
+        for (int32_t i = 0; i < static_cast<int32_t>(bitmap_w / 128); i++) {
             check_popcnts[0] += __builtin_popcountll(occupieds[i]);
             const uint64_t masked_runends = runends[i] & BITMASK(std::min(64, std::max<int32_t>(total_size - 64 * i, 0)));
             check_popcnts[1] += __builtin_popcountll(masked_runends);
@@ -3219,10 +3262,11 @@ private:
     static void PrintStore(const Diva<diva_type, payload_type> &s,
                            const typename Diva<diva_type, payload_type>::InfixStore &store) {
         const uint32_t size_grade = store.GetSizeGrade();
+        const uint32_t bitmap_w = static_cast<uint32_t>(s.bitmap_target_sizes_[size_grade]);
         const uint32_t *popcnts = reinterpret_cast<const uint32_t *>(store.ptr);
         const uint64_t *occupieds = store.ptr + Diva<diva_type, payload_type>::num_metadata_offset_words;
         const uint64_t *runends = store.ptr + Diva<diva_type, payload_type>::num_metadata_offset_words
-                                  + Diva<>::infix_store_target_size / 64;
+                                  + bitmap_w / 64;
 
         std::cerr << " size_grade=" << size_grade << " full_slot_count=" << store.GetFullSlotCount() << std::endl;
         if constexpr (payload_type == PayloadType::FixedLength) {
@@ -3237,7 +3281,7 @@ private:
         }
         std::cerr << "popcnts=[" << popcnts[0] << ", " << popcnts[1] << ']' << std::endl;
         std::cerr << "occupieds: ";
-        for (int32_t i = 0; i < Diva<>::infix_store_target_size; i++) {
+        for (int32_t i = 0; i < static_cast<int32_t>(bitmap_w); i++) {
             if ((occupieds[i / 64] >> (i % 64)) & 1ULL)
                 std::cerr << i << ", ";
         }
