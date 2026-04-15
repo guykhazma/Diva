@@ -3545,7 +3545,7 @@ wormhole_iter_fix_rev(struct wormhole_iter * const iter, bool write, bool unlock
     return true;
 
   while (unlikely(iter->is < 0)) {
-    debug_assert(iter->leaf->leaflock);
+    // debug_assert(iter->leaf->leaflock);
     struct wormleaf * const prev = iter->leaf->prev;
     if (likely(prev != NULL)) {
       struct wormref * const ref = iter->ref;

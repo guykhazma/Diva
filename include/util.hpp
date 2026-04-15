@@ -435,14 +435,20 @@ __attribute__((always_inline))
 inline void write_bits_to_bitmap(void *bitmap, uint32_t bitmap_pos,
                                  uint64_t bits,
                                  uint32_t num_bits_to_copy) {
+    if (num_bits_to_copy == 0) return; // Guard against 0-bit writes
     bits &= BITMASK(num_bits_to_copy);
     uint64_t *bitmap_words = reinterpret_cast<uint64_t *>(bitmap);
-    bitmap_words[bitmap_pos / 64] &= ~(BITMASK(num_bits_to_copy) << (bitmap_pos % 64));
-    bitmap_words[bitmap_pos / 64] |= bits << (bitmap_pos % 64);
-    const int32_t next_word_bit_count = std::max(static_cast<int32_t>(bitmap_pos) % 64 
-                                            + static_cast<int32_t>(num_bits_to_copy) - 64, 0);
-    bitmap_words[bitmap_pos / 64 + 1] &= ~BITMASK(next_word_bit_count);
-    bitmap_words[bitmap_pos / 64 + 1] |= bits >> (num_bits_to_copy - next_word_bit_count);
+    uint32_t word_idx = bitmap_pos / 64;
+    uint32_t bit_offset = bitmap_pos % 64;
+    // Write to the first word
+    bitmap_words[word_idx] &= ~(BITMASK(num_bits_to_copy) << bit_offset);
+    bitmap_words[word_idx] |= (bits << bit_offset);
+    // Check if we actually cross into the next word
+    if (bit_offset + num_bits_to_copy > 64) {
+      uint32_t next_word_bits = (bit_offset + num_bits_to_copy) - 64;
+      bitmap_words[word_idx + 1] &= ~BITMASK(next_word_bits);
+      bitmap_words[word_idx + 1] |= (bits >> (num_bits_to_copy - next_word_bits));
+    }
 }
 
 
@@ -567,10 +573,10 @@ inline void cpu_pause() {
 
 __attribute__((always_inline))
 inline bool rwlock_trylock_read(std::atomic<lock_t>& lock) {
-    if ((lock.fetch_add(1, std::memory_order::memory_order_acquire) & rwlock_write_bit) == 0)
+    if ((lock.fetch_add(1, std::memory_order_acquire) & rwlock_write_bit) == 0)
         return true;
     else {
-        lock.fetch_sub(1, std::memory_order::memory_order_relaxed);
+        lock.fetch_sub(1, std::memory_order_relaxed);
         return false;
     }
 }
@@ -584,21 +590,21 @@ inline void rwlock_lock_read(std::atomic<lock_t>& lock) {
 #pragma nounroll
         do {
             cpu_pause();
-        } while (lock.load(std::memory_order::memory_order_acquire) & rwlock_write_bit);
+        } while (lock.load(std::memory_order_acquire) & rwlock_write_bit);
     } while (true);
 }
 
 __attribute__((always_inline))
 inline void rwlock_unlock_read(std::atomic<lock_t>& lock) {
-    lock.fetch_sub(1, std::memory_order::memory_order_release);
+    lock.fetch_sub(1, std::memory_order_release);
 }
 
 __attribute__((always_inline))
 inline bool rwlock_trylock_write(std::atomic<lock_t>& lock) {
-    lock_t v0 = lock.load(std::memory_order::memory_order_acquire);
+    lock_t v0 = lock.load(std::memory_order_acquire);
     if (v0 == rwlock_no_access && lock.compare_exchange_weak(v0, rwlock_write_bit,
-                                                             std::memory_order::memory_order_acquire,
-                                                             std::memory_order::memory_order_relaxed)) {
+                                                             std::memory_order_acquire,
+                                                             std::memory_order_relaxed)) {
         return true;
     }
     else {
@@ -615,13 +621,13 @@ inline void rwlock_lock_write(std::atomic<lock_t>& lock) {
 #pragma nounroll
         do {
             cpu_pause();
-        } while (lock.load(std::memory_order::memory_order_acquire));
+        } while (lock.load(std::memory_order_acquire));
     } while (true);
 }
 
 __attribute__((always_inline))
 inline void rwlock_unlock_write(std::atomic<lock_t>& lock) {
-    lock.fetch_sub(rwlock_write_bit, std::memory_order::memory_order_release);
+    lock.fetch_sub(rwlock_write_bit, std::memory_order_release);
 }
 
 
