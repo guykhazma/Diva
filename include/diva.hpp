@@ -164,6 +164,7 @@ public:
                                            const uint64_t *boundary_payload,
                                            const uint32_t boundary_payload_size);
     void BulkLoadStreamingSealFinish();
+    void PrintTrieAndPayloads();
     uint64_t GetNumKeys() const;
 
     // Walk wormhole trie keys in sorted order (BinaryTrie only). Payload bits
@@ -359,6 +360,7 @@ private:
                                                         payload_type == PayloadType::TrieOnly) ? 2 : 1;
     static constexpr uint8_t min_infix_store_size = 2;
     static constexpr uint32_t target_infix_store_size = 1024;
+    static constexpr uint32_t max_infix_store_size = 4096;
     static_assert(target_infix_store_size % 64 == 0);
     static constexpr uint32_t base_implicit_size = __builtin_ctz(target_infix_store_size);
     static constexpr uint32_t scale_shift = 15;
@@ -615,7 +617,7 @@ private:
     const float load_factor_alt_ = 0.95;
     const uint32_t size_scalar_shrink_grow_sep = std::log((target_infix_store_size) / min_infix_store_size) / std::log(1 / load_factor_) + 1;
     uint64_t size_scalars_[size_scalar_count], sizes_[size_scalar_count], scaled_sizes_[size_scalar_count], exception_scaled_size_;
-    uint64_t implicit_scalars_[target_infix_store_size / 2 + 1];
+    uint64_t implicit_scalars_[max_infix_store_size / 2 + 1];
     std::atomic<uint64_t> n_keys_ = 0;
 
     uint32_t bulk_load_streaming_ind_, bulk_load_streaming_max_len_;
@@ -999,13 +1001,14 @@ inline void Diva<diva_type, payload_type>::SetupScaleFactors() {
         size_scalars_[i] = std::numeric_limits<uint64_t>::max();
         scaled_sizes_[i] = std::numeric_limits<uint64_t>::max();
     }
-    
-    for (int32_t i = 0; i < target_infix_store_size / 2; i++) {
-        const double ratio = static_cast<double>(target_infix_store_size)
-                                / static_cast<double>(i + static_cast<double>(target_infix_store_size) / 2);
+
+    // calculate once for the max infix store size
+    for (int32_t i = 0; i < max_infix_store_size / 2; i++) {
+        const double ratio = static_cast<double>(max_infix_store_size)
+                                / static_cast<double>(i + static_cast<double>(max_infix_store_size) / 2);
         implicit_scalars_[i] = static_cast<uint64_t>(ratio * (1ULL << scale_implicit_shift));
     }
-    implicit_scalars_[target_infix_store_size / 2] = 1ULL << scale_implicit_shift;
+    implicit_scalars_[max_infix_store_size / 2] = 1ULL << scale_implicit_shift;
 }
 
 
@@ -2439,36 +2442,64 @@ inline std::tuple<uint32_t, uint32_t, uint32_t>
 Diva<diva_type, payload_type>::GetSharedIgnoreImplicitLengths(const InfiniteByteString key_1,
                                                               const InfiniteByteString key_2,
                                                               uint32_t target_infix_store_size) const {
-    uint32_t share = 0, ignore = 0;
+  uint32_t share = 0, ignore = 0;
+  uint32_t ind = 0, delta;
 
-    uint32_t ind = 0, delta;
+  const uint32_t key1_bits = key_1.length * 8;
+  const uint32_t key2_bits = key_2.length * 8;
+  // Common prefix cannot exceed the length of the shorter string
+  const uint32_t max_shared_bits = std::min(key1_bits, key2_bits);
+
+  // --- Share Loop ---
+  do {
+    const uint64_t read_1 = key_1.WordAt(ind * sizeof(uint64_t));
+    const uint64_t read_2 = key_2.WordAt(ind * sizeof(uint64_t));
+    delta = __builtin_ia32_lzcnt_u64(read_1 ^ read_2);
+    share += delta;
+    ind++;
+  } while (delta == 64 && (ind * 64) < max_shared_bits);
+
+  // Correct share if it overshot the actual string length
+  if (share > max_shared_bits) share = max_shared_bits;
+
+  // --- Ignore Loop ---
+  // If key_1 is a prefix of key_2, share == key1_bits, so ignore stays 0
+  if (share < key1_bits) {
+    ind = share / 64;
     do {
-        const uint64_t read_1 = key_1.WordAt(ind * sizeof(uint64_t));
-        const uint64_t read_2 = key_2.WordAt(ind * sizeof(uint64_t));
-        delta = __builtin_ia32_lzcnt_u64(read_1 ^ read_2);
-        share += delta;
-        ind++;
-    } while (delta == 64);
+      const uint64_t read_1 = key_1.WordAt(ind * sizeof(uint64_t));
+      const uint64_t read_2 = key_2.WordAt(ind * sizeof(uint64_t));
 
-    ind--;
-    do {
-        const uint64_t read_1 = key_1.WordAt(ind * sizeof(uint64_t));
-        const uint64_t read_2 = key_2.WordAt(ind * sizeof(uint64_t));
-        const uint32_t offset = (ind > share / 64 ? 0 : share % 64 + 1);
-        delta = __builtin_ia32_lzcnt_u64(((~read_1) | read_2) & BITMASK(64 - offset));
-        ignore += delta - offset;
-        ind++;
-    } while (delta == 64);
+      // Mask out bits already processed in 'share'
+      const uint32_t offset = (ind > share / 64 ? 0 : share % 64);
 
-    assert((target_infix_store_size & (target_infix_store_size - 1)) == 0 &&
-           "target_infix_store_size must be a power of two");
-    uint32_t base_implicit_bits = __builtin_ctz(target_infix_store_size);
-    uint64_t implicit_size = base_implicit_bits;
-    const uint64_t implicit_1 = key_1.BitsAt(share + ignore + 1, base_implicit_bits - 1);
-    const uint64_t implicit_2 = (1ULL << (base_implicit_bits - 1)) | key_2.BitsAt(share + ignore + 1, base_implicit_bits - 1);
-    implicit_size += (2 * (implicit_2 - implicit_1 + 1) < (1ULL << base_implicit_bits));
+      // Original logic: Find how many 1s in key_1 are 0s in key_2
+      uint64_t val = ((~read_1) | read_2);
+      if (offset > 0) val |= (BITMASK(offset) << (64 - offset));
 
-    return {share, ignore, implicit_size};
+      delta = __builtin_ia32_lzcnt_u64(val);
+      ignore += (delta - offset);
+      ind++;
+    } while (delta == 64 && (ind * 64) < key1_bits);
+
+    // Ensure ignore doesn't exceed the remaining bits of key_1
+    if (share + ignore > key1_bits) ignore = key1_bits - share;
+  }
+
+  assert((target_infix_store_size & (target_infix_store_size - 1)) == 0 &&
+         "target_infix_store_size must be a power of two");
+
+  uint32_t base_implicit_bits = __builtin_ctz(target_infix_store_size);
+  uint64_t implicit_size = base_implicit_bits;
+
+  // BitsAt is safe; it returns 0 if reading past length
+  const uint64_t implicit_1 = key_1.BitsAt(share + ignore + 1, base_implicit_bits - 1);
+  const uint64_t implicit_2 = (1ULL << (base_implicit_bits - 1)) |
+                              key_2.BitsAt(share + ignore + 1, base_implicit_bits - 1);
+
+  implicit_size += (2 * (implicit_2 - implicit_1 + 1) < (1ULL << base_implicit_bits));
+
+  return {share, ignore, (uint32_t)implicit_size};
 }
 
 
@@ -4364,7 +4395,79 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreamingSealWithBoundary(
   bulk_load_streaming_ind_ = 0;
   segment_bulk_load_key_list_.clear();
 
+  // PrintTrieAndPayloads();
   n_keys_.fetch_add(sealed_key_count, std::memory_order_release);
+}
+
+template <DivaType diva_type, PayloadType payload_type>
+inline void Diva<diva_type, payload_type>::PrintTrieAndPayloads() {
+  // 1. Define Boundaries using Slices
+  uint8_t start_buf[8];
+  memset(start_buf, 0x00, 8);
+  rocksdb::Slice start_slice(reinterpret_cast<const char*>(start_buf), 8);
+
+  uint8_t end_buf[100];
+  memset(end_buf, 0xFF, 100);
+  rocksdb::Slice end_slice(reinterpret_cast<const char*>(end_buf), 100);
+
+  // 2. Setup Iterator
+  wormhole_iter it;
+  it.ref = better_tree_;
+  it.map = better_tree_->map;
+  it.leaf = nullptr;
+  it.is = 0;
+
+  // 3. Initial Seek
+  wh_iter_seek(&it, start_slice.data(), start_slice.size(), false);
+
+  std::cout << "--- Starting Trie Traversal ---" << std::endl;
+  std::flush(std::cout);
+
+  while (wh_iter_valid(&it)) {
+    const void* curr_key_ptr;
+    uint32_t curr_key_len;
+    void* infix_ptr;
+    uint32_t val;
+
+    // Peek internal pointers
+    wh_iter_peek_ref(&it, &curr_key_ptr, &curr_key_len, &infix_ptr, &val);
+
+    // 2. Cast to InfixStore to access the internal payload
+    auto* store = reinterpret_cast<InfixStore*>(infix_ptr);
+    rocksdb::Slice current_slice(reinterpret_cast<const char*>(curr_key_ptr), curr_key_len);
+
+    if (store != nullptr) {
+      // 3. Lock the store (Hand-over-hand protocol from PointQueryWithBoundary)
+      rwlock_lock_read(store->rwlock);
+
+      // 4. Extract ptr[1] which contains our 128-bit payload
+      const uint64_t* payload_list = reinterpret_cast<const uint64_t*>(store->ptr[1]);
+
+      if (payload_list != nullptr) {
+        // According to SeekBlockBoundary: first 64 bits = offset, next 64 bits = size
+        uint64_t offset = payload_list[0];
+        uint64_t size   = payload_list[1];
+
+        // 5. Print the decoded info
+        std::cout << "TrieKey: key=0x" << current_slice.ToString(true)
+                  << " offset: " << offset
+                  << " size: " << size << std::endl;
+        std::flush(std::cout);
+      } else {
+        // 5. Print the decoded info
+        std::cout << "TrieKey: key=0x" << current_slice.ToString(true) << std::endl;
+        std::flush(std::cout);
+      }
+
+      rwlock_unlock_read(store->rwlock);
+    }
+
+    // 6. Advance
+    wh_iter_skip1(&it, false, true);
+  }
+
+  std::cout << "--- Traversal Finished ---" << std::endl;
+  std::flush(std::cout);
 }
 
 template <DivaType diva_type, PayloadType payload_type>
@@ -4402,16 +4505,17 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreamingSealFinish() {
     prev_seal_payload_ = nullptr;
   }
 
-  // Add 0xFF sentinel so GetLowerUpperBounds always finds a next_key.
-  // (0x00 was already inserted as the initial left boundary.)
-  // Match the max streamed key width so ordering stays consistent with user keys.
-  const uint32_t sentinel_len = bulk_load_streaming_max_len_
-                                    ? bulk_load_streaming_max_len_
-                                    : 1;
-  uint8_t *key_copy = new uint8_t[sentinel_len];
-  memset(key_copy, 0xFF, sentinel_len);
-  AddTreeKey(key_copy, sentinel_len);
-  delete[] key_copy;
+//  // Add 0xFF sentinel so GetLowerUpperBounds always finds a next_key.
+//  // (0x00 was already inserted as the initial left boundary.)
+//  // Match the max streamed key width so ordering stays consistent with user keys.
+//  const uint32_t sentinel_len = bulk_load_streaming_max_len_
+//                                    ? bulk_load_streaming_max_len_
+//                                    : 1;
+//  uint8_t *key_copy = new uint8_t[sentinel_len];
+//  memset(key_copy, 0xFF, sentinel_len);
+//  AddTreeKey(key_copy, sentinel_len);
+//  delete[] key_copy;
+  PrintTrieAndPayloads();
 }
 
 template <DivaType diva_type, PayloadType payload_type>
@@ -5457,7 +5561,9 @@ inline void Diva<diva_type, payload_type>::InsertRawIntoInfixStore(InfixStore &s
 
     const uint64_t implicit_part = key >> infix_size_;
     const uint64_t explicit_part = key & BITMASK(infix_size_);
-    const uint64_t implicit_scalar = implicit_scalars_[total_implicit - (sizes_[store.GetSizeGrade()] / 2)];
+    const uint64_t implicit_scalar_index = (total_implicit - (sizes_[store.GetSizeGrade()] / 2)) *
+                                           (max_infix_store_size / sizes_[store.GetSizeGrade()]);
+    const uint64_t implicit_scalar = implicit_scalars_[implicit_scalar_index];
 #ifdef DEBUG
     assert(implicit_part < total_implicit);
 #endif // DEBUG
@@ -5699,7 +5805,9 @@ inline void Diva<diva_type, payload_type>::DeleteRawFromInfixStore(InfixStore &s
 
     const uint64_t implicit_part = key >> infix_size_;
     const uint64_t explicit_part = key & BITMASK(infix_size_);
-    const uint64_t implicit_scalar = implicit_scalars_[total_implicit - (sizes_[size_grade] / 2)];
+    const uint64_t implicit_scalar_index = (total_implicit - (sizes_[store.GetSizeGrade()] / 2)) *
+                                           (max_infix_store_size / sizes_[store.GetSizeGrade()]);
+    const uint64_t implicit_scalar = implicit_scalars_[implicit_scalar_index];
 
     uint32_t current_implicit = implicit_part;
     const bool is_occupied = GetOccupiedBit(store, implicit_part);
@@ -5987,7 +6095,9 @@ Diva<diva_type, payload_type>::DeleteRawRangeFromInfixStore(InfixStore &store,
     const uint64_t explicit_part_l = (l_key & BITMASK(infix_size_)) - 1;  // Remove the age counter bit
     const uint64_t implicit_part_r = r_key >> infix_size_;
     const uint64_t explicit_part_r = r_key & BITMASK(infix_size_);
-    const uint64_t implicit_scalar = implicit_scalars_[total_implicit - (sizes_[size_grade] / 2)];
+    const uint64_t implicit_scalar_index = (total_implicit - (sizes_[store.GetSizeGrade()] / 2)) *
+                                           (max_infix_store_size / sizes_[store.GetSizeGrade()]);
+    const uint64_t implicit_scalar = implicit_scalars_[implicit_scalar_index];
 
     uint64_t *occupieds = store.ptr + num_metadata_offset_words;
     uint64_t *runends = store.ptr + num_metadata_offset_words + ((sizes_[size_grade] + 63) / 64);
@@ -6628,7 +6738,9 @@ inline void Diva<diva_type, payload_type>::LoadListToInfixStore(InfixStore &stor
 #ifdef DEBUG
     assert(total_implicit >= infix_store_target_size / 2);
 #endif // DEBUG
-    const uint64_t implicit_scalar = implicit_scalars_[total_implicit - sizes_[size_grade] / 2];
+    const uint64_t implicit_scalar_index = (total_implicit - (sizes_[store.GetSizeGrade()] / 2)) *
+                                           (max_infix_store_size / sizes_[store.GetSizeGrade()]);
+    const uint64_t implicit_scalar = implicit_scalars_[implicit_scalar_index];
 
     if (zero_out)
         store.Reset(total_size, infix_size_, payload_size_);
@@ -6722,7 +6834,9 @@ inline void Diva<diva_type, payload_type>::LoadVectorToInfixStore(InfixStore &st
 
     const uint32_t size_grade = store.GetSizeGrade();
     const uint32_t total_size = scaled_sizes_[size_grade];
-    const uint64_t implicit_scalar = implicit_scalars_[total_implicit - (sizes_[store.GetSizeGrade()] / 2)];
+    const uint64_t implicit_scalar_index = (total_implicit - (sizes_[store.GetSizeGrade()] / 2)) *
+                                           (max_infix_store_size / sizes_[store.GetSizeGrade()]);
+    const uint64_t implicit_scalar = implicit_scalars_[implicit_scalar_index];
     if (zero_out)
         store.Reset(total_size, infix_size_, payload_type == PayloadType::TrieOnly ? 0 : payload_size_);
 
