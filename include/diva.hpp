@@ -2463,21 +2463,16 @@ Diva<diva_type, payload_type>::GetSharedIgnoreImplicitLengths(const InfiniteByte
   if (share > max_shared_bits) share = max_shared_bits;
 
   // --- Ignore Loop ---
-  // If key_1 is a prefix of key_2, share == key1_bits, so ignore stays 0
+  // Keep original bit alignment semantics: start from the word where the first
+  // non-shared bit lives and skip that differing bit itself (+1 offset).
   if (share < key1_bits) {
-    ind = share / 64;
+    ind = (ind > 0) ? (ind - 1) : 0;
     do {
       const uint64_t read_1 = key_1.WordAt(ind * sizeof(uint64_t));
       const uint64_t read_2 = key_2.WordAt(ind * sizeof(uint64_t));
 
-      // Mask out bits already processed in 'share'
-      const uint32_t offset = (ind > share / 64 ? 0 : share % 64);
-
-      // Original logic: Find how many 1s in key_1 are 0s in key_2
-      uint64_t val = ((~read_1) | read_2);
-      if (offset > 0) val |= (BITMASK(offset) << (64 - offset));
-
-      delta = __builtin_ia32_lzcnt_u64(val);
+      const uint32_t offset = (ind > share / 64 ? 0 : (share % 64) + 1);
+      delta = __builtin_ia32_lzcnt_u64(((~read_1) | read_2) & BITMASK(64 - offset));
       ignore += (delta - offset);
       ind++;
     } while (delta == 64 && (ind * 64) < key1_bits);
@@ -4505,17 +4500,17 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreamingSealFinish() {
     prev_seal_payload_ = nullptr;
   }
 
-//  // Add 0xFF sentinel so GetLowerUpperBounds always finds a next_key.
-//  // (0x00 was already inserted as the initial left boundary.)
-//  // Match the max streamed key width so ordering stays consistent with user keys.
-//  const uint32_t sentinel_len = bulk_load_streaming_max_len_
-//                                    ? bulk_load_streaming_max_len_
-//                                    : 1;
-//  uint8_t *key_copy = new uint8_t[sentinel_len];
-//  memset(key_copy, 0xFF, sentinel_len);
-//  AddTreeKey(key_copy, sentinel_len);
-//  delete[] key_copy;
-  PrintTrieAndPayloads();
+  // Add 0xFF sentinel so GetLowerUpperBounds always finds a next_key.
+  // (0x00 was already inserted as the initial left boundary.)
+  // Match the max streamed key width so ordering stays consistent with user keys.
+  const uint32_t sentinel_len = bulk_load_streaming_max_len_
+                                    ? bulk_load_streaming_max_len_
+                                    : 1;
+  uint8_t *key_copy = new uint8_t[sentinel_len];
+  memset(key_copy, 0xFF, sentinel_len);
+  AddTreeKey(key_copy, sentinel_len);
+  delete[] key_copy;
+  // PrintTrieAndPayloads();
 }
 
 template <DivaType diva_type, PayloadType payload_type>
