@@ -398,17 +398,19 @@ private:
         InfixStore(InfixStore &&other) = default;
         InfixStore &operator=(const InfixStore &other) = default;
 
-        void Reset(const uint32_t slot_count, const uint32_t slot_size, const uint32_t payload_size=0) {
+        void Reset(const uint32_t slot_count, const uint32_t scaled_slot_count,
+                   const uint32_t slot_size, const uint32_t payload_size=0) {
 #ifdef DEBUG
             assert(ptr);
 #endif // DEBUG
-            memset(ptr, 0, GetPtrWordCount(slot_count, slot_size, payload_size) * sizeof(uint64_t));
+            memset(ptr, 0, GetPtrWordCount(slot_count, scaled_slot_count, slot_size,
+                                           payload_size) * sizeof(uint64_t));
         }
 
         static uint64_t GetPtrWordCount(const uint32_t slot_count,
                                         const uint32_t scaled_slot_count,
                                         const uint32_t slot_size,
-                                        const uint32_t payload_size=0) {
+                                        const uint32_t payload_size) {
           // 1. occupied bitmap words
           const uint64_t occupied_bitmap = (slot_count + 63) / 64;
 
@@ -6746,7 +6748,7 @@ inline void Diva<diva_type, payload_type>::LoadListToInfixStore(InfixStore &stor
     const uint64_t implicit_scalar = implicit_scalars_[implicit_scalar_index];
 
     if (zero_out)
-        store.Reset(total_size, infix_size_, payload_size_);
+        store.Reset(sizes_[size_grade], total_size, infix_size_, payload_size_);
     store.SetFullSlotCount(list_len);
     if (list_len == 0)
         return;
@@ -6841,7 +6843,8 @@ inline void Diva<diva_type, payload_type>::LoadVectorToInfixStore(InfixStore &st
                                            (max_infix_store_size / sizes_[store.GetSizeGrade()]);
     const uint64_t implicit_scalar = implicit_scalars_[implicit_scalar_index];
     if (zero_out)
-        store.Reset(total_size, infix_size_, payload_type == PayloadType::TrieOnly ? 0 : payload_size_);
+        store.Reset(sizes_[size_grade], total_size, infix_size_,
+                    payload_type == PayloadType::TrieOnly ? 0 : payload_size_);
 
     // Make sure everything is in increasing order
 #ifdef DEBUG
