@@ -164,7 +164,7 @@ public:
                                            const uint64_t *boundary_payload,
                                            const uint32_t boundary_payload_size);
     void BulkLoadStreamingSealFinish();
-    void PrintTrieAndPayloads();
+    void PrintTrieAndPayloads() const;
     uint64_t GetNumKeys() const;
 
     // Walk wormhole trie keys in sorted order (BinaryTrie only). Payload bits
@@ -1019,6 +1019,9 @@ inline void Diva<diva_type, payload_type>::GetLowerUpperBounds(const InfiniteByt
                                                                Diva<diva_type, payload_type>::InfixStore *& infix_store_ptr) const {
     const bool unlock = false;
 GetLowerUpperBoundsRetry:
+    prev_key = {nullptr, 0};
+    next_key = {nullptr, 0};
+    infix_store_ptr = nullptr;
     uint32_t l_ind = 0, r_ind = 0;
     InfixStore *dummy_infix_store_ptr;
     uint32_t dummy_val;
@@ -1612,6 +1615,11 @@ inline bool Diva<diva_type, payload_type>::PointQueryWithBoundary(
   wormhole_iter it;
   GetLowerUpperBounds(key, it_write_lock, leaves_to_unlock, it, it_int,
                       prev_key, next_key, infix_store_ptr);
+
+  if (prev_key.str == nullptr) {
+    UnlockLeaves(leaves_to_unlock, it_write_lock);
+    return false;
+  }
 
   uint64_t prev_key_word, next_key_word;
   if constexpr (diva_type == DivaType::Int) {
@@ -4152,7 +4160,6 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreaming(const uint8_t *key,
     n_keys_.fetch_add(target_infix_store_size, std::memory_order_release);
 }
 
-// if a payload is set here we expect that diva is configured with fixed length payloads
 template <DivaType diva_type, PayloadType payload_type>
 inline void Diva<diva_type, payload_type>::BulkLoadStreamingToCurrentInfix(
     const uint8_t *key, const uint32_t key_len) {
@@ -4272,15 +4279,11 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreamingSealWithBoundary(
   uint32_t infix_key_count = bulk_load_streaming_ind_;
   if (bulk_load_streaming_ind_ > 0) {
     const InfiniteByteString &last_key = segment_bulk_load_key_list_[bulk_load_streaming_ind_ - 1];
-    // print the last key and the boundary for debugging
-    std::string last_key_str(reinterpret_cast<const char *>(last_key.str), last_key.length);
-    std::string boundary_key_str(reinterpret_cast<const char *>(boundary_copy), boundary_key_len);
     if (last_key.length == boundary_key_len &&
         memcmp(last_key.str, boundary_copy, boundary_key_len) == 0) {
       infix_key_count = bulk_load_streaming_ind_ - 1;
     }
   }
-
   uint32_t allocation_size_grade = std::lower_bound(
                                        sizes_, sizes_ + size_scalar_count,
                                        static_cast<uint64_t>(infix_key_count)) - sizes_;
@@ -4395,7 +4398,7 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreamingSealWithBoundary(
 }
 
 template <DivaType diva_type, PayloadType payload_type>
-inline void Diva<diva_type, payload_type>::PrintTrieAndPayloads() {
+inline void Diva<diva_type, payload_type>::PrintTrieAndPayloads() const {
   // 1. Define Boundaries using Slices
   uint8_t start_buf[8];
   memset(start_buf, 0x00, 8);
@@ -4501,7 +4504,7 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreamingSealFinish() {
   }
 
   // Add 0xFF sentinel so GetLowerUpperBounds always finds a next_key.
-  // (0x00 was already inserted as the initial left boundary.)
+  // Add also 0x00 as the smallest key
   // Match the max streamed key width so ordering stays consistent with user keys.
   const uint32_t sentinel_len = bulk_load_streaming_max_len_
                                     ? bulk_load_streaming_max_len_
@@ -4510,6 +4513,11 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreamingSealFinish() {
   memset(key_copy, 0xFF, sentinel_len);
   AddTreeKey(key_copy, sentinel_len);
   delete[] key_copy;
+  // add also the key 0x00 so that there will always be the smallest key
+  uint8_t *zero_key_copy = new uint8_t[1];
+  memset(zero_key_copy, 0x00, 1);
+  AddTreeKey(zero_key_copy, 1);
+  delete[] zero_key_copy;
   // PrintTrieAndPayloads();
 }
 
