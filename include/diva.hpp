@@ -1739,14 +1739,10 @@ inline bool Diva<diva_type, payload_type>::PointQueryWithBoundary(
 template <DivaType diva_type, PayloadType payload_type>
 inline Diva<diva_type, payload_type>::TrieBoundaryCursor::TrieBoundaryCursor(const Diva *parent)
     : parent_(parent) {
-  if constexpr (diva_type == DivaType::BinaryTrie) {
-    it_.ref = parent_->better_tree_;
-    it_.map = parent_->better_tree_->map;
-    it_.leaf = nullptr;
-    it_.is = 0;
-  } else {
-    std::memset(&it_, 0, sizeof(it_));
-  }
+  it_.ref = parent_->better_tree_;
+  it_.map = parent_->better_tree_->map;
+  it_.leaf = nullptr;
+  it_.is = 0;
 }
 
 template <DivaType diva_type, PayloadType payload_type>
@@ -1785,9 +1781,6 @@ inline void Diva<diva_type, payload_type>::TrieBoundaryCursor::UnlockLeafIfNeede
 
 template <DivaType diva_type, PayloadType payload_type>
 inline void Diva<diva_type, payload_type>::TrieBoundaryCursor::SeekToFirst() {
-  if constexpr (diva_type != DivaType::BinaryTrie) {
-    return;
-  }
   UnlockLeafIfNeeded();
   static const bool write = false;
   wh_iter_seek(&it_, nullptr, 0, write);
@@ -1796,9 +1789,6 @@ inline void Diva<diva_type, payload_type>::TrieBoundaryCursor::SeekToFirst() {
 template <DivaType diva_type, PayloadType payload_type>
 inline void Diva<diva_type, payload_type>::TrieBoundaryCursor::SeekLowerBound(const uint8_t *key,
                                                                               uint32_t key_len) {
-  if constexpr (diva_type != DivaType::BinaryTrie) {
-    return;
-  }
   UnlockLeafIfNeeded();
   static const bool write = false;
   if (key_len == 0) {
@@ -1810,9 +1800,6 @@ inline void Diva<diva_type, payload_type>::TrieBoundaryCursor::SeekLowerBound(co
 
 template <DivaType diva_type, PayloadType payload_type>
 inline void Diva<diva_type, payload_type>::TrieBoundaryCursor::Next() {
-  if constexpr (diva_type != DivaType::BinaryTrie) {
-    return;
-  }
   static const bool write = false, unlock = true;
   if (wh_iter_valid(&it_)) {
     wh_iter_skip1(&it_, write, unlock);
@@ -1834,9 +1821,6 @@ inline bool Diva<diva_type, payload_type>::TrieBoundaryCursor::Prev() {
 
 template <DivaType diva_type, PayloadType payload_type>
 inline void Diva<diva_type, payload_type>::TrieBoundaryCursor::SeekToLast() {
-  if constexpr (diva_type != DivaType::BinaryTrie) {
-    return;
-  }
   SeekToFirst();
   if (!wh_iter_valid(&it_)) {
     return;
@@ -1861,9 +1845,6 @@ inline void Diva<diva_type, payload_type>::TrieBoundaryCursor::SeekToLast() {
 
 template <DivaType diva_type, PayloadType payload_type>
 inline bool Diva<diva_type, payload_type>::TrieBoundaryCursor::Valid() const {
-  if constexpr (diva_type != DivaType::BinaryTrie) {
-    return false;
-  }
   return wh_iter_valid(
       const_cast<wormhole_iter *>(&it_)); // wh_iter_valid takes non-const
 }
@@ -1872,9 +1853,6 @@ template <DivaType diva_type, PayloadType payload_type>
 inline bool Diva<diva_type, payload_type>::TrieBoundaryCursor::GetCurrent(std::vector<uint8_t> *out_key,
                                                                           uint64_t *out_payload,
                                                                           uint32_t payload_bits) {
-  if constexpr (diva_type != DivaType::BinaryTrie) {
-    return false;
-  }
   if (!wh_iter_valid(&it_)) {
     return false;
   }
@@ -4351,7 +4329,7 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreamingSealWithBoundary(
     }
   } else {
     if (infix_key_count > 0) {
-      LoadListToInfixStore(store, infix_list, infix_key_count, total_implicit,
+      LoadListToInfixStore(store, infix_list.data(), infix_key_count, total_implicit,
                            true, nullptr);
     }
   }
