@@ -6404,6 +6404,10 @@ inline int32_t Diva<diva_type, payload_type>::GetLongestMatchingInfixSize(const 
     if constexpr (diva_type == DivaType::BinaryTrie) {  // TODO: Figure out integration of this with payloads
         for (int32_t i = runstart_pos; i <= runend_pos; i++) {
             const uint64_t current_slot = GetSlot(store, i);
+            if (current_slot == 0) {
+                // BinaryTrie continuation/padding slots are non-canonical.
+                continue;
+            }
             const uint64_t mask = ((current_slot & -current_slot) << 1) - 1;
             if ((current_slot | mask) == (explicit_part | mask)) {
                 if (SlotHasTrie(store, i, runend_pos)) {
@@ -6477,14 +6481,21 @@ inline bool Diva<diva_type, payload_type>::RangeQueryInfixStore(InfixStore &stor
             const int32_t runend_pos = SelectRunends(store, rank);
             const int32_t runstart_pos = std::max<int32_t>(rank ? SelectRunends(store, rank - 1) : -1,
                                                            FindEmptySlotBefore(store, runend_pos)) + 1;
-            const uint64_t current_slot = GetSlot(store, runstart_pos);
+            int32_t first_pos = runstart_pos;
+            while (first_pos <= runend_pos && GetSlot(store, first_pos) == 0) {
+                ++first_pos;
+            }
+            if (first_pos > runend_pos) {
+                return false;
+            }
+            const uint64_t current_slot = GetSlot(store, first_pos);
             const uint64_t current_slot_l = current_slot & (current_slot - 1);
             if constexpr (diva_type == DivaType::BinaryTrie) {
                 if (current_slot_l <= r_explicit_part) {
-                    if (SlotHasTrie(store, runstart_pos, runend_pos)) {
+                    if (SlotHasTrie(store, first_pos, runend_pos)) {
                       const uint32_t aligned_occupied_bits = ((sizes_[store.GetSizeGrade()] + 63) / 64) * 64;
                       const Infix infix_to_query(store.ptr + num_metadata_offset_words,
-                                                 aligned_occupied_bits + scaled_store_size + infix_size_ * runstart_pos,
+                                                 aligned_occupied_bits + scaled_store_size + infix_size_ * first_pos,
                                                  infix_size_);
                         const uint32_t mask_size = lowbit_pos(infix_to_query.infix_) + 1;
                         const uint8_t zero_key[1] = {0};
@@ -6511,6 +6522,9 @@ inline bool Diva<diva_type, payload_type>::RangeQueryInfixStore(InfixStore &stor
             if constexpr (diva_type == DivaType::BinaryTrie) {
                 for (int32_t pos = runstart_pos; pos < runend_pos; pos++) {
                     const uint64_t current_slot = GetSlot(store, pos);
+                    if (current_slot == 0) {
+                        continue;
+                    }
                     const uint64_t current_slot_r = current_slot | (current_slot - 1);
                     if (SlotHasTrie(store, pos, runend_pos)) {
                       const uint32_t aligned_occupied_bits = ((sizes_[store.GetSizeGrade()] + 63) / 64) * 64;
@@ -6555,6 +6569,9 @@ inline bool Diva<diva_type, payload_type>::RangeQueryInfixStore(InfixStore &stor
                                                    FindEmptySlotBefore(store, runend_pos)) + 1;
     for (int32_t i = runstart_pos; i <= runend_pos; i++) {
         const uint64_t current_slot = GetSlot(store, i);
+        if (current_slot == 0) {
+            continue;
+        }
         const uint64_t current_slot_l = current_slot & (current_slot - 1);
         const uint64_t current_slot_r = current_slot | (current_slot - 1);
         if constexpr (diva_type == DivaType::BinaryTrie) {
@@ -6611,8 +6628,9 @@ inline bool Diva<diva_type, payload_type>::PointQueryInfixStore(InfixStore &stor
     const uint64_t explicit_part = key & BITMASK(infix_size_);
     const uint32_t size_grade = store.GetSizeGrade();
 
-    if (!GetOccupiedBit(store, implicit_part))
+    if (!GetOccupiedBit(store, implicit_part)) {
         return false;
+    }
 
     const uint32_t rank = RankOccupieds(store, implicit_part);
     const int32_t runend_pos = SelectRunends(store, rank);
@@ -6621,24 +6639,39 @@ inline bool Diva<diva_type, payload_type>::PointQueryInfixStore(InfixStore &stor
                                                        FindEmptySlotBefore(store, runend_pos)) + 1;
         for (int32_t i = runstart_pos; i <= runend_pos; i++) {
             const uint64_t slot_value = GetSlot(store, i);
-            const uint64_t mask = ((slot_value & (-slot_value)) << 1) - 1;
-            const uint32_t mask_size = lowbit_pos(slot_value) + 1;
-            if ((explicit_part | mask) == (slot_value | mask)) {
-                if (SlotHasTrie(store, i, runend_pos)) {
-                  const uint32_t aligned_occupied_bits = ((sizes_[size_grade] + 63) / 64) * 64;
-                  const Infix infix_to_query(store.ptr + num_metadata_offset_words,
-                                             aligned_occupied_bits + scaled_sizes_[size_grade] + (infix_size_ * i),
-                                             infix_size_);
-                    const uint32_t key_start_bit = original_key_start_bit + infix_size_ - mask_size;
-                    if (infix_to_query.QueryTrie(original_key, original_key, key_start_bit, infix_size_))
-                        return true;
-                    i += infix_to_query.GetNumSlots(infix_size_) - 1;
-                }
-                else 
-                    return true;
+            if (slot_value == 0) {
+                // BinaryTrie encodes continuation/padding words as zero; they are
+                // not canonical infix slots and should be ignored during scans.
+                continue;
             }
-            else if ((slot_value & (slot_value - 1)) > explicit_part - 1)
+
+            const bool has_trie = SlotHasTrie(store, i, runend_pos);
+            if (has_trie) {
+                const uint32_t aligned_occupied_bits = ((sizes_[size_grade] + 63) / 64) * 64;
+                const Infix infix_to_query(store.ptr + num_metadata_offset_words,
+                                           aligned_occupied_bits + scaled_sizes_[size_grade] + (infix_size_ * i),
+                                           infix_size_);
+                const uint64_t mask = ((slot_value & (-slot_value)) << 1) - 1;
+                const uint32_t mask_size = lowbit_pos(slot_value) + 1;
+                if ((explicit_part | mask) == (slot_value | mask)) {
+                    const uint32_t key_start_bit = original_key_start_bit + infix_size_ - mask_size;
+                    const bool trie_hit =
+                        infix_to_query.QueryTrie(original_key, original_key, key_start_bit, infix_size_);
+                    if (trie_hit)
+                        return true;
+                } else if ((slot_value & (slot_value - 1)) > explicit_part - 1) {
+                    break;
+                }
+                i += infix_to_query.GetNumSlots(infix_size_) - 1;
+                continue;
+            }
+
+            const uint64_t mask = ((slot_value & (-slot_value)) << 1) - 1;
+            if ((explicit_part | mask) == (slot_value | mask)) {
+                return true;
+            } else if ((slot_value & (slot_value - 1)) > explicit_part - 1) {
                 break;
+            }
         }
     }
     else {
