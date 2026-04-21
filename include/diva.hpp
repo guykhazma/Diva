@@ -4267,46 +4267,55 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreamingSealWithBoundary(
   uint32_t allocation_size_grade = std::lower_bound(
                                        sizes_, sizes_ + size_scalar_count,
                                        static_cast<uint64_t>(infix_key_count)) - sizes_;
-  std::vector<uint64_t> infix_list(infix_key_count);
+  std::vector<uint64_t> infix_list;
   std::vector<Infix> infix_vec;
-  uint32_t last_infix_pos = 0;
-  const auto [shared, ignore, implicit_size] =
-      GetSharedIgnoreImplicitLengths(bulk_load_left_key_, bulk_load_right_key, sizes_[allocation_size_grade]);
-  const uint32_t key_start_bit = shared + ignore + implicit_size + infix_size_ - 1;
-  const uint64_t prev_implicit =
-      ExtractPartialKey(bulk_load_left_key_, shared, ignore, implicit_size, 0) >> infix_size_;
-  const uint64_t next_implicit =
-      ExtractPartialKey(bulk_load_right_key, shared, ignore, implicit_size, 1) >> infix_size_;
-  const uint32_t total_implicit = next_implicit - prev_implicit + 1;
+  uint32_t total_implicit = 0;
 
-  for (uint32_t i = 0; i < infix_key_count; i++) {
-    const uint64_t extraction = ExtractPartialKey(segment_bulk_load_key_list_[i], shared, ignore, implicit_size,
-                                                  segment_bulk_load_key_list_[i].GetBit(shared));
-    infix_list[i] = ((extraction | 1ULL) - (prev_implicit << infix_size_));
+  auto rebuild_encoded_segment = [&](uint32_t grade) {
+    infix_list.assign(infix_key_count, 0);
+    infix_vec.clear();
+    uint32_t last_infix_pos = 0;
+    const auto [shared, ignore, implicit_size] =
+        GetSharedIgnoreImplicitLengths(bulk_load_left_key_, bulk_load_right_key, sizes_[grade]);
+    const uint32_t key_start_bit = shared + ignore + implicit_size + infix_size_ - 1;
+    const uint64_t prev_implicit =
+        ExtractPartialKey(bulk_load_left_key_, shared, ignore, implicit_size, 0) >> infix_size_;
+    const uint64_t next_implicit =
+        ExtractPartialKey(bulk_load_right_key, shared, ignore, implicit_size, 1) >> infix_size_;
+    total_implicit = static_cast<uint32_t>(next_implicit - prev_implicit + 1);
+
+    for (uint32_t i = 0; i < infix_key_count; i++) {
+      const uint64_t extraction =
+          ExtractPartialKey(segment_bulk_load_key_list_[i], shared, ignore, implicit_size,
+                            segment_bulk_load_key_list_[i].GetBit(shared));
+      infix_list[i] = ((extraction | 1ULL) - (prev_implicit << infix_size_));
+      if constexpr (diva_type == DivaType::BinaryTrie) {
+        segment_bulk_load_key_list_[i].length *= 8;
+        if (infix_list[last_infix_pos] != infix_list[i]) {
+          infix_vec.emplace_back(infix_list[last_infix_pos]);
+          if (i - last_infix_pos > 1) {
+            infix_vec.back().BuildTrieAndSuffixes(segment_bulk_load_key_list_.data() + last_infix_pos,
+                                                  i - last_infix_pos, key_start_bit, infix_size_,
+                                                  false, false, true);
+          }
+          last_infix_pos = i;
+        }
+      }
+    }
     if constexpr (diva_type == DivaType::BinaryTrie) {
-      segment_bulk_load_key_list_[i].length *= 8;
-      if (infix_list[last_infix_pos] != infix_list[i]) {
+      if (infix_key_count > 0) {
         infix_vec.emplace_back(infix_list[last_infix_pos]);
-        if (i - last_infix_pos > 1) {
+        if (infix_key_count - last_infix_pos > 1) {
           infix_vec.back().BuildTrieAndSuffixes(segment_bulk_load_key_list_.data() + last_infix_pos,
-                                                i - last_infix_pos, key_start_bit, infix_size_,
+                                                infix_key_count - last_infix_pos, key_start_bit, infix_size_,
                                                 false, false, true);
         }
-        last_infix_pos = i;
+        last_infix_pos = infix_key_count;
       }
     }
-  }
-  if constexpr (diva_type == DivaType::BinaryTrie) {
-    if (infix_key_count > 0) {
-      infix_vec.emplace_back(infix_list[last_infix_pos]);
-      if (infix_key_count - last_infix_pos > 1) {
-        infix_vec.back().BuildTrieAndSuffixes(segment_bulk_load_key_list_.data() + last_infix_pos,
-                                              infix_key_count - last_infix_pos, key_start_bit, infix_size_,
-                                              false, false, true);
-      }
-      last_infix_pos = infix_key_count;
-    }
-  }
+  };
+
+  rebuild_encoded_segment(allocation_size_grade);
 
   void *dummy_locked_leaf_addrs[3] = {nullptr, nullptr, nullptr};
   if constexpr (diva_type == DivaType::BinaryTrie) {
@@ -4314,10 +4323,12 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreamingSealWithBoundary(
     for (auto& infix : infix_vec) {
       num_slots_filled += infix.GetNumSlots(infix_size_);
     }
-    allocation_size_grade = std::lower_bound(sizes_, sizes_ + size_scalar_count, num_slots_filled) - sizes_;
-  }
-  if (allocation_size_grade == 54) {
-    int a = 0;
+    const uint32_t final_grade =
+        std::lower_bound(sizes_, sizes_ + size_scalar_count, num_slots_filled) - sizes_;
+    if (final_grade != allocation_size_grade) {
+      allocation_size_grade = final_grade;
+      rebuild_encoded_segment(allocation_size_grade);
+    }
   }
   // Use payload_size_ (0) so per-slot overhead is zero; block handle goes in ptr[1].
   InfixStore store(sizes_[allocation_size_grade], scaled_sizes_[allocation_size_grade], infix_size_,
@@ -4363,8 +4374,12 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreamingSealWithBoundary(
   // by SealFinish for the last boundary).
   save_boundary_payload();
 
-  // TODO: fix
-  const uint32_t sealed_key_count = static_cast<uint32_t>(infix_key_count) + 2;
+  // Count logical keys represented by this sealed segment:
+  //   - infix_key_count keys stored in this segment store, plus
+  //   - the right boundary key carried forward to be materialized next.
+  // Do not count the left boundary here; it was already accounted by the
+  // previous segment (or is synthetic for the first segment).
+  const uint32_t sealed_key_count = static_cast<uint32_t>(infix_key_count) + 1;
 
   // Advance left key to the boundary (NOT yet in trie; written on next call).
   delete[] bulk_load_left_key_.str;
