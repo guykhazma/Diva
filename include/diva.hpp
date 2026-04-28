@@ -5046,36 +5046,63 @@ IteratorRefetchLowerUpperBounds:
         goto IteratorRefetchLowerUpperBounds;
     }
 
-    const int32_t rank = filter_->RankOccupieds(infix_store, implicit_part_l);
-    const int32_t runend_pos = filter_->SelectRunends(infix_store, rank);
-    const int32_t runstart_pos = std::max(rank ? static_cast<int32_t>(filter_->SelectRunends(infix_store, rank - 1)) : -1,
-                                          static_cast<int32_t>(filter_->FindEmptySlotBefore(infix_store, runend_pos))) + 1;
-    const uint64_t recovered_implicit = prev_implicit + implicit_part_l;
-    explicit_part_r = implicit_part_l == implicit_part_r ? explicit_part_r 
-                                                         : BITMASK(filter_->infix_size_);
-    for (int32_t pos = runstart_pos; pos <= runend_pos; pos++) {
-        const uint64_t slot_value = filter_->GetSlot(infix_store, pos);
+    // Captured-by-reference walk of one bucket's run of slots. Pushes
+    // matching infix entries (and payloads) into `infixes_` / `bit_counts_`
+    // / `payloads_`. `bucket_explicit_part_l` is the lower explicit-part
+    // bound for this bucket (extraction_l's explicit part for the first
+    // bucket; 0 for any subsequent bucket walked inline because we then
+    // start at the bucket boundary).
+    const uint64_t orig_explicit_part_r = explicit_part_r;
+    auto walk_bucket = [&](uint64_t bucket_idx, uint64_t bucket_explicit_part_l) {
+        const int32_t rank = filter_->RankOccupieds(infix_store, bucket_idx);
+        const int32_t runend_pos = filter_->SelectRunends(infix_store, rank);
+        const int32_t runstart_pos = std::max(rank ? static_cast<int32_t>(filter_->SelectRunends(infix_store, rank - 1)) : -1,
+                                              static_cast<int32_t>(filter_->FindEmptySlotBefore(infix_store, runend_pos))) + 1;
+        const uint64_t recovered_implicit = prev_implicit + bucket_idx;
+        const uint64_t bucket_explicit_part_r = (bucket_idx == implicit_part_r)
+                                                    ? orig_explicit_part_r
+                                                    : BITMASK(filter_->infix_size_);
+        for (int32_t pos = runstart_pos; pos <= runend_pos; pos++) {
+            const uint64_t slot_value = filter_->GetSlot(infix_store, pos);
 #ifdef DEBUG
-        assert(slot_value);
+            assert(slot_value);
 #endif // DEBUG
-        const uint64_t slot_l = slot_value & (slot_value - 1);
-        const uint64_t slot_r = slot_value | (slot_value - 1);
-        if (slot_r >= explicit_part_l && slot_l <= explicit_part_r) {
-            const uint32_t explicit_part_length = filter_->infix_size_ - lowbit_pos(slot_value) - 1;
+            const uint64_t slot_l = slot_value & (slot_value - 1);
+            const uint64_t slot_r = slot_value | (slot_value - 1);
+            if (slot_r >= bucket_explicit_part_l && slot_l <= bucket_explicit_part_r) {
+                const uint32_t explicit_part_length = filter_->infix_size_ - lowbit_pos(slot_value) - 1;
 #ifdef DEBUG
-            assert(explicit_part_length <= filter_->infix_size_);
+                assert(explicit_part_length <= filter_->infix_size_);
 #endif // DEBUG
-            infixes_.push_back((recovered_implicit << filter_->infix_size_) | slot_value);
-            bit_counts_.push_back(shared + ignore + implicit_size + explicit_part_length);
-            if constexpr (payload_type == PayloadType::FixedLength) {
-                payloads_.resize((filter_->payload_size_ * infixes_.size() + 63) / 64 + 1);
-                filter_->GetPayload(infix_store, pos, payloads_.data(), filter_->payload_size_ * (infixes_.size() - 1));
+                infixes_.push_back((recovered_implicit << filter_->infix_size_) | slot_value);
+                bit_counts_.push_back(shared + ignore + implicit_size + explicit_part_length);
+                if constexpr (payload_type == PayloadType::FixedLength) {
+                    payloads_.resize((filter_->payload_size_ * infixes_.size() + 63) / 64 + 1);
+                    filter_->GetPayload(infix_store, pos, payloads_.data(), filter_->payload_size_ * (infixes_.size() - 1));
+                }
             }
         }
-    }
+    };
 
-    // Update `next_to_fetch_`
+    walk_bucket(implicit_part_l, explicit_part_l);
+
+    // Update `next_to_fetch_`. If the next occupied bucket within this store
+    // is the boundary bucket (total_implicit - 1), walk it inline now and
+    // then transition to the next store via `next_key` directly.
+    // Reason: SetNextToFetchFromExtraction would otherwise produce a
+    // `next_to_fetch_` whose significant bits encode `next_key` but whose
+    // byte length is rounded up (extra trailing zero bytes) for byte
+    // alignment. Because InfiniteByteString comparison falls back to
+    // byte-length tiebreaking, the next Fetch would treat that key as
+    // strictly past the boundary and skip the sample-payload push for the
+    // next store. Walking the boundary bucket here keeps its slots and
+    // lets us hand a clean, byte-faithful `next_key` to the next Fetch.
     implicit_part_l = filter_->NextOccupied(infix_store, implicit_part_l);
+    if (implicit_part_l == total_implicit - 1
+        && implicit_part_l <= implicit_part_r) {
+        walk_bucket(implicit_part_l, /*bucket_explicit_part_l=*/0);
+        implicit_part_l = filter_->NextOccupied(infix_store, implicit_part_l);
+    }
     if (implicit_part_l <= std::min(implicit_part_r, total_implicit - 1)) {
         const uint64_t recovered_extraction = (prev_implicit + implicit_part_l) << filter_->infix_size_;
         SetNextToFetchFromExtraction(prev_key, recovered_extraction);
