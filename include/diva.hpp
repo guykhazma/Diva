@@ -95,6 +95,24 @@ public:
     void Insert(uint64_t key, const void *payload=nullptr, uint32_t random_number=0);
     void Insert(std::string_view key, const void *payload=nullptr, uint32_t random_number=0);
     void Insert(const uint8_t *key, const uint32_t key_len, const void *payload=nullptr, uint32_t random_number=0);
+
+    // InsertAfterPayload: locate an existing entry for `key` whose payload
+    // bytes equal `target_payload` (compared over the lower `payload_size_`
+    // bits) and insert `new_payload` immediately after it in iteration
+    // order. Returns true on success, false if `key` is not present or
+    // `target_payload` is not found.
+    //
+    // Currently only the trie-sample case is implemented (prev_key == key
+    // in the wormhole trie); the infix-store case will follow.
+    //
+    // Used by GC to preserve the relative order of versions of the same
+    // user_key when a moved version is re-inserted (so the consumer's
+    // reverse-iteration "newer-first" semantic remains correct).
+    bool InsertAfterPayload(std::string_view key, const void *new_payload,
+                            const void *target_payload);
+    bool InsertAfterPayload(const uint8_t *key, uint32_t key_len,
+                            const void *new_payload,
+                            const void *target_payload);
     void Delete(uint64_t key, std::function<bool(const uint64_t *)> should_remove=nullptr);
     void Delete(std::string_view input_key, std::function<bool(const uint64_t *)> should_remove=nullptr);
     void Delete(const uint8_t *input_key, const uint32_t input_key_len, std::function<bool(const uint64_t *)> should_remove=nullptr);
@@ -382,6 +400,12 @@ private:
     void AddTreeKey(const uint8_t *key, const uint32_t key_len, const uint64_t *payload=nullptr);
     void InsertSimple(const InfiniteByteString key, const void *payload=nullptr);
     uint32_t InsertSplit(const InfiniteByteString key, const void *payload=nullptr);
+    bool InsertAfterPayloadInInfixStore(InfixStore &infix_store,
+                                         const InfiniteByteString &prev_key,
+                                         const InfiniteByteString &next_key,
+                                         const InfiniteByteString &key,
+                                         const void *new_payload,
+                                         const void *target_payload);
     void DeleteMerge(InfiniteByteString key);
     template <class t_itr>
     void BulkLoadFixedLength(t_itr begin, t_itr end, const uint32_t key_len, const uint64_t **payloads=nullptr);
@@ -1029,6 +1053,279 @@ inline void Diva<int_optimized, payload_type>::Insert(const uint8_t *key, const 
     else 
         InsertSimple(converted_key, payload);
     n_keys_.fetch_add(num_keys_added, std::memory_order_release);
+}
+
+template <bool int_optimized, PayloadType payload_type>
+inline bool Diva<int_optimized, payload_type>::InsertAfterPayload(
+        std::string_view key, const void *new_payload, const void *target_payload) {
+    return InsertAfterPayload(reinterpret_cast<const uint8_t *>(key.data()),
+                              static_cast<uint32_t>(key.size()), new_payload,
+                              target_payload);
+}
+
+template <bool int_optimized, PayloadType payload_type>
+inline bool Diva<int_optimized, payload_type>::InsertAfterPayload(
+        const uint8_t *key, uint32_t key_len,
+        const void *new_payload, const void *target_payload) {
+    if constexpr (payload_type != PayloadType::FixedLength) {
+        // Only fixed-length-payload mode has a meaningful payload to compare.
+        return false;
+    }
+    const InfiniteByteString converted_key {key, key_len};
+
+    const bool it_write_lock = false;
+    InfixStore *infix_store_ptr;
+    void *leaves_to_unlock[3] = {};
+    InfiniteByteString next_key {};
+    InfiniteByteString prev_key {};
+    wormhole_int_iter it_int;
+    wormhole_iter it;
+    GetLowerUpperBounds(converted_key, it_write_lock, leaves_to_unlock, it,
+                        it_int, prev_key, next_key, infix_store_ptr);
+    uint64_t prev_key_word, next_key_word;
+    if constexpr (int_optimized) {
+        prev_key_word = *reinterpret_cast<const uint64_t *>(prev_key.str);
+        prev_key.str = reinterpret_cast<const uint8_t *>(&prev_key_word);
+        next_key_word = *reinterpret_cast<const uint64_t *>(next_key.str);
+        next_key.str = reinterpret_cast<const uint8_t *>(&next_key_word);
+    }
+
+    rwlock_lock_write(infix_store_ptr->rwlock);
+    InfixStore& infix_store = *infix_store_ptr;
+    UnlockLeaves(leaves_to_unlock, it_write_lock);
+
+    if (!(prev_key == converted_key)) {
+        // Infix-store case: key is between two trie samples. Find the slot
+        // whose payload matches `target_payload`, then insert at slot+1.
+        return InsertAfterPayloadInInfixStore(infix_store, prev_key, next_key,
+                                              converted_key, new_payload,
+                                              target_payload);
+    }
+
+    // Trie-sample case: find the position of the existing payload that
+    // matches `target_payload` byte-for-byte over the lower payload_size_
+    // bits, then insert `new_payload` immediately after it.
+    const uint32_t num_payloads = infix_store.num_sample_payloads;
+    if (num_payloads == 0) {
+        rwlock_unlock_write(infix_store.rwlock);
+        return false;
+    }
+
+    // Stack buffer big enough for typical payload sizes (16 * 64 = 1024 bits).
+    constexpr uint32_t kProbeBufWords = 16;
+    const uint32_t payload_u64s = (payload_size_ + 63) / 64;
+    if (payload_u64s > kProbeBufWords) {
+        rwlock_unlock_write(infix_store.rwlock);
+        return false;
+    }
+    uint64_t probe_buf[kProbeBufWords];
+
+    // Helper: do the lower payload_size_ bits of `a` equal those of `b`?
+    auto payload_bits_equal = [&](const void *a, const void *b) -> bool {
+        const uint32_t full_bytes = payload_size_ / 8;
+        if (full_bytes > 0 && std::memcmp(a, b, full_bytes) != 0) {
+            return false;
+        }
+        const uint32_t rem_bits = payload_size_ % 8;
+        if (rem_bits > 0) {
+            const uint8_t mask = static_cast<uint8_t>((1u << rem_bits) - 1u);
+            const uint8_t aa =
+                reinterpret_cast<const uint8_t *>(a)[full_bytes] & mask;
+            const uint8_t bb =
+                reinterpret_cast<const uint8_t *>(b)[full_bytes] & mask;
+            if (aa != bb) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    uint32_t target_pos = UINT32_MAX;
+    for (uint32_t i = 0; i < num_payloads; i++) {
+        std::memset(probe_buf, 0, sizeof(probe_buf));
+        GetSamplePayload(infix_store, i, probe_buf, 0);
+        if (payload_bits_equal(probe_buf, target_payload)) {
+            target_pos = i;
+            break;
+        }
+    }
+    if (target_pos == UINT32_MAX) {
+        rwlock_unlock_write(infix_store.rwlock);
+        return false;
+    }
+
+    // Grow the payload list by one slot.
+    uint64_t *payload_list = reinterpret_cast<uint64_t *>(infix_store.ptr[1]);
+    const uint32_t new_total_bits = (num_payloads + 1) * payload_size_;
+    const uint32_t new_total_words = (new_total_bits + 63) / 64;
+    payload_list = reinterpret_cast<uint64_t *>(
+        realloc(payload_list, new_total_words * sizeof(uint64_t)));
+
+    // Shift payloads at positions [target_pos+1 .. num_payloads-1] right by
+    // one slot to open a hole at position target_pos+1.
+    const uint32_t shift_l = (target_pos + 1) * payload_size_;
+    const uint32_t shift_r_exclusive = num_payloads * payload_size_;
+    if (shift_r_exclusive > shift_l) {
+        // Use the aligned variant: payload_list is a freshly-realloc'd
+        // uint64_t array, so word-aligned access is safe. (The unaligned
+        // variant has a memcpy size bug — uses sizeof(int32) instead of
+        // sizeof(uint64) for the destination read/write.)
+        shift_bitmap_right(payload_list, shift_l,
+                           shift_r_exclusive - 1, payload_size_);
+    }
+
+    // Write new_payload into the hole.
+    copy_bitmap_to_bitmap(reinterpret_cast<const uint64_t *>(new_payload), 0,
+                          payload_list, shift_l, payload_size_);
+
+    infix_store.num_sample_payloads++;
+    infix_store.ptr[1] = reinterpret_cast<uint64_t>(payload_list);
+    rwlock_unlock_write(infix_store.rwlock);
+    return true;
+}
+
+template <bool int_optimized, PayloadType payload_type>
+inline bool Diva<int_optimized, payload_type>::InsertAfterPayloadInInfixStore(
+        InfixStore &infix_store,
+        const InfiniteByteString &prev_key,
+        const InfiniteByteString &next_key,
+        const InfiniteByteString &key,
+        const void *new_payload, const void *target_payload) {
+    if constexpr (payload_type != PayloadType::FixedLength) {
+        rwlock_unlock_write(infix_store.rwlock);
+        return false;
+    }
+
+    // Compute the (implicit_part, explicit_part) for `key` against the
+    // surrounding (prev_key, next_key) trie boundaries — same arithmetic as
+    // InsertSimple's infix-store path.
+    auto [shared, ignore, implicit_size] =
+        GetSharedIgnoreImplicitLengths(prev_key, next_key);
+    const uint64_t extraction =
+        ExtractPartialKey(key, shared, ignore, implicit_size, key.GetBit(shared));
+    const uint64_t prev_implicit =
+        ExtractPartialKey(prev_key, shared, ignore, implicit_size, 0)
+        >> infix_size_;
+    const uint64_t next_implicit =
+        ExtractPartialKey(next_key, shared, ignore, implicit_size, 1)
+        >> infix_size_;
+    const uint32_t total_implicit = next_implicit - prev_implicit + 1;
+    const uint64_t insertee = ((extraction | 1ULL) - (prev_implicit << infix_size_));
+
+    const uint64_t implicit_part = insertee >> infix_size_;
+
+    // Make sure there's room (mirrors InsertRawIntoInfixStore's resize check).
+    {
+        uint32_t size_grade = infix_store.GetSizeGrade();
+        const uint64_t elem_count = infix_store.GetElemCount();
+        if (elem_count >= (size_grade ? scaled_sizes_[size_grade - 1]
+                                       : exception_scaled_size_)) {
+            ResizeInfixStore(infix_store, total_implicit);
+        }
+    }
+    const uint32_t size_grade = infix_store.GetSizeGrade();
+    const uint64_t implicit_scalar =
+        implicit_scalars_[total_implicit - infix_store_target_size / 2];
+
+    uint32_t *popcnts = reinterpret_cast<uint32_t *>(infix_store.ptr);
+    uint64_t *occupieds = infix_store.ptr + 2;
+    uint64_t *runends = infix_store.ptr + 2 + infix_store_target_size / 64;
+
+    if (!get_bitmap_bit(occupieds, implicit_part)) {
+        // No entries for this key's bucket → no possible target match.
+        rwlock_unlock_write(infix_store.rwlock);
+        return false;
+    }
+
+    const int32_t mapped_pos =
+        GetMappedPos(implicit_part, size_grade, implicit_scalar);
+    const uint32_t key_rank = RankOccupieds(infix_store, implicit_part);
+    const int32_t runend_pos = SelectRunends(infix_store, key_rank);
+    const int32_t previous_empty = FindEmptySlotBefore(infix_store, mapped_pos);
+    const int32_t run_start =
+        std::max(PreviousRunend(infix_store, runend_pos), previous_empty) + 1;
+
+    // Walk slots in [run_start..runend_pos], compare each slot's payload
+    // bytes against target_payload, find the first match.
+    constexpr uint32_t kProbeBufWords = 16;
+    const uint32_t payload_u64s = (payload_size_ + 63) / 64;
+    if (payload_u64s > kProbeBufWords) {
+        rwlock_unlock_write(infix_store.rwlock);
+        return false;
+    }
+    uint64_t probe_buf[kProbeBufWords];
+
+    auto payload_bits_equal = [&](const void *a, const void *b) -> bool {
+        const uint32_t full_bytes = payload_size_ / 8;
+        if (full_bytes > 0 && std::memcmp(a, b, full_bytes) != 0) {
+            return false;
+        }
+        const uint32_t rem_bits = payload_size_ % 8;
+        if (rem_bits > 0) {
+            const uint8_t mask = static_cast<uint8_t>((1u << rem_bits) - 1u);
+            const uint8_t aa =
+                reinterpret_cast<const uint8_t *>(a)[full_bytes] & mask;
+            const uint8_t bb =
+                reinterpret_cast<const uint8_t *>(b)[full_bytes] & mask;
+            if (aa != bb) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    int32_t target_pos = -1;
+    for (int32_t pos = run_start; pos <= runend_pos; ++pos) {
+        std::memset(probe_buf, 0, sizeof(probe_buf));
+        GetPayload(infix_store, pos, probe_buf, 0);
+        if (payload_bits_equal(probe_buf, target_payload)) {
+            target_pos = pos;
+            break;
+        }
+    }
+    if (target_pos < 0) {
+        rwlock_unlock_write(infix_store.rwlock);
+        return false;
+    }
+
+    // Insert at slot `target_pos + 1`. Replicate the existing-bucket shift
+    // logic from InsertRawIntoInfixStore.
+    const int32_t r = target_pos + 1;
+    const int32_t next_empty = FindEmptySlotAfter(infix_store, mapped_pos);
+    const uint64_t explicit_part = insertee & BITMASK(infix_size_);
+
+    if (next_empty < static_cast<int32_t>(scaled_sizes_[size_grade])) {
+        ShiftSlotsRight(infix_store, r, next_empty, 1);
+        ShiftPayloadsRight(infix_store, r, next_empty, 1);
+        ShiftRunendsRight(infix_store, runend_pos, next_empty, 1);
+        if (runend_pos < static_cast<int32_t>(infix_store_target_size / 2) &&
+            static_cast<int32_t>(infix_store_target_size / 2) <= next_empty) {
+            popcnts[1] -=
+                get_bitmap_bit(runends, infix_store_target_size / 2);
+        }
+        SetSlot(infix_store, r, explicit_part);
+        SetPayload(infix_store, r,
+                   reinterpret_cast<const uint64_t *>(new_payload), 0);
+    } else {
+        ShiftSlotsLeft(infix_store, previous_empty + 1, r, 1);
+        ShiftPayloadsLeft(infix_store, previous_empty + 1, r, 1);
+        if (previous_empty + 1 <= static_cast<int32_t>(infix_store_target_size / 2) &&
+            static_cast<int32_t>(infix_store_target_size / 2) <
+                std::min(runend_pos, r)) {
+            popcnts[1] +=
+                get_bitmap_bit(runends, infix_store_target_size / 2);
+        }
+        ShiftRunendsLeft(infix_store, previous_empty + 1,
+                         std::min(runend_pos, r), 1);
+        SetSlot(infix_store, r - 1, explicit_part);
+        SetPayload(infix_store, r - 1,
+                   reinterpret_cast<const uint64_t *>(new_payload), 0);
+    }
+    infix_store.UpdateElemCount(1);
+
+    rwlock_unlock_write(infix_store.rwlock);
+    n_keys_.fetch_add(1, std::memory_order_release);
+    return true;
 }
 
 template <bool int_optimized, PayloadType payload_type>

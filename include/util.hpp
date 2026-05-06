@@ -254,6 +254,20 @@ inline void move_bitmap_right(uint64_t *ptr, const uint32_t l, const uint32_t r,
 
 
 //__attribute__((always_inline))
+//
+// KNOWN BUG (do not call this function — has no production callers today):
+//   The two memcpy calls below use `sizeof(dst_bit_pos)` (4 bytes, since
+//   dst_bit_pos is int32_t) instead of `sizeof(val)` (8 bytes, since val is
+//   uint64_t). The read leaves the upper 32 bits of `val` as uninitialized
+//   stack garbage; the subsequent mask/OR then operates on that garbage; and
+//   the write only flushes 4 bytes back, leaving the upper 32 bits of the
+//   destination word untouched. The function is broken for any shift that
+//   straddles a 32-bit boundary inside a 64-bit word.
+//   The sister function `move_bitmap_left_unaligned` (a few lines below)
+//   uses `sizeof(val)` correctly. The aligned variants `move_bitmap_right`
+//   / `shift_bitmap_right` are also correct (they index `ptr` directly).
+//   Use those instead, or fix this one (replace both `sizeof(dst_bit_pos)`
+//   with `sizeof(val)`) before relying on the unaligned right shift.
 inline void move_bitmap_right_unaligned(uint64_t *ptr, const uint32_t l, const uint32_t r, const uint32_t shamt) {
     const int32_t l_src_bit_pos = l;
     int32_t r_src_bit_pos = r;
