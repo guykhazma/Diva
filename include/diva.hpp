@@ -77,8 +77,21 @@ class Diva {
     friend class InfixStoreTests;
 
 public:
+    // `file_number_offset_bits`: width of the per-payload FOR offset
+    // (file_number - InfixStore.reference). 0 = legacy mode (no FOR patching;
+    // payload bytes pass through opaquely). Non-zero enables the FOR-aware
+    // insert path (see Insert overloads' `raw_file_number`).
+    //
+    // `for_field_bit_pos`: starting bit position of the FOR field within a
+    // single payload entry. UINT32_MAX (default) means "infer as
+    // payload_size - file_number_offset_bits", which is correct only when
+    // the FOR field is the very topmost field. When the caller's payload
+    // layout reserves bits above the FOR field (e.g. for a debug shadow),
+    // the position must be passed explicitly.
     Diva(const uint32_t infix_size, const uint32_t rng_seed, const float load_factor,
-         const uint32_t payload_size=0, const bool setup_start_end_samples=false);
+         const uint32_t payload_size=0, const bool setup_start_end_samples=false,
+         const uint32_t file_number_offset_bits=0,
+         const uint32_t for_field_bit_pos=UINT32_MAX);
 
     template <class t_itr>
     Diva(const uint32_t infix_size, const t_itr begin, const t_itr end, const uint32_t key_len,
@@ -86,7 +99,7 @@ public:
          const uint32_t payload_size=0, const uint64_t **payload_list=nullptr);
 
     template <class t_itr>
-    Diva(const uint32_t infix_size, const t_itr begin, const t_itr end, 
+    Diva(const uint32_t infix_size, const t_itr begin, const t_itr end,
          const uint32_t rng_seed, const float load_factor,
          const uint32_t payload_size=0, const uint64_t **payload_list=nullptr);
 
@@ -94,9 +107,18 @@ public:
 
     ~Diva();
 
-    void Insert(uint64_t key, const void *payload=nullptr, uint32_t random_number=0);
-    void Insert(std::string_view key, const void *payload=nullptr, uint32_t random_number=0);
-    void Insert(const uint8_t *key, const uint32_t key_len, const void *payload=nullptr, uint32_t random_number=0);
+    // `raw_file_number` is the absolute file number for this entry. When the
+    // Diva instance was constructed with `file_number_offset_bits > 0`, Diva
+    // computes the FOR offset against the destination InfixStore's reference
+    // (or initializes the reference for an empty store) and patches the high
+    // bits of the payload buffer before insertion. With `file_number_offset_bits == 0`
+    // the parameter is ignored — caller-side encoding is left intact.
+    void Insert(uint64_t key, const void *payload=nullptr, uint32_t random_number=0,
+                uint32_t raw_file_number=0);
+    void Insert(std::string_view key, const void *payload=nullptr, uint32_t random_number=0,
+                uint32_t raw_file_number=0);
+    void Insert(const uint8_t *key, const uint32_t key_len, const void *payload=nullptr,
+                uint32_t random_number=0, uint32_t raw_file_number=0);
 
     // InsertAfterPayload: locate an existing entry for `key` whose payload
     // bytes equal `target_payload` (compared over the lower `payload_size_`
@@ -110,11 +132,19 @@ public:
     // Used by GC to preserve the relative order of versions of the same
     // user_key when a moved version is re-inserted (so the consumer's
     // reverse-iteration "newer-first" semantic remains correct).
+    // `raw_file_number` is the absolute file number of `new_payload`.
+    // `target_raw_file_number` is the absolute file number of the entry
+    // we're matching against (`target_payload`); Diva uses it to FOR-patch
+    // the target's FOR field before byte-comparing on-disk entries.
     bool InsertAfterPayload(std::string_view key, const void *new_payload,
-                            const void *target_payload);
+                            const void *target_payload,
+                            uint32_t raw_file_number=0,
+                            uint32_t target_raw_file_number=0);
     bool InsertAfterPayload(const uint8_t *key, uint32_t key_len,
                             const void *new_payload,
-                            const void *target_payload);
+                            const void *target_payload,
+                            uint32_t raw_file_number=0,
+                            uint32_t target_raw_file_number=0);
     void Delete(uint64_t key, std::function<bool(const uint64_t *)> should_remove=nullptr);
     void Delete(std::string_view input_key, std::function<bool(const uint64_t *)> should_remove=nullptr);
     void Delete(const uint8_t *input_key, const uint32_t input_key_len, std::function<bool(const uint64_t *)> should_remove=nullptr);
@@ -125,6 +155,31 @@ public:
     void DeleteRange(const uint8_t *input_l, const uint32_t input_l_len,
                      const uint8_t *input_r, const uint32_t input_r_len,
                      std::function<bool(const uint64_t *)> should_remove=nullptr);
+
+    // FOR-aware delete primitives (FixedLength payloads only).
+    //
+    // `DeleteByPayloadInStore`: delete all entries in the destination
+    // InfixStore for `key` whose payload (lower bits = offset + tombstone)
+    // byte-equals `target_payload` after Diva patches the FOR field using
+    // the store's reference. `raw_file_number` is the absolute file number
+    // of the entry to delete; Diva computes the FOR offset internally.
+    // Returns true if at least one entry was deleted.
+    bool DeleteByPayloadInStore(std::string_view key,
+                                const uint64_t *target_payload,
+                                uint32_t raw_file_number);
+    bool DeleteByPayloadInStore(const uint8_t *key, const uint32_t key_len,
+                                const uint64_t *target_payload,
+                                uint32_t raw_file_number);
+
+    // `DeleteRangeWithReference`: same shape as DeleteRange but the
+    // predicate is invoked with the source InfixStore's reference_file_number
+    // alongside each payload, so the lambda can decode the absolute
+    // file_number = reference + FOR_offset on the fly.
+    void DeleteRangeWithReference(
+        const uint8_t *input_l, const uint32_t input_l_len,
+        const uint8_t *input_r, const uint32_t input_r_len,
+        std::function<bool(const uint64_t *, uint32_t reference_file_number)>
+            should_remove);
     bool RangeQuery(uint64_t l, uint64_t r) const;
     bool RangeQuery(std::string_view input_l, std::string_view input_r) const;
     bool RangeQuery(const uint8_t *input_l, const uint32_t input_l_len,
@@ -135,9 +190,13 @@ public:
     void ShrinkInfixSize(const uint32_t new_infix_size);
     uint64_t Size() const;
     uint32_t Serialize(char *out) const;
-    void BulkLoadStreaming(uint64_t key, const uint64_t *payload=nullptr);
-    void BulkLoadStreaming(std::string_view key, const uint64_t *payload=nullptr);
-    void BulkLoadStreaming(const uint8_t *key, const uint32_t key_len, const uint64_t *payload=nullptr);
+    void BulkLoadStreaming(uint64_t key, const uint64_t *payload=nullptr,
+                           uint32_t raw_file_number=0);
+    void BulkLoadStreaming(std::string_view key, const uint64_t *payload=nullptr,
+                           uint32_t raw_file_number=0);
+    void BulkLoadStreaming(const uint8_t *key, const uint32_t key_len,
+                           const uint64_t *payload=nullptr,
+                           uint32_t raw_file_number=0);
     void BulkLoadStreamingFinish();
     uint64_t GetNumKeys() const;
 
@@ -229,6 +288,12 @@ public:
         void SetDeleteFunction(std::function<bool(const uint64_t *)> should_remove);
         bool IsValid() const;
 
+        // Frame-of-reference base for the InfixStore that produced the current
+        // batch of yielded payloads. Caller adds this to the FOR offset
+        // decoded from the payload to recover the absolute file_number.
+        // Returns 0 in legacy / Pass-A mode.
+        uint32_t GetReferenceFileNumber() const { return fetched_reference_file_number_; }
+
     private:
         static constexpr uint32_t iterator_local_buf_len = 1 << 10;
         Diva<int_optimized, payload_type> *filter_;
@@ -241,6 +306,7 @@ public:
         uint32_t ind_ = 0;
         std::function<bool(const uint64_t *)> should_remove_;
         bool first_store_to_fetched_and_delete_ = true;
+        uint32_t fetched_reference_file_number_ = 0;
 
         Iterator(Diva<int_optimized, payload_type> *parent,
                  std::string_view start, std::string_view end,
@@ -302,6 +368,11 @@ private:
         uint16_t num_sample_payloads = 0;
         alignas(alignof(std::atomic<lock_t>)) std::atomic<lock_t> rwlock{0};
         uint64_t *ptr = nullptr;
+        // Frame-of-reference base for this store's payloads: every payload's
+        // file_number is encoded as a 16-bit offset from this value. Set once
+        // when the store is allocated (= min file_number across the entries
+        // that initialize it). Inserts into an existing store reuse this base.
+        uint32_t reference_file_number = 0;
 
         InfixStore(const uint32_t slot_count, const uint32_t slot_size,
                    const uint32_t size_grade, const uint32_t payload_size=0) {
@@ -317,9 +388,13 @@ private:
                     status(other.status),
                     num_sample_payloads(other.num_sample_payloads),
                     rwlock(0),
-                    ptr(other.ptr) { 
+                    ptr(other.ptr),
+                    reference_file_number(other.reference_file_number) {
             rwlock.store(0, std::memory_order::memory_order_release);
         }
+
+        uint32_t GetReferenceFileNumber() const { return reference_file_number; }
+        void SetReferenceFileNumber(uint32_t v) { reference_file_number = v; }
         InfixStore(InfixStore &&other) = default;
         InfixStore &operator=(const InfixStore &other) = default;
 
@@ -383,6 +458,17 @@ private:
 
     uint32_t infix_size_;
     uint32_t payload_size_;
+    // FOR offset width in bits. 0 = legacy mode (no FOR patching; payload
+    // bytes pass through opaquely). Set at construction; immutable thereafter.
+    uint32_t file_number_offset_bits_ = 0;
+    // Starting bit position of the FOR field within a single payload entry.
+    // Computed at construction. See ctor comment for details.
+    uint32_t for_field_bit_pos_ = 0;
+    // Thread-local: the source InfixStore's reference_file_number for the
+    // *most recently invoked* should_remove call on the calling thread.
+    // Updated by `Iterator::FetchDelete` before each predicate call. Lambdas
+    // that need the source ref read it via `GetCurrentIteratorReference()`.
+    inline static thread_local uint32_t iterator_current_reference_ = 0;
     wormhole *wh_;
     wormref *better_tree_;
     wormhole_int *wh_int_;
@@ -401,14 +487,18 @@ private:
     uint64_t *bulk_load_left_payload_ = nullptr, *bulk_load_payload_list_ = nullptr;
 
     void AddTreeKey(const uint8_t *key, const uint32_t key_len, const uint64_t *payload=nullptr);
-    void InsertSimple(const InfiniteByteString key, const void *payload=nullptr);
-    uint32_t InsertSplit(const InfiniteByteString key, const void *payload=nullptr);
+    void InsertSimple(const InfiniteByteString key, const void *payload=nullptr,
+                      uint32_t raw_file_number=0);
+    uint32_t InsertSplit(const InfiniteByteString key, const void *payload=nullptr,
+                         uint32_t raw_file_number=0);
     bool InsertAfterPayloadInInfixStore(InfixStore &infix_store,
                                          const InfiniteByteString &prev_key,
                                          const InfiniteByteString &next_key,
                                          const InfiniteByteString &key,
                                          const void *new_payload,
-                                         const void *target_payload);
+                                         const void *target_payload,
+                                         uint32_t raw_file_number=0,
+                                         uint32_t target_raw_file_number=0);
     void DeleteMerge(InfiniteByteString key);
     template <class t_itr>
     void BulkLoadFixedLength(t_itr begin, t_itr end, const uint32_t key_len, const uint64_t **payloads=nullptr);
@@ -523,6 +613,51 @@ private:
     InfixStore AllocateInfixStoreWithList(const uint64_t *list, const uint32_t list_len,
                                           const uint32_t total_implicit=infix_store_target_size,
                                           const uint64_t *payload_list=nullptr);
+
+    // Read the ref captured by the most recent `Iterator::FetchDelete`
+    // step on this thread. Lambdas passed to DeleteRangeWithReference call
+    // this to recover the source store's FOR base.
+    static uint32_t GetCurrentIteratorReference() { return iterator_current_reference_; }
+
+    // FOR helpers (no-ops when `file_number_offset_bits_ == 0`).
+    //
+    // `PatchPayloadFOR`: caller holds the destination store's write lock.
+    // Patches the FOR field bits of `payload` in place. If the store is empty
+    // (first-ever insert), initializes its reference to `raw_file_number` and
+    // writes 0 as the FOR offset. Otherwise computes
+    // `for_offset = raw_file_number - store.reference_file_number` and writes
+    // it. Aborts if `raw_file_number < store.reference_file_number` or the
+    // resulting offset doesn't fit in `file_number_offset_bits_`.
+    void PatchPayloadFOR(InfixStore &store, uint64_t *payload, uint32_t raw_file_number);
+
+    // For single-key insert paths: returns a pointer to a payload that is
+    // safe to pass to the lower-level insert (AddSamplePayload /
+    // InsertRawIntoInfixStore). When file_number_offset_bits_ == 0 or
+    // `payload` is null, returns `payload` unchanged. Otherwise copies
+    // `payload` into `working_buf`, calls PatchPayloadFOR, returns
+    // `working_buf`. `working_buf_words` must be at least
+    // (payload_size_ + 63) / 64.
+    const uint64_t* MaybePatchPayloadForFOR(InfixStore &store,
+                                            const uint64_t *payload,
+                                            uint64_t *working_buf,
+                                            uint32_t working_buf_words,
+                                            uint32_t raw_file_number);
+
+    // `RebasePayloadListFOR`: scans `payload_list` (a packed bitmap of
+    // `list_len` entries, each `payload_size_` bits wide) for the minimum
+    // FOR offset; subtracts that minimum from every entry's FOR field in
+    // place; returns the new reference (`old_reference + min_offset`).
+    // Used by store-rebuild paths that take payloads encoded against
+    // `old_reference` and produce a freshly-based new store.
+    uint32_t RebasePayloadListFOR(uint64_t *payload_list, uint32_t list_len,
+                                  uint32_t old_reference);
+
+    // Low-level FOR field accessors. The FOR field occupies the high
+    // `file_number_offset_bits_` of the payload — bits
+    // [payload_size_ - file_number_offset_bits_, payload_size_).
+    uint32_t ReadFOROffsetFromPayload(const uint64_t *payload, uint32_t entry_index) const;
+    void WriteFOROffsetToPayload(uint64_t *payload, uint32_t entry_index,
+                                 uint32_t for_offset) const;
     uint32_t GetInfixList(const InfixStore &store, uint64_t *res, uint64_t *res_payload=nullptr) const;
     std::tuple<uint32_t, bool> GetExpandedInfixListLength(const uint64_t *list, const uint32_t list_len,
                                                           const uint32_t implicit_size, const uint32_t shamt,
@@ -559,13 +694,22 @@ public:
 template <bool int_optimized, PayloadType payload_type>
 inline Diva<int_optimized, payload_type>::Diva(const uint32_t infix_size, const uint32_t rng_seed,
                                                const float load_factor, const uint32_t payload_size,
-                                               const bool setup_start_end_samples):
+                                               const bool setup_start_end_samples,
+                                               const uint32_t file_number_offset_bits,
+                                               const uint32_t for_field_bit_pos):
             wh_(nullptr),
             better_tree_(nullptr),
             wh_int_(nullptr),
             better_tree_int_(nullptr),
             infix_size_(infix_size),
             payload_size_(0),
+            file_number_offset_bits_(file_number_offset_bits),
+            for_field_bit_pos_(
+                for_field_bit_pos == UINT32_MAX
+                    ? (file_number_offset_bits == 0
+                           ? 0u
+                           : payload_size - file_number_offset_bits)
+                    : for_field_bit_pos),
             rng_seed_(rng_seed),
             load_factor_(load_factor),
             load_factor_alt_(load_factor),
@@ -1030,46 +1174,54 @@ inline void Diva<int_optimized, payload_type>::UnlockLeaves(void *leaves[3], boo
 template <bool int_optimized, PayloadType payload_type>
 inline void Diva<int_optimized, payload_type>::Insert(uint64_t key,
                                                       const void *payload,
-                                                      uint32_t random_number) {
+                                                      uint32_t random_number,
+                                                      uint32_t raw_file_number) {
     key = __builtin_bswap64(key);
-    Insert(reinterpret_cast<const uint8_t *>(&key), sizeof(key), payload, random_number);
+    Insert(reinterpret_cast<const uint8_t *>(&key), sizeof(key), payload,
+           random_number, raw_file_number);
 }
 
 
 template <bool int_optimized, PayloadType payload_type>
 inline void Diva<int_optimized, payload_type>::Insert(std::string_view key,
                                                       const void *payload,
-                                                      uint32_t random_number) {
-    Insert(reinterpret_cast<const uint8_t *>(key.data()), key.size(), payload, random_number);
+                                                      uint32_t random_number,
+                                                      uint32_t raw_file_number) {
+    Insert(reinterpret_cast<const uint8_t *>(key.data()), key.size(), payload,
+           random_number, raw_file_number);
 }
 
 
 template <bool int_optimized, PayloadType payload_type>
 inline void Diva<int_optimized, payload_type>::Insert(const uint8_t *key, const uint32_t key_len,
                                                       const void *payload,
-                                                      uint32_t random_number) {
+                                                      uint32_t random_number,
+                                                      uint32_t raw_file_number) {
     const InfiniteByteString converted_key {key, static_cast<uint32_t>(key_len)};
     random_number = random_number == 0 ? rng_() : random_number;
     uint32_t num_keys_added = 1;
     if (random_number % infix_store_target_size == 0)
-        num_keys_added += InsertSplit(converted_key, payload);
+        num_keys_added += InsertSplit(converted_key, payload, raw_file_number);
     else
-        InsertSimple(converted_key, payload);
+        InsertSimple(converted_key, payload, raw_file_number);
     n_keys_.fetch_add(num_keys_added, std::memory_order_release);
 }
 
 template <bool int_optimized, PayloadType payload_type>
 inline bool Diva<int_optimized, payload_type>::InsertAfterPayload(
-        std::string_view key, const void *new_payload, const void *target_payload) {
+        std::string_view key, const void *new_payload, const void *target_payload,
+        uint32_t raw_file_number, uint32_t target_raw_file_number) {
     return InsertAfterPayload(reinterpret_cast<const uint8_t *>(key.data()),
                               static_cast<uint32_t>(key.size()), new_payload,
-                              target_payload);
+                              target_payload, raw_file_number,
+                              target_raw_file_number);
 }
 
 template <bool int_optimized, PayloadType payload_type>
 inline bool Diva<int_optimized, payload_type>::InsertAfterPayload(
         const uint8_t *key, uint32_t key_len,
-        const void *new_payload, const void *target_payload) {
+        const void *new_payload, const void *target_payload,
+        uint32_t raw_file_number, uint32_t target_raw_file_number) {
     if constexpr (payload_type != PayloadType::FixedLength) {
         // Only fixed-length-payload mode has a meaningful payload to compare.
         return false;
@@ -1102,7 +1254,8 @@ inline bool Diva<int_optimized, payload_type>::InsertAfterPayload(
         // whose payload matches `target_payload`, then insert at slot+1.
         return InsertAfterPayloadInInfixStore(infix_store, prev_key, next_key,
                                               converted_key, new_payload,
-                                              target_payload);
+                                              target_payload, raw_file_number,
+                                              target_raw_file_number);
     }
 
     // Trie-sample case: find the position of the existing payload that
@@ -1113,6 +1266,21 @@ inline bool Diva<int_optimized, payload_type>::InsertAfterPayload(
         rwlock_unlock_write(infix_store.rwlock);
         return false;
     }
+
+    // FOR-patch writable copies of both `new_payload` (the new entry to
+    // insert) and `target_payload` (the entry to match) against the
+    // destination store's reference. No-op in legacy mode.
+    constexpr uint32_t kForSampleBufWords = 16;
+    uint64_t for_sample_buf[kForSampleBufWords];
+    uint64_t for_target_buf[kForSampleBufWords];
+    const uint64_t* effective_new_payload = MaybePatchPayloadForFOR(
+        infix_store, reinterpret_cast<const uint64_t *>(new_payload),
+        for_sample_buf, kForSampleBufWords, raw_file_number);
+    new_payload = static_cast<const void *>(effective_new_payload);
+    const uint64_t* effective_target_payload = MaybePatchPayloadForFOR(
+        infix_store, reinterpret_cast<const uint64_t *>(target_payload),
+        for_target_buf, kForSampleBufWords, target_raw_file_number);
+    target_payload = static_cast<const void *>(effective_target_payload);
 
     // Stack buffer big enough for typical payload sizes (16 * 64 = 1024 bits).
     constexpr uint32_t kProbeBufWords = 16;
@@ -1193,11 +1361,29 @@ inline bool Diva<int_optimized, payload_type>::InsertAfterPayloadInInfixStore(
         const InfiniteByteString &prev_key,
         const InfiniteByteString &next_key,
         const InfiniteByteString &key,
-        const void *new_payload, const void *target_payload) {
+        const void *new_payload, const void *target_payload,
+        uint32_t raw_file_number,
+        uint32_t target_raw_file_number) {
     if constexpr (payload_type != PayloadType::FixedLength) {
         rwlock_unlock_write(infix_store.rwlock);
         return false;
     }
+
+    // FOR-patch writable copies of both `new_payload` (the new entry to
+    // insert) and `target_payload` (the entry to match against on-disk
+    // payloads) against the destination store's reference. No-op in legacy
+    // mode.
+    constexpr uint32_t kForPatchBufWords = 16;
+    uint64_t for_patch_buf[kForPatchBufWords];
+    uint64_t for_target_buf[kForPatchBufWords];
+    const uint64_t* effective_new_payload = MaybePatchPayloadForFOR(
+        infix_store, reinterpret_cast<const uint64_t *>(new_payload),
+        for_patch_buf, kForPatchBufWords, raw_file_number);
+    new_payload = static_cast<const void *>(effective_new_payload);
+    const uint64_t* effective_target_payload = MaybePatchPayloadForFOR(
+        infix_store, reinterpret_cast<const uint64_t *>(target_payload),
+        for_target_buf, kForPatchBufWords, target_raw_file_number);
+    target_payload = static_cast<const void *>(effective_target_payload);
 
     // Compute the (implicit_part, explicit_part) for `key` against the
     // surrounding (prev_key, next_key) trie boundaries — same arithmetic as
@@ -1333,7 +1519,8 @@ inline bool Diva<int_optimized, payload_type>::InsertAfterPayloadInInfixStore(
 
 template <bool int_optimized, PayloadType payload_type>
 inline void Diva<int_optimized, payload_type>::InsertSimple(const InfiniteByteString key,
-                                                            const void *payload) {
+                                                            const void *payload,
+                                                            uint32_t raw_file_number) {
     const bool it_write_lock = false;
     InfixStore *infix_store_ptr;
     void *leaves_to_unlock[3] = {};
@@ -1357,9 +1544,18 @@ inline void Diva<int_optimized, payload_type>::InsertSimple(const InfiniteByteSt
     InfixStore& infix_store = *infix_store_ptr;
     UnlockLeaves(leaves_to_unlock, it_write_lock);
 
+    // Stack working buffer for FOR-patched payload. Sized for any realistic
+    // payload (1024 bits). MaybePatchPayloadForFOR returns the original
+    // pointer when FOR mode is off, so this is a true no-op in legacy mode.
+    constexpr uint32_t kForPatchBufWords = 16;
+    uint64_t for_patch_buf[kForPatchBufWords];
+    const uint64_t* effective_payload = MaybePatchPayloadForFOR(
+        infix_store, reinterpret_cast<const uint64_t *>(payload),
+        for_patch_buf, kForPatchBufWords, raw_file_number);
+
     if (prev_key == key) {
         // Add new sample payload
-        AddSamplePayload(infix_store, payload);
+        AddSamplePayload(infix_store, effective_payload);
         rwlock_unlock_write(infix_store.rwlock);
         return;
     }
@@ -1371,7 +1567,7 @@ inline void Diva<int_optimized, payload_type>::InsertSimple(const InfiniteByteSt
     const uint32_t total_implicit = next_implicit - prev_implicit + 1;
     const uint64_t insertee = ((extraction | 1ULL) - (prev_implicit << infix_size_));
     if constexpr (payload_type == PayloadType::FixedLength)
-        InsertRawIntoInfixStore(infix_store, insertee, total_implicit, reinterpret_cast<const uint64_t *>(payload));
+        InsertRawIntoInfixStore(infix_store, insertee, total_implicit, effective_payload);
     else
         InsertRawIntoInfixStore(infix_store, insertee, total_implicit);
     rwlock_unlock_write(infix_store.rwlock);
@@ -1553,15 +1749,16 @@ inline void Diva<int_optimized, payload_type>::AddTreeKey(const uint8_t *key, co
     }
     void *dummy_locked_leaf_addrs[3] = {nullptr, nullptr, nullptr};
     if constexpr (int_optimized)
-        wh_int_put(better_tree_int_, key, key_len, &infix_store, sizeof(infix_store), dummy_locked_leaf_addrs);
+        wh_int_put(better_tree_int_, key, key_len, &infix_store, sizeof(InfixStore), dummy_locked_leaf_addrs);
     else
-        wh_put(better_tree_, key, key_len, &infix_store, sizeof(infix_store), dummy_locked_leaf_addrs);
+        wh_put(better_tree_, key, key_len, &infix_store, sizeof(InfixStore), dummy_locked_leaf_addrs);
 }
 
 
 template <bool int_optimized, PayloadType payload_type>
 inline uint32_t Diva<int_optimized, payload_type>::InsertSplit(const InfiniteByteString key,
-                                                               const void *payload) {
+                                                               const void *payload,
+                                                               uint32_t raw_file_number) {
     const bool it_write_lock = true;
     InfixStore *infix_store_ptr;
     void *leaves_to_unlock[3] = {};
@@ -1584,9 +1781,17 @@ inline uint32_t Diva<int_optimized, payload_type>::InsertSplit(const InfiniteByt
     rwlock_lock_write(infix_store_ptr->rwlock);
     InfixStore& infix_store = *infix_store_ptr;
 
+    // Stack working buffer for FOR-patched payloads (samples + the new key
+    // added to the right-side store). Sized for any realistic payload.
+    constexpr uint32_t kForSplitBufWords = 16;
+    uint64_t for_split_buf[kForSplitBufWords];
+
     if (prev_key == key) {
-        // Add new sample payload
-        AddSamplePayload(infix_store, payload);
+        // Trie-sample: patch payload against the existing store's reference.
+        const uint64_t* effective_payload = MaybePatchPayloadForFOR(
+            infix_store, reinterpret_cast<const uint64_t *>(payload),
+            for_split_buf, kForSplitBufWords, raw_file_number);
+        AddSamplePayload(infix_store, effective_payload);
         rwlock_unlock_write(infix_store.rwlock);
         UnlockLeaves(leaves_to_unlock, it_write_lock);
         return 0;
@@ -1754,6 +1959,12 @@ inline uint32_t Diva<int_optimized, payload_type>::InsertSplit(const InfiniteByt
                                                      left_payload_list);
     store_lt.SetInvalidBits(infix_store.GetInvalidBits());
     store_lt.SetPartialKey(infix_store.IsPartialKey());
+    // Inherit the source's FOR base. The split's left/right payloads are
+    // already encoded against `infix_store.reference_file_number`, so each
+    // new store stays consistent without a rebase. (A future optimization
+    // would compute a tighter ref and rebase entries, deferring the
+    // rebuild-on-overflow case.)
+    store_lt.reference_file_number = infix_store.reference_file_number;
     if constexpr (payload_type == PayloadType::FixedLength) {
         // Set the sample's payload
         store_lt.ptr[1] = infix_store.ptr[1];
@@ -1762,9 +1973,16 @@ inline uint32_t Diva<int_optimized, payload_type>::InsertSplit(const InfiniteByt
                                                      right_list_len,
                                                      total_implicit_gt,
                                                      right_payload_list);
+    store_gt.reference_file_number = infix_store.reference_file_number;
     if constexpr (payload_type == PayloadType::FixedLength) {
-        // Set the sample's payload
-        AddSamplePayload(store_gt, reinterpret_cast<const uint64_t *>(payload));
+        // The new key is added as `store_gt`'s sample payload. Patch the FOR
+        // field against store_gt's reference (just inherited from source) —
+        // if store_gt is empty (right_list_len == 0), this also initializes
+        // its reference from raw_file_number.
+        const uint64_t* effective_new_payload = MaybePatchPayloadForFOR(
+            store_gt, reinterpret_cast<const uint64_t *>(payload),
+            for_split_buf, kForSplitBufWords, raw_file_number);
+        AddSamplePayload(store_gt, effective_new_payload);
     }
 
     auto *ptr_to_free = infix_store.ptr;
@@ -2377,10 +2595,10 @@ inline Diva<int_optimized, payload_type>::Diva(const char *deser_buf):
 #ifdef DEBUG
             assert(1 <= key_length && key_length <= sizeof(uint64_t));
 #endif
-            wh_int_put(better_tree_int_, key, key_length, &store, sizeof(store), dummy_locked_leaf_addrs);
+            wh_int_put(better_tree_int_, key, key_length, &store, sizeof(InfixStore), dummy_locked_leaf_addrs);
         }
         else
-            wh_put(better_tree_, key, key_length, &store, sizeof(store), dummy_locked_leaf_addrs);
+            wh_put(better_tree_, key, key_length, &store, sizeof(InfixStore), dummy_locked_leaf_addrs);
 
         memcpy(&key_length, deser_buf + ind, sizeof(key_length));
         ind += sizeof(key_length);
@@ -2555,6 +2773,8 @@ inline void Diva<int_optimized, payload_type>::Delete(const uint8_t *input_key, 
 
     if (prev_key == key) {
         if constexpr (payload_type == PayloadType::FixedLength) {
+            // Expose store's FOR base to ref-aware predicates.
+            iterator_current_reference_ = infix_store.reference_file_number;
             uint64_t payload[(payload_size_ + 63) / 64 + 1];
             bool removed = false;
             for (uint32_t i = 0; i < infix_store.num_sample_payloads; i++) {
@@ -2620,7 +2840,7 @@ inline void Diva<int_optimized, payload_type>::DeleteRange(const uint8_t *input_
                                                            const uint8_t *input_r, const uint32_t input_r_len,
                                                            std::function<bool(const uint64_t *)> should_remove) {
     auto it = GetIterator(input_l, input_l_len, input_r, input_r_len,
-                          should_remove ? should_remove 
+                          should_remove ? should_remove
                                         : [](const uint64_t *payload) { return true; });
     uint64_t i = 0;
     while (it.IsValid()) {
@@ -2630,6 +2850,86 @@ inline void Diva<int_optimized, payload_type>::DeleteRange(const uint8_t *input_
         malloc_trim(0);
       }
     }
+}
+
+
+// FOR-aware overload: the predicate receives the source InfixStore's
+// reference_file_number alongside the payload, recovered via
+// `GetCurrentIteratorReference()` (set by `Iterator::FetchDelete` /
+// `DeleteRaw*FromInfixStore` before each predicate invocation).
+template <bool int_optimized, PayloadType payload_type>
+inline void Diva<int_optimized, payload_type>::DeleteRangeWithReference(
+    const uint8_t *input_l, const uint32_t input_l_len,
+    const uint8_t *input_r, const uint32_t input_r_len,
+    std::function<bool(const uint64_t *, uint32_t)> should_remove) {
+    DeleteRange(input_l, input_l_len, input_r, input_r_len,
+                [pred = std::move(should_remove)](const uint64_t *payload) {
+                    return pred(payload, GetCurrentIteratorReference());
+                });
+}
+
+
+template <bool int_optimized, PayloadType payload_type>
+inline bool Diva<int_optimized, payload_type>::DeleteByPayloadInStore(
+        std::string_view key, const uint64_t *target_payload,
+        uint32_t raw_file_number) {
+    return DeleteByPayloadInStore(reinterpret_cast<const uint8_t *>(key.data()),
+                                  static_cast<uint32_t>(key.size()),
+                                  target_payload, raw_file_number);
+}
+
+
+// Delete the entry in the destination InfixStore for `key` whose payload
+// (lower offset+tombstone bits) byte-equals `target_payload` after Diva
+// patches the FOR field with the encoded offset of `raw_file_number`.
+//
+// Reuses DeleteRange under the hood with a byte-comparison lambda that
+// captures a per-store-encoded copy of the target. The encoding happens
+// inside the lambda on first invocation when the iterator's current
+// reference is known via `GetCurrentIteratorReference()`. Range is
+// `[key, key]` so we hit exactly one store.
+template <bool int_optimized, PayloadType payload_type>
+inline bool Diva<int_optimized, payload_type>::DeleteByPayloadInStore(
+        const uint8_t *key, const uint32_t key_len,
+        const uint64_t *target_payload, uint32_t raw_file_number) {
+    if constexpr (payload_type != PayloadType::FixedLength) {
+        return false;
+    }
+    bool any_deleted = false;
+    const uint32_t buf_words = (payload_size_ + 63) / 64;
+    const size_t payload_bits = payload_size_;
+    // Working buffer for the FOR-patched target. Captured by the lambda;
+    // patched on the first invocation once we know the source store's ref.
+    auto target_buf = std::make_shared<std::vector<uint64_t>>(buf_words, 0);
+    auto patched = std::make_shared<bool>(false);
+
+    DeleteRange(key, key_len, key, key_len,
+                [this, target_payload, raw_file_number, payload_bits,
+                 buf_words, target_buf, patched, &any_deleted]
+                (const uint64_t *payload) {
+                    if (!*patched) {
+                        const uint32_t ref = GetCurrentIteratorReference();
+                        memcpy(target_buf->data(), target_payload,
+                               buf_words * sizeof(uint64_t));
+                        if (file_number_offset_bits_ > 0) {
+                            assert(raw_file_number >= ref &&
+                                   "DeleteByPayloadInStore: raw_file_number < store.ref");
+                            const uint64_t delta =
+                                static_cast<uint64_t>(raw_file_number) - ref;
+                            assert(delta < (1ULL << file_number_offset_bits_) &&
+                                   "DeleteByPayloadInStore: FOR offset overflow");
+                            WriteFOROffsetToPayload(target_buf->data(),
+                                                    /*entry_index=*/0,
+                                                    static_cast<uint32_t>(delta));
+                        }
+                        *patched = true;
+                    }
+                    const bool match = compare_bitmap_to_bitmap(
+                        payload, 0, target_buf->data(), 0, payload_bits);
+                    if (match) any_deleted = true;
+                    return match;
+                });
+    return any_deleted;
 }
 
 
@@ -2694,7 +2994,42 @@ inline void Diva<int_optimized, payload_type>::DeleteMerge(InfiniteByteString ke
     }
     GetInfixList(*store_l, infix_list, payload_list);
     GetInfixList(*store_r, infix_list + store_l->GetElemCount(), right_payload_list);
+    // Merged-store reference: pick min(ref_l, ref_r). Shift each side's
+    // FOR-encoded payloads by the constant delta needed to rebase against
+    // the new ref. store_l's sample payloads (inherited via store.ptr[1]
+    // below) also need shifting if store_l's delta is non-zero — handled
+    // after the merge.
+    uint32_t merged_reference = 0;
+    uint32_t delta_l = 0;
+    uint32_t delta_r = 0;
     if constexpr (payload_type == PayloadType::FixedLength) {
+        merged_reference = std::min(store_l->reference_file_number,
+                                    store_r->reference_file_number);
+        delta_l = store_l->reference_file_number - merged_reference;
+        delta_r = store_r->reference_file_number - merged_reference;
+        const uint32_t max_offset = file_number_offset_bits_ > 0
+            ? static_cast<uint32_t>((1ULL << file_number_offset_bits_) - 1) : 0;
+        if (file_number_offset_bits_ > 0 && delta_l > 0) {
+            for (uint32_t i = 0; i < store_l->GetElemCount(); i++) {
+                const uint32_t off = ReadFOROffsetFromPayload(payload_list, i);
+                const uint64_t shifted = static_cast<uint64_t>(off) + delta_l;
+                assert(shifted <= max_offset &&
+                       "DeleteMerge: FOR offset overflow on store_l shift");
+                WriteFOROffsetToPayload(payload_list, i,
+                                        static_cast<uint32_t>(shifted));
+            }
+        }
+        if (file_number_offset_bits_ > 0 && delta_r > 0) {
+            for (uint32_t i = 0; i < store_r->GetElemCount(); i++) {
+                const uint32_t off = ReadFOROffsetFromPayload(right_payload_list, i);
+                const uint64_t shifted = static_cast<uint64_t>(off) + delta_r;
+                assert(shifted <= max_offset &&
+                       "DeleteMerge: FOR offset overflow on store_r shift");
+                WriteFOROffsetToPayload(right_payload_list, i,
+                                        static_cast<uint32_t>(shifted));
+            }
+        }
+        (void)max_offset;
         copy_bitmap_to_bitmap(right_payload_list, 0,
                               payload_list, payload_size_ * store_l->GetElemCount(),
                               payload_size_ * store_r->GetElemCount());
@@ -2780,9 +3115,33 @@ inline void Diva<int_optimized, payload_type>::DeleteMerge(InfiniteByteString ke
 
     InfixStore store = AllocateInfixStoreWithList(infix_list, total_elem_count, total_implicit, payload_list);
     if constexpr (payload_type == PayloadType::FixedLength) {
-        // Make sure the sample payload list is moved
+        // Move store_l's sample payloads onto the new store. If the merged
+        // ref shifted away from store_l's ref, those samples are encoded
+        // against the OLD store_l ref and need rebasing.
         store.ptr[1] = store_l->ptr[1];
+        if (file_number_offset_bits_ > 0 && delta_l > 0 &&
+            store_l->num_sample_payloads > 0) {
+            uint64_t* sample_payloads =
+                reinterpret_cast<uint64_t*>(store.ptr[1]);
+            const uint32_t max_offset =
+                static_cast<uint32_t>((1ULL << file_number_offset_bits_) - 1);
+            for (uint32_t i = 0; i < store_l->num_sample_payloads; i++) {
+                const uint32_t off =
+                    ReadFOROffsetFromPayload(sample_payloads, i);
+                const uint64_t shifted = static_cast<uint64_t>(off) + delta_l;
+                assert(shifted <= max_offset &&
+                       "DeleteMerge: FOR offset overflow on sample shift");
+                WriteFOROffsetToPayload(sample_payloads, i,
+                                        static_cast<uint32_t>(shifted));
+            }
+            (void)max_offset;
+        }
     }
+    // Set the merged store's FOR base to min(ref_l, ref_r). Both halves'
+    // payloads (and store_l's samples) have been rebased against this above.
+    store.reference_file_number = (payload_type == PayloadType::FixedLength)
+                                       ? merged_reference
+                                       : 0;
 
     store.SetInvalidBits(store_l->GetInvalidBits());
     store.SetPartialKey(store_l->IsPartialKey());
@@ -2984,9 +3343,9 @@ inline void Diva<int_optimized, payload_type>::BulkLoadFixedLength(const t_itr b
             else 
                 LoadListToInfixStore(store, infix_list, infix_store_target_size - 1, total_implicit);
             if constexpr (int_optimized)
-                wh_int_put(better_tree_int_, left_key.str, left_key.length, &store, sizeof(store), dummy_locked_leaf_addrs);
+                wh_int_put(better_tree_int_, left_key.str, left_key.length, &store, sizeof(InfixStore), dummy_locked_leaf_addrs);
             else
-                wh_put(better_tree_, left_key.str, left_key.length, &store, sizeof(store), dummy_locked_leaf_addrs);
+                wh_put(better_tree_, left_key.str, left_key.length, &store, sizeof(InfixStore), dummy_locked_leaf_addrs);
 
             if constexpr (int_optimized)
                 int_opt_buf[0] = int_opt_buf[1];
@@ -3061,9 +3420,9 @@ inline void Diva<int_optimized, payload_type>::BulkLoadFixedLength(const t_itr b
         else
             LoadListToInfixStore(store, infix_list, i, total_implicit);
         if constexpr (int_optimized)
-            wh_int_put(better_tree_int_, left_key.str, left_key.length, &store, sizeof(store), dummy_locked_leaf_addrs);
+            wh_int_put(better_tree_int_, left_key.str, left_key.length, &store, sizeof(InfixStore), dummy_locked_leaf_addrs);
         else
-            wh_put(better_tree_, left_key.str, left_key.length, &store, sizeof(store), dummy_locked_leaf_addrs);
+            wh_put(better_tree_, left_key.str, left_key.length, &store, sizeof(InfixStore), dummy_locked_leaf_addrs);
 
         if constexpr (payload_type == PayloadType::FixedLength)
             AddTreeKey(right_key.str, right_key.length, right_payload);
@@ -3148,9 +3507,9 @@ inline void Diva<int_optimized, payload_type>::BulkLoad(const t_itr begin, const
             else 
                 LoadListToInfixStore(store, infix_list, infix_store_target_size - 1, total_implicit);
             if constexpr (int_optimized)
-                wh_int_put(better_tree_int_, left_key.str, left_key.length, &store, sizeof(store), dummy_locked_leaf_addrs);
+                wh_int_put(better_tree_int_, left_key.str, left_key.length, &store, sizeof(InfixStore), dummy_locked_leaf_addrs);
             else
-                wh_put(better_tree_, left_key.str, left_key.length, &store, sizeof(store), dummy_locked_leaf_addrs);
+                wh_put(better_tree_, left_key.str, left_key.length, &store, sizeof(InfixStore), dummy_locked_leaf_addrs);
 
             /*
 #ifdef DEBUG
@@ -3252,9 +3611,9 @@ inline void Diva<int_optimized, payload_type>::BulkLoad(const t_itr begin, const
         else
             LoadListToInfixStore(store, infix_list, i, total_implicit);
         if constexpr (int_optimized)
-            wh_int_put(better_tree_int_, left_key.str, left_key.length, &store, sizeof(store), dummy_locked_leaf_addrs);
+            wh_int_put(better_tree_int_, left_key.str, left_key.length, &store, sizeof(InfixStore), dummy_locked_leaf_addrs);
         else
-            wh_put(better_tree_, left_key.str, left_key.length, &store, sizeof(store), dummy_locked_leaf_addrs);
+            wh_put(better_tree_, left_key.str, left_key.length, &store, sizeof(InfixStore), dummy_locked_leaf_addrs);
 
         if constexpr (payload_type == PayloadType::FixedLength)
             AddTreeKey(right_key.str, right_key.length, right_payload);
@@ -3269,21 +3628,25 @@ inline void Diva<int_optimized, payload_type>::BulkLoad(const t_itr begin, const
 
 
 template <bool int_optimized, PayloadType payload_type>
-inline void Diva<int_optimized, payload_type>::BulkLoadStreaming(uint64_t key, const uint64_t *payload) {
+inline void Diva<int_optimized, payload_type>::BulkLoadStreaming(uint64_t key, const uint64_t *payload,
+                                                                 uint32_t raw_file_number) {
     key = __builtin_bswap64(key);
-    BulkLoadStreaming(reinterpret_cast<const uint8_t *>(&key), sizeof(key), payload);
+    BulkLoadStreaming(reinterpret_cast<const uint8_t *>(&key), sizeof(key), payload, raw_file_number);
 }
 
 
 template <bool int_optimized, PayloadType payload_type>
-inline void Diva<int_optimized, payload_type>::BulkLoadStreaming(std::string_view key, const uint64_t *payload) {
-    BulkLoadStreaming(reinterpret_cast<const uint8_t *>(key.data()), key.size(), payload);
+inline void Diva<int_optimized, payload_type>::BulkLoadStreaming(std::string_view key, const uint64_t *payload,
+                                                                 uint32_t raw_file_number) {
+    BulkLoadStreaming(reinterpret_cast<const uint8_t *>(key.data()), key.size(), payload, raw_file_number);
 }
 
 
 template <bool int_optimized, PayloadType payload_type>
 inline void Diva<int_optimized, payload_type>::BulkLoadStreaming(const uint8_t *key, const uint32_t key_len,
-                                                                 const uint64_t *payload) {
+                                                                 const uint64_t *payload,
+                                                                 uint32_t raw_file_number) {
+    (void)raw_file_number;  // Pass A: FOR patching not yet wired here.
     uint8_t *key_copy = new uint8_t[key_len];
     memcpy(key_copy, key, key_len);
 
@@ -3327,9 +3690,9 @@ inline void Diva<int_optimized, payload_type>::BulkLoadStreaming(const uint8_t *
     else 
         LoadListToInfixStore(store, infix_list, bulk_load_streaming_ind_, total_implicit);
     if constexpr (int_optimized)
-        wh_int_put(better_tree_int_, bulk_load_left_key_.str, bulk_load_left_key_.length, &store, sizeof(store), dummy_locked_leaf_addrs);
+        wh_int_put(better_tree_int_, bulk_load_left_key_.str, bulk_load_left_key_.length, &store, sizeof(InfixStore), dummy_locked_leaf_addrs);
     else
-        wh_put(better_tree_, bulk_load_left_key_.str, bulk_load_left_key_.length, &store, sizeof(store), dummy_locked_leaf_addrs);
+        wh_put(better_tree_, bulk_load_left_key_.str, bulk_load_left_key_.length, &store, sizeof(InfixStore), dummy_locked_leaf_addrs);
 
     delete[] bulk_load_left_key_.str;
     bulk_load_left_key_ = bulk_load_right_key;
@@ -3376,9 +3739,9 @@ inline void Diva<int_optimized, payload_type>::BulkLoadStreamingFinish() {
         else 
             LoadListToInfixStore(store, infix_list, bulk_load_streaming_ind_, total_implicit);
         if constexpr (int_optimized)
-            wh_int_put(better_tree_int_, bulk_load_left_key_.str, bulk_load_left_key_.length, &store, sizeof(store), dummy_locked_leaf_addrs);
+            wh_int_put(better_tree_int_, bulk_load_left_key_.str, bulk_load_left_key_.length, &store, sizeof(InfixStore), dummy_locked_leaf_addrs);
         else
-            wh_put(better_tree_, bulk_load_left_key_.str, bulk_load_left_key_.length, &store, sizeof(store), dummy_locked_leaf_addrs);
+            wh_put(better_tree_, bulk_load_left_key_.str, bulk_load_left_key_.length, &store, sizeof(InfixStore), dummy_locked_leaf_addrs);
         uint64_t bulk_load_right_payload_[(payload_size_ + 63) / 64 + 1];
         copy_bitmap_to_bitmap(bulk_load_payload_list_, bulk_load_streaming_ind_ * payload_size_,
                               bulk_load_right_payload_, 0, payload_size_);
@@ -3990,6 +4353,8 @@ template <bool int_optimized, PayloadType payload_type>
 inline void Diva<int_optimized, payload_type>::DeleteRawFromInfixStore(InfixStore &store, const uint64_t key,
                                                                        const uint32_t total_implicit,
                                                                        std::function<bool(const uint64_t *)> should_remove) {
+    // Expose store's FOR base to ref-aware predicates.
+    iterator_current_reference_ = store.reference_file_number;
     uint32_t size_grade = store.GetSizeGrade();
     const uint64_t elem_count = store.GetElemCount();
     if (size_grade > 0 && elem_count <= (size_grade > 1 ? scaled_sizes_[size_grade - 2] : exception_scaled_size_))
@@ -4202,9 +4567,11 @@ template <bool int_optimized, PayloadType payload_type>
 inline std::pair<uint64_t, uint32_t>
 Diva<int_optimized, payload_type>::DeleteRawRangeFromInfixStore(InfixStore &store,
                                                                 const uint64_t l_key,
-                                                                const uint64_t r_key, 
-                                                                const uint32_t total_implicit, 
+                                                                const uint64_t r_key,
+                                                                const uint32_t total_implicit,
                                                                 std::function<bool(const uint64_t *)> should_remove) {
+    // Expose store's FOR base to ref-aware predicates.
+    iterator_current_reference_ = store.reference_file_number;
     uint32_t deleted_count = 0;
 
     const uint32_t size_grade = store.GetSizeGrade();
@@ -4967,6 +5334,92 @@ inline typename Diva<int_optimized, payload_type>::InfixStore Diva<int_optimized
 
 
 template <bool int_optimized, PayloadType payload_type>
+inline uint32_t Diva<int_optimized, payload_type>::ReadFOROffsetFromPayload(
+        const uint64_t *payload, uint32_t entry_index) const {
+    if (file_number_offset_bits_ == 0) return 0;
+    const uint32_t bit_pos =
+        entry_index * payload_size_ + for_field_bit_pos_;
+    uint32_t result = 0;
+    for (uint32_t i = 0; i < file_number_offset_bits_; i++) {
+        const uint32_t pos = bit_pos + i;
+        const uint32_t word = pos / 64;
+        const uint32_t bit = pos % 64;
+        result |= (static_cast<uint32_t>((payload[word] >> bit) & 1ULL) << i);
+    }
+    return result;
+}
+
+
+template <bool int_optimized, PayloadType payload_type>
+inline void Diva<int_optimized, payload_type>::WriteFOROffsetToPayload(
+        uint64_t *payload, uint32_t entry_index, uint32_t for_offset) const {
+    if (file_number_offset_bits_ == 0) return;
+    const uint32_t bit_pos =
+        entry_index * payload_size_ + for_field_bit_pos_;
+    for (uint32_t i = 0; i < file_number_offset_bits_; i++) {
+        const uint32_t pos = bit_pos + i;
+        const uint32_t word = pos / 64;
+        const uint32_t bit = pos % 64;
+        const uint64_t bit_value = (for_offset >> i) & 1ULL;
+        payload[word] = (payload[word] & ~(1ULL << bit)) | (bit_value << bit);
+    }
+}
+
+
+template <bool int_optimized, PayloadType payload_type>
+inline void Diva<int_optimized, payload_type>::PatchPayloadFOR(
+        InfixStore &store, uint64_t *payload, uint32_t raw_file_number) {
+    if (file_number_offset_bits_ == 0) return;
+    uint32_t for_offset;
+    const bool store_empty =
+        (store.GetElemCount() == 0 && store.num_sample_payloads == 0);
+    if (store_empty) {
+        store.reference_file_number = raw_file_number;
+        for_offset = 0;
+    } else {
+        assert(raw_file_number >= store.reference_file_number &&
+               "FOR: raw_file_number < store.reference_file_number");
+        const uint64_t delta = raw_file_number - store.reference_file_number;
+        assert(delta < (1ULL << file_number_offset_bits_) &&
+               "FOR: offset overflows file_number_offset_bits_");
+        for_offset = static_cast<uint32_t>(delta);
+    }
+    WriteFOROffsetToPayload(payload, /*entry_index=*/0, for_offset);
+}
+
+
+template <bool int_optimized, PayloadType payload_type>
+inline const uint64_t* Diva<int_optimized, payload_type>::MaybePatchPayloadForFOR(
+        InfixStore &store, const uint64_t *payload, uint64_t *working_buf,
+        uint32_t working_buf_words, uint32_t raw_file_number) {
+    if (file_number_offset_bits_ == 0 || payload == nullptr) return payload;
+    const uint32_t buf_words = (payload_size_ + 63) / 64;
+    assert(buf_words <= working_buf_words);
+    memcpy(working_buf, payload, buf_words * sizeof(uint64_t));
+    PatchPayloadFOR(store, working_buf, raw_file_number);
+    return working_buf;
+}
+
+
+template <bool int_optimized, PayloadType payload_type>
+inline uint32_t Diva<int_optimized, payload_type>::RebasePayloadListFOR(
+        uint64_t *payload_list, uint32_t list_len, uint32_t old_reference) {
+    if (file_number_offset_bits_ == 0 || list_len == 0) return old_reference;
+    uint32_t min_offset = std::numeric_limits<uint32_t>::max();
+    for (uint32_t i = 0; i < list_len; i++) {
+        const uint32_t off = ReadFOROffsetFromPayload(payload_list, i);
+        if (off < min_offset) min_offset = off;
+    }
+    if (min_offset == 0) return old_reference;  // already minimal — nothing to do
+    for (uint32_t i = 0; i < list_len; i++) {
+        const uint32_t off = ReadFOROffsetFromPayload(payload_list, i);
+        WriteFOROffsetToPayload(payload_list, i, off - min_offset);
+    }
+    return old_reference + min_offset;
+}
+
+
+template <bool int_optimized, PayloadType payload_type>
 inline uint32_t Diva<int_optimized, payload_type>::GetInfixList(const InfixStore &store, uint64_t *res,
                                                                 uint64_t *res_payload) const {
     const uint32_t size_grade = store.GetSizeGrade();
@@ -5116,6 +5569,7 @@ inline typename Diva<int_optimized, payload_type>::Iterator& Diva<int_optimized,
     ind_ = other.ind_;
     should_remove_ = other.should_remove_;
     first_store_to_fetched_and_delete_ = other.first_store_to_fetched_and_delete_;
+    fetched_reference_file_number_ = other.fetched_reference_file_number_;
     memcpy(shared_prefix_, other.shared_prefix_, (shared_ + 7) / 8);
     memcpy(current_key_contents_, other.current_key_contents_,
             (shared_ + ignore_ + implicit_ + filter_->infix_size_ + 6) / 8);
@@ -5134,7 +5588,8 @@ inline Diva<int_optimized, payload_type>::Iterator::Iterator(const Iterator& oth
         payloads_(other.payloads_),
         ind_(other.ind_),
         should_remove_(other.should_remove_),
-        first_store_to_fetched_and_delete_(other.first_store_to_fetched_and_delete_){
+        first_store_to_fetched_and_delete_(other.first_store_to_fetched_and_delete_),
+        fetched_reference_file_number_(other.fetched_reference_file_number_){
     SetNextToFetch(other.next_to_fetch_.str, other.next_to_fetch_.length);
     SetEnd(other.end_key_.str, other.end_key_.length);
     memcpy(shared_prefix_, other.shared_prefix_, (shared_ + 7) / 8);
@@ -5349,6 +5804,9 @@ IteratorRefetchLowerUpperBounds:
     InfixStore& infix_store = *infix_store_ptr;
     rwlock_lock_read(infix_store.rwlock);
     filter_->UnlockLeaves(leaves_to_unlock, it_write_lock);
+    // Capture the source store's FOR base for callers that decode payloads
+    // produced by this Fetch.
+    fetched_reference_file_number_ = infix_store.reference_file_number;
 
     if (next_to_fetch_ <= prev_key) {
         // Previous key was a partial key and a prefix of the query key
@@ -5527,6 +5985,13 @@ inline void Diva<int_optimized, payload_type>::Iterator::FetchDelete() {
     rwlock_lock_write(infix_store_ptr->rwlock);
     InfixStore& infix_store = *infix_store_ptr;
     filter_->UnlockLeaves(leaves_to_unlock, it_write_lock);
+    fetched_reference_file_number_ = infix_store.reference_file_number;
+    // Expose this store's FOR base for ref-aware predicates invoked below.
+    // Both the sample-payload deletion inline here and the
+    // DeleteRawRangeFromInfixStore call further down need this set so the
+    // predicate's call to GetCurrentIteratorReference() returns the source
+    // store's ref (not a stale value from a previous Fetch).
+    filter_->iterator_current_reference_ = infix_store.reference_file_number;
     if (next_to_fetch_ <= prev_key) {
         if (end_key_.str != nullptr && prev_key > end_key_) {
             rwlock_unlock_write(infix_store.rwlock);
