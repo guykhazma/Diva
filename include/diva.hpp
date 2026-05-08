@@ -40,12 +40,14 @@ static void print_key(const uint8_t *key, const uint32_t key_len, const bool bin
 }
 
 
-static void print_key(const char *key, const uint32_t key_len, const bool binary=true) {
+[[maybe_unused]] static void print_key(const char *key, const uint32_t key_len, const bool binary=true) {
     print_key(reinterpret_cast<const uint8_t *>(key), key_len, binary);
 }
 
 
-static void validate_infixes_and_bounds(uint32_t infix_count, uint64_t *infix_list,
+
+
+[[maybe_unused]] static void validate_infixes_and_bounds(uint32_t infix_count, uint64_t *infix_list,
                                         uint32_t infix_size_,
                                         uint64_t prev_extraction, uint64_t next_extraction) {
     const uint64_t prev_implicit = prev_extraction >> infix_size_;
@@ -231,7 +233,8 @@ public:
         static constexpr uint32_t iterator_local_buf_len = 1 << 10;
         Diva<int_optimized, payload_type> *filter_;
         InfiniteByteString next_to_fetch_, end_key_;
-        uint32_t shared_, ignore_, implicit_;
+
+        uint32_t shared_ = 0, ignore_ = 0, implicit_ = 0;
         uint8_t next_to_fetch_contents_[iterator_local_buf_len], end_key_contents_[iterator_local_buf_len];
         uint8_t shared_prefix_[iterator_local_buf_len], current_key_contents_[iterator_local_buf_len];
         std::vector<uint64_t> infixes_, bit_counts_, payloads_;
@@ -1050,7 +1053,7 @@ inline void Diva<int_optimized, payload_type>::Insert(const uint8_t *key, const 
     uint32_t num_keys_added = 1;
     if (random_number % infix_store_target_size == 0)
         num_keys_added += InsertSplit(converted_key, payload);
-    else 
+    else
         InsertSimple(converted_key, payload);
     n_keys_.fetch_add(num_keys_added, std::memory_order_release);
 }
@@ -1369,7 +1372,7 @@ inline void Diva<int_optimized, payload_type>::InsertSimple(const InfiniteByteSt
     const uint64_t insertee = ((extraction | 1ULL) - (prev_implicit << infix_size_));
     if constexpr (payload_type == PayloadType::FixedLength)
         InsertRawIntoInfixStore(infix_store, insertee, total_implicit, reinterpret_cast<const uint64_t *>(payload));
-    else 
+    else
         InsertRawIntoInfixStore(infix_store, insertee, total_implicit);
     rwlock_unlock_write(infix_store.rwlock);
 }
@@ -1809,17 +1812,40 @@ inline std::tuple<uint32_t, bool> Diva<int_optimized, payload_type>::GetExpanded
     bool expanded = false;
     const uint64_t lower_implicit_lim = lower_lim >> infix_size_;
     const uint64_t upper_implicit_lim = upper_lim >> infix_size_;
+    // Mirror UpdateInfixList's shift-overflow handling: when the shift would
+    // lose any significant bit past bit 63, UpdateInfixList forces the
+    // wide-spread (val=0) fallback. Match that here so the returned count
+    // equals what will actually be written — every entry contributes
+    // (upper - lower + 1) entries. slot_value_bits derivation is shared
+    // with UpdateInfixList below.
+    const uint32_t slot_value_bits = infix_size_ + base_implicit_size + 1;
+    const bool shift_overflows = (shamt + slot_value_bits > 64);
     for (int32_t i = 0; i < list_len; i++) {
         const int32_t new_lowbit_position = lowbit_pos(list[i]) + shamt;
+        if (shift_overflows) {
+            if (upper_implicit_lim >= lower_implicit_lim) {
+                actual_list_len += upper_implicit_lim - lower_implicit_lim;
+            }
+            expanded = true;
+            continue;
+        }
         if (infix_size_ <= new_lowbit_position && new_lowbit_position < 64) {
             const uint64_t implicit_part = (list[i] << shamt) >> infix_size_;
             const uint64_t start = std::max(lower_implicit_lim, implicit_part - (implicit_part & (-implicit_part)));
             const uint64_t end = std::min(upper_implicit_lim, implicit_part | (implicit_part - 1));
-            actual_list_len += end - start;
+            // Guard the uint64 subtraction without adjusting the base `1` —
+            // an `actual_list_len -= 1` form here would underflow
+            // InsertSplit's uint32 return value (left+right - infix_count)
+            // when many entries clamp out, inflating n_keys_ by ~4B per call.
+            if (end >= start) {
+                actual_list_len += end - start;
+            }
             expanded = true;
         }
         else if (new_lowbit_position >= 64) {
-            actual_list_len += upper_implicit_lim - lower_implicit_lim;
+            if (upper_implicit_lim >= lower_implicit_lim) {
+                actual_list_len += upper_implicit_lim - lower_implicit_lim;
+            }
             expanded = true;
         }
     }
@@ -1847,9 +1873,46 @@ inline void Diva<int_optimized, payload_type>::UpdateInfixList(const uint64_t *l
             assert(res[i] > 0);
 #endif
         }
+        // `LoadListToInfixStore` (called next via AllocateInfixStoreWithList)
+        // requires its input sorted in CompareInfixes order — it walks the
+        // list once and assigns occupied/runend bits per bucket as they are
+        // encountered. Out-of-order entries get attributed to the wrong
+        // bucket, so a per-key seek lands on an empty slot.
+        //
+        // GetInfixList returns slots in physical-position order. With only
+        // sort-order-preserving inserts (InsertSimple/InsertSplit), physical
+        // order matches sort order. But `InsertAfterPayload` can place an
+        // entry adjacent to an arbitrary OLD entry — sacrificing slot-sort
+        // order for chronological insertion order — so any leaf that has
+        // been touched by InsertAfterPayload may produce an unsorted list
+        // here. The expanded branch below already runs this sort.
         if constexpr (payload_type == PayloadType::FixedLength) {
-            const uint32_t total_payload_bits = list_len * payload_size_;
-            copy_bitmap_to_bitmap(payload_list, payload_list_offset, res_payload, 0, total_payload_bits);
+            const bool should_allocate_on_heap = list_len > heap_alloc_threshold;
+            std::pair<uint64_t, uint32_t> sorter_contents[should_allocate_on_heap ? 1 : list_len];
+            std::pair<uint64_t, uint32_t> *sorter = sorter_contents;
+            if (should_allocate_on_heap)
+                sorter = new std::pair<uint64_t, uint32_t>[list_len];
+            for (uint32_t i = 0; i < list_len; ++i) {
+                sorter[i] = {res[i], i};
+            }
+            auto comp = [&](std::pair<uint64_t, uint32_t> a,
+                            std::pair<uint64_t, uint32_t> b) {
+                return CompareInfixes(a.first, b.first);
+            };
+            std::stable_sort(sorter, sorter + list_len, comp);
+            for (uint32_t i = 0; i < list_len; ++i) {
+                res[i] = sorter[i].first;
+                const uint32_t pos_in = payload_size_ * sorter[i].second + payload_list_offset;
+                const uint32_t pos_out = payload_size_ * i;
+                copy_bitmap_to_bitmap(payload_list, pos_in, res_payload, pos_out, payload_size_);
+            }
+            if (should_allocate_on_heap)
+                delete[] sorter;
+        } else {
+            auto comp = [&](uint64_t a, uint64_t b) {
+                return CompareInfixes(a, b);
+            };
+            std::stable_sort(res, res + list_len, comp);
         }
         return;
     }
@@ -1863,8 +1926,18 @@ inline void Diva<int_optimized, payload_type>::UpdateInfixList(const uint64_t *l
         payload_ind = new uint32_t[res_len];
     const uint64_t lower_implicit_lim = lower_lim >> infix_size_;
     const uint64_t upper_implicit_lim = upper_lim >> infix_size_;
+    // Each list[i] is built as `(implicit_part << infix_size_) | explicit_part`
+    // (see GetInfixList). implicit_part is bounded by total_implicit, which
+    // never exceeds 2^(base_implicit_size + 1), so list[i]'s significant width
+    // is at most `infix_size_ + base_implicit_size + 1`. The plain `shamt < 64`
+    // guard catches only total bit loss; partial loss (any bit past bit 63)
+    // silently corrupts val. Forcing val=0 here triggers the explicit_part==0
+    // wide-spread branch below — over-approximates by writing one slot per
+    // bucket of the new range (preserves no-false-negatives at the cost of FPR).
+    const uint32_t slot_value_bits = infix_size_ + base_implicit_size + 1;
+    const bool shift_overflows = (shamt + slot_value_bits > 64);
     for (int32_t i = 0; i < list_len; i++) {
-        const uint64_t val = shamt < 64 ? list[i] << shamt : 0UL;
+        const uint64_t val = (shift_overflows || shamt >= 64) ? 0UL : (list[i] << shamt);
         const uint64_t implicit_part = val >> infix_size_;
         const uint64_t explicit_part = val & BITMASK(infix_size_);
         if (explicit_part == 0) {
@@ -4837,6 +4910,9 @@ inline void Diva<int_optimized, payload_type>::LoadListToInfixStore(InfixStore &
             }
             write_head++;
         }
+#ifdef DEBUG
+        assert(r[i] >= 1 && r[i] - 1 < static_cast<int32_t>(total_size));
+#endif
         set_bitmap_bit(runends, r[i] - 1);
     }
 
