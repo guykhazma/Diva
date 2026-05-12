@@ -1574,11 +1574,19 @@ inline bool Diva<int_optimized, payload_type>::InsertAfterPayloadInInfixStore(
         return false;
     }
 
-    // Insert at slot `target_pos + 1`. Replicate the existing-bucket shift
-    // logic from InsertRawIntoInfixStore.
+    // Insert at slot `target_pos + 1` with a copy of target's slot
+    // value. Using target's encoding (rather than recomputing the
+    // fresh explicit_part for K at the current trie state) preserves
+    // the bucket's primary-sort invariant: the new slot has the same
+    // primary as target and sits adjacent to it. If target has been
+    // shifted by past splits (lb>0), the new slot inherits the same lb
+    // — both stay clustered at target's sort position. The bits we'd
+    // "refresh" by using fresh K bits aren't needed; reader resolves
+    // by full-key disk check.
     const int32_t r = target_pos + 1;
     const int32_t next_empty = FindEmptySlotAfter(infix_store, mapped_pos);
-    const uint64_t explicit_part = insertee & BITMASK(infix_size_);
+    const uint64_t explicit_part = GetSlot(infix_store, target_pos);
+    (void)insertee;
     const bool shift_right =
         (next_empty < static_cast<int32_t>(scaled_sizes_[size_grade]));
 
@@ -1919,70 +1927,13 @@ inline uint32_t Diva<int_optimized, payload_type>::InsertSplit(const InfiniteByt
     else 
         infix_count = GetInfixList(infix_store, infix_list);
 
-    // Linear partition of infix_list into [LEFT | RIGHT] by primary vs
-    // separator. Replaces the previous binary search, which assumed slots
-    // within a bucket were sorted by primary ascending. With insertion-order
-    // within-bucket layout (UpdateInfixList now stable_sorts by implicit_part
-    // only), the binary search would land at an arbitrary position and
-    // misclassify entries — leading to underflow in UpdateInfixList's
-    // `(val << shamt) - lower_lim` and OOB writes in LoadListToInfixStore.
-    //
-    // The partition is stable: within each half, the relative order of
-    // entries is preserved (which equals insertion order). The downstream
-    // partial-match back-walk continues to work because entries with the
-    // same implicit_part as separator land at the END of LEFT — that holds
-    // because GetInfixList yields slot-order, which is implicit_part
-    // ascending across buckets, and our changes don't affect that.
-    int32_t sep_l, sep_r;
-    {
-        uint32_t left_count = 0;
-        for (uint32_t i = 0; i < infix_count; i++) {
-            const uint64_t val = infix_list[i] & (infix_list[i] - 1);
-            if (val <= separator - 1) left_count++;
-        }
-        const uint32_t partition_buf_words = infix_count + 1;
-        const bool partition_on_heap =
-            partition_buf_words > heap_alloc_threshold;
-        uint64_t partition_buf_stack[partition_on_heap ? 1
-                                                       : partition_buf_words];
-        uint64_t* partition_buf =
-            partition_on_heap ? new uint64_t[partition_buf_words]
-                              : partition_buf_stack;
-        const uint32_t pl_words =
-            (partition_buf_words * payload_size_ + 63) / 64 + 2;
-        uint64_t pl_buf_stack[partition_on_heap ? 1 : pl_words];
-        uint64_t* pl_buf = nullptr;
-        if constexpr (payload_type == PayloadType::FixedLength) {
-            pl_buf = partition_on_heap ? new uint64_t[pl_words]
-                                       : pl_buf_stack;
-        }
-        uint32_t left_idx = 0;
-        uint32_t right_idx = left_count;
-        for (uint32_t i = 0; i < infix_count; i++) {
-            const uint64_t val = infix_list[i] & (infix_list[i] - 1);
-            const uint32_t dst =
-                (val <= separator - 1) ? left_idx++ : right_idx++;
-            partition_buf[dst] = infix_list[i];
-            if constexpr (payload_type == PayloadType::FixedLength) {
-                copy_bitmap_to_bitmap(payload_list, i * payload_size_,
-                                      pl_buf, dst * payload_size_,
-                                      payload_size_);
-            }
-        }
-        std::memcpy(infix_list, partition_buf,
-                    infix_count * sizeof(uint64_t));
-        if constexpr (payload_type == PayloadType::FixedLength) {
-            copy_bitmap_to_bitmap(pl_buf, 0, payload_list, 0,
-                                  infix_count * payload_size_);
-        }
-        if (partition_on_heap) {
-            delete[] partition_buf;
-            if constexpr (payload_type == PayloadType::FixedLength) {
-                delete[] pl_buf;
-            }
-        }
-        sep_l = static_cast<int32_t>(left_count) - 1;
-        sep_r = static_cast<int32_t>(left_count);
+    int32_t sep_l = -1, sep_r = infix_count, sep_mid;
+    while (sep_r - sep_l > 1) {
+        sep_mid = (sep_l + sep_r) / 2;
+        const uint64_t val = infix_list[sep_mid] & (infix_list[sep_mid] - 1);
+        const bool cond = val <= separator - 1;
+        sep_l = cond ? sep_mid : sep_l;
+        sep_r = cond ? sep_r : sep_mid;
     }
     uint64_t *infix_list_right_half_ptr = infix_list + sep_r;
     uint64_t *payload_list_right_half_ptr = payload_list;
@@ -2251,12 +2202,11 @@ inline void Diva<int_optimized, payload_type>::UpdateInfixList(const uint64_t *l
             assert(res[i] > 0);
 #endif
         }
-        // Sort only by implicit_part (= value >> infix_size_), preserving
-        // insertion order within a bucket via stable_sort. LoadListToInfixStore
-        // requires implicit_parts grouped+ascending; within-bucket sort by
-        // CompareInfixes is purely a read-side optimization (RangeQuery
-        // runstart shortcut, Delete/GetLongestMatchingInfixSize binary
-        // searches) — those sites have been converted to linear scans.
+        // `LoadListToInfixStore` (called next via AllocateInfixStoreWithList)
+        // requires its input sorted in CompareInfixes order — it walks the
+        // list once and assigns occupied/runend bits per bucket as they are
+        // encountered. Out-of-order entries get attributed to the wrong
+        // bucket, so a per-key seek lands on an empty slot.
         if constexpr (payload_type == PayloadType::FixedLength) {
             const bool should_allocate_on_heap = list_len > heap_alloc_threshold;
             std::pair<uint64_t, uint32_t> sorter_contents[should_allocate_on_heap ? 1 : list_len];
@@ -2268,7 +2218,7 @@ inline void Diva<int_optimized, payload_type>::UpdateInfixList(const uint64_t *l
             }
             auto comp = [&](std::pair<uint64_t, uint32_t> a,
                             std::pair<uint64_t, uint32_t> b) {
-                return (a.first >> infix_size_) < (b.first >> infix_size_);
+                return CompareInfixes(a.first, b.first);
             };
             std::stable_sort(sorter, sorter + list_len, comp);
             for (uint32_t i = 0; i < list_len; ++i) {
@@ -2281,7 +2231,7 @@ inline void Diva<int_optimized, payload_type>::UpdateInfixList(const uint64_t *l
                 delete[] sorter;
         } else {
             auto comp = [&](uint64_t a, uint64_t b) {
-                return (a >> infix_size_) < (b >> infix_size_);
+                return CompareInfixes(a, b);
             };
             std::stable_sort(res, res + list_len, comp);
         }
@@ -2359,7 +2309,7 @@ inline void Diva<int_optimized, payload_type>::UpdateInfixList(const uint64_t *l
     }
     else {
         auto comp = [&](uint64_t a, uint64_t b) {
-                        return (a >> infix_size_) < (b >> infix_size_);
+                        return CompareInfixes(a, b);
                     };
         std::stable_sort(res, res + res_ind, comp);
     }
@@ -4522,17 +4472,15 @@ inline void Diva<int_optimized, payload_type>::InsertRawIntoInfixStore(InfixStor
 #endif // DEBUG
         const int32_t previous_empty = FindEmptySlotBefore(store, mapped_pos);
 
-        // Within-bucket slots are no longer sorted by primary (UpdateInfixList
-        // stable_sorts only by implicit_part). The binary search below is
-        // therefore an approximation — it lands at SOME position inside the
-        // run rather than a true sort-position. Empirically this approximate
-        // placement keeps the segment-loader iterator working at small scale
-        // (<= 5M keys); at 8M+ it produces ~0.09% Get mismatches that the
-        // mask-comparison "walk past same-K" can't fix because K's old slot
-        // bits have been shifted by past splits and no longer share bits
-        // with the freshly-encoded explicit_part. A clean fix would require
-        // identifying same-K slots without relying on slot bits (e.g. by
-        // payload inspection), which the current encoding does not support.
+        // Binary search for the sort-insertion position by primary.
+        // Assumes the run is sorted by primary — which it is as long as
+        // every operation that touches the run preserves sort:
+        //   - InsertRaw inserts at this BS position (sort-preserving).
+        //   - InsertAfterPayload copies the target slot's value into
+        //     the new entry, so the new entry has the SAME primary as
+        //     target → sort preserved at that position.
+        //   - UpdateInfixList stable_sorts by implicit_part (within a
+        //     bucket the order from input is preserved).
         int32_t l = std::max(PreviousRunend(store, runend_pos), previous_empty);
         int32_t r = runend_pos + 1;
         int32_t mid;
@@ -4679,11 +4627,17 @@ inline void Diva<int_optimized, payload_type>::DeleteRawFromInfixStore(InfixStor
                                           static_cast<int32_t>(FindEmptySlotBefore(store, runend_pos))) + 1;
     const bool run_destroyed = runstart_pos == runend_pos;
 
-    // Linear scan: within-bucket slots are no longer sorted by primary,
-    // so we can't bisect. Walk from runend_pos backward (preserves the
-    // original "newest-first" semantic for callers deleting one occurrence).
+
+    int32_t l = runstart_pos - 1, r = runend_pos + 1, mid;
+    while (r - l > 1) {
+        mid = (l + r) / 2;
+        const uint64_t value = GetSlot(store, mid);
+        const bool cond = (value & (value - 1)) <= explicit_part - 1;
+        l = cond ? mid : l;
+        r = cond ? r : mid;
+    }
     int32_t match_pos;
-    for (match_pos = runend_pos; match_pos >= runstart_pos; match_pos--) {
+    for (match_pos = l; match_pos >= runstart_pos; match_pos--) {
         const uint64_t value = GetSlot(store, match_pos);
         const uint64_t mask = ((value & -value) << 1) - 1;
         if constexpr (payload_type == PayloadType::FixedLength) {
@@ -5297,28 +5251,30 @@ inline uint32_t Diva<int_optimized, payload_type>::GetLongestMatchingInfixSize(c
                                           static_cast<int32_t>(FindEmptySlotBefore(store, runend_pos))) + 1;
     const bool run_destroyed = runstart_pos == runend_pos;
 
-    // Linear scan over the run: pick the LONGEST matching prefix (smallest
-    // lb). Within-bucket slots are no longer sorted, so we can't rely on
-    // the back-walk to encounter the narrowest match first — instead, scan
-    // every slot and track the best.
-    uint32_t best_match = 0;  // 0 means "no match found"
-    for (int32_t pos = runstart_pos; pos <= runend_pos; pos++) {
+    int32_t l = runstart_pos - 1, r = runend_pos + 1, mid;
+    while (r - l > 1) {
+        mid = (l + r) / 2;
+        uint64_t value = GetSlot(store, mid);
+        value -= value & -value;
+        if (value <= key - 1)
+            l = mid;
+        else
+            r = mid;
+    }
+    int32_t match_pos;
+    for (match_pos = l; match_pos >= runstart_pos; match_pos--) {
         if constexpr (payload_type == PayloadType::FixedLength) {
             uint64_t payload[(payload_size_ + 63) / 64 + 1];
-            GetPayload(store, pos, payload);
+            GetPayload(store, match_pos, payload);
             if (!should_consider(payload))
                 continue;
         }
-        const uint64_t value = GetSlot(store, pos);
+        const uint64_t value = GetSlot(store, match_pos);
         const uint64_t mask = ((value & -value) << 1) - 1;
-        if ((value | mask) == (explicit_part | mask)) {
-            const uint32_t this_match_size = infix_size_ - lowbit_pos(value);
-            if (this_match_size > best_match) {
-                best_match = this_match_size;
-            }
-        }
+        if ((value | mask) == (explicit_part | mask))
+            return infix_size_ - lowbit_pos(value);
     }
-    return best_match;
+    return 0;   // No matching infix found
 }
 
 
@@ -5341,14 +5297,9 @@ inline bool Diva<int_optimized, payload_type>::RangeQueryInfixStore(InfixStore &
             const uint32_t runend_pos = SelectRunends(store, r_rank);
             const uint32_t runstart_pos = std::max(r_rank ? static_cast<int32_t>(SelectRunends(store, r_rank - 1)) : -1,
                                                    static_cast<int32_t>(FindEmptySlotBefore(store, runend_pos))) + 1;
-            // Linear scan: within-bucket slots are no longer sorted, so
-            // runstart's primary is not necessarily the smallest in the
-            // bucket. Check every slot.
-            for (int32_t pos = runstart_pos; pos <= static_cast<int32_t>(runend_pos); ++pos) {
-                const uint64_t slot_value = GetSlot(store, pos);
-                if (slot_value - (slot_value & -slot_value) <= r_explicit_part)
-                    return true;
-            }
+            const uint64_t slot_value = GetSlot(store, runstart_pos);
+            if (slot_value - (slot_value & -slot_value) <= r_explicit_part)
+                return true;
         }
         if (get_bitmap_bit(occupieds, l_implicit_part)) {
             const uint32_t l_rank = RankOccupieds(store, l_implicit_part);
