@@ -369,9 +369,11 @@ private:
         alignas(alignof(std::atomic<lock_t>)) std::atomic<lock_t> rwlock{0};
         uint64_t *ptr = nullptr;
         // Frame-of-reference base for this store's payloads: every payload's
-        // file_number is encoded as a 16-bit offset from this value. Set once
-        // when the store is allocated (= min file_number across the entries
-        // that initialize it). Inserts into an existing store reuse this base.
+        // file_number is encoded as a delta from this value (width =
+        // Diva::file_number_offset_bits_). Set on first FOR-aware insert via
+        // ComputeFORReference (0 when file numbers fit as absolute offsets,
+        // otherwise raw_file_number). Inserts into an
+        // existing store reuse this base.
         uint32_t reference_file_number = 0;
         // Checkpoint dirty flag. `true` means the store has been mutated
         // since the last successful checkpoint and needs re-serialization.
@@ -631,13 +633,19 @@ private:
 
     // FOR helpers (no-ops when `file_number_offset_bits_ == 0`).
     //
+    // Pick a stable FOR reference for `raw_file_number`. Uses 0 when the file
+    // number fits directly in the offset field; otherwise the smallest power
+    // of two that keeps `raw_file_number - ref` encodable.
+    static uint32_t ComputeFORReference(uint32_t raw_file_number,
+                                        uint32_t offset_bits);
+
     // `PatchPayloadFOR`: caller holds the destination store's write lock.
     // Patches the FOR field bits of `payload` in place. If the store is empty
-    // (first-ever insert), initializes its reference to `raw_file_number` and
-    // writes 0 as the FOR offset. Otherwise computes
-    // `for_offset = raw_file_number - store.reference_file_number` and writes
-    // it. Aborts if `raw_file_number < store.reference_file_number` or the
-    // resulting offset doesn't fit in `file_number_offset_bits_`.
+    // (first-ever insert), initializes its reference via ComputeFORReference
+    // and writes `raw_file_number - reference` as the FOR offset. Otherwise
+    // computes `for_offset = raw_file_number - store.reference_file_number`
+    // and writes it. Aborts if `raw_file_number < store.reference_file_number`
+    // or the resulting offset doesn't fit in `file_number_offset_bits_`.
     void PatchPayloadFOR(InfixStore &store, uint64_t *payload, uint32_t raw_file_number);
 
     // For single-key insert paths: returns a pointer to a payload that is
@@ -661,6 +669,21 @@ private:
     // `old_reference` and produce a freshly-based new store.
     uint32_t RebasePayloadListFOR(uint64_t *payload_list, uint32_t list_len,
                                   uint32_t old_reference);
+
+    // `RebaseInfixStoreFOR`: in-place rebase of a store's FOR base. Walks
+    // every occupied slot and every sample payload, finds the minimum FOR
+    // offset across all of them, subtracts that minimum from every payload's
+    // FOR field, and bumps `store.reference_file_number` by the same amount.
+    //
+    // This is the recovery path when an insert's `raw_file_number` would
+    // overflow the FOR field against the store's current ref but the store's
+    // live entries (after GC reaped the original low entries) span less than
+    // 2^file_number_offset_bits_. Sliding the ref up reclaims headroom.
+    //
+    // Returns the new reference (== old reference if rebase isn't possible:
+    // FOR mode off, empty store, or min_offset already 0). Caller must hold
+    // the store's write lock.
+    uint32_t RebaseInfixStoreFOR(InfixStore &store);
 
     // Low-level FOR field accessors. The FOR field occupies the high
     // `file_number_offset_bits_` of the payload — bits
@@ -1366,8 +1389,8 @@ inline bool Diva<int_optimized, payload_type>::InsertAfterPayload(
 
     // FOR-patch writable copies of both `new_payload` (the new entry to
     // insert) and `target_payload` (the entry to match) against the
-    // destination store's reference. No-op in legacy mode.
-    constexpr uint32_t kForSampleBufWords = 16;
+    // destination store's reference.
+    constexpr uint32_t kForSampleBufWords = 1;
     uint64_t for_sample_buf[kForSampleBufWords];
     uint64_t for_target_buf[kForSampleBufWords];
     const uint64_t* effective_new_payload = MaybePatchPayloadForFOR(
@@ -1379,40 +1402,27 @@ inline bool Diva<int_optimized, payload_type>::InsertAfterPayload(
         for_target_buf, kForSampleBufWords, target_raw_file_number);
     target_payload = static_cast<const void *>(effective_target_payload);
 
-    // Stack buffer big enough for typical payload sizes (16 * 64 = 1024 bits).
-    constexpr uint32_t kProbeBufWords = 16;
+    // Single-word probe path: payload fits in one uint64_t (asserted in the
+    // BlobFilter layer). GetSamplePayload overwrites bits [0, payload_size_)
+    // of probe_buf[0]; high bits never affect equality because we mask via
+    // `payload_eq_mask` before comparing.
+    constexpr uint32_t kProbeBufWords = 1;
     const uint32_t payload_u64s = (payload_size_ + 63) / 64;
     if (payload_u64s > kProbeBufWords) {
         rwlock_unlock_write(infix_store.rwlock);
         return false;
     }
     uint64_t probe_buf[kProbeBufWords];
-
-    // Helper: do the lower payload_size_ bits of `a` equal those of `b`?
-    auto payload_bits_equal = [&](const void *a, const void *b) -> bool {
-        const uint32_t full_bytes = payload_size_ / 8;
-        if (full_bytes > 0 && std::memcmp(a, b, full_bytes) != 0) {
-            return false;
-        }
-        const uint32_t rem_bits = payload_size_ % 8;
-        if (rem_bits > 0) {
-            const uint8_t mask = static_cast<uint8_t>((1u << rem_bits) - 1u);
-            const uint8_t aa =
-                reinterpret_cast<const uint8_t *>(a)[full_bytes] & mask;
-            const uint8_t bb =
-                reinterpret_cast<const uint8_t *>(b)[full_bytes] & mask;
-            if (aa != bb) {
-                return false;
-            }
-        }
-        return true;
-    };
+    const uint64_t payload_eq_mask =
+        payload_size_ >= 64 ? ~uint64_t{0}
+                            : ((uint64_t{1} << payload_size_) - 1);
+    const uint64_t target_word =
+        *reinterpret_cast<const uint64_t *>(target_payload) & payload_eq_mask;
 
     uint32_t target_pos = UINT32_MAX;
     for (uint32_t i = 0; i < num_payloads; i++) {
-        std::memset(probe_buf, 0, sizeof(probe_buf));
         GetSamplePayload(infix_store, i, probe_buf, 0);
-        if (payload_bits_equal(probe_buf, target_payload)) {
+        if (((probe_buf[0] ^ target_word) & payload_eq_mask) == 0) {
             target_pos = i;
             break;
         }
@@ -1468,9 +1478,8 @@ inline bool Diva<int_optimized, payload_type>::InsertAfterPayloadInInfixStore(
 
     // FOR-patch writable copies of both `new_payload` (the new entry to
     // insert) and `target_payload` (the entry to match against on-disk
-    // payloads) against the destination store's reference. No-op in legacy
-    // mode.
-    constexpr uint32_t kForPatchBufWords = 16;
+    // payloads) against the destination store's reference.
+    constexpr uint32_t kForPatchBufWords = 1;
     uint64_t for_patch_buf[kForPatchBufWords];
     uint64_t for_target_buf[kForPatchBufWords];
     const uint64_t* effective_new_payload = MaybePatchPayloadForFOR(
@@ -1531,40 +1540,29 @@ inline bool Diva<int_optimized, payload_type>::InsertAfterPayloadInInfixStore(
     const int32_t run_start =
         std::max(PreviousRunend(infix_store, runend_pos), previous_empty) + 1;
 
-    // Walk slots in [run_start..runend_pos], compare each slot's payload
-    // bytes against target_payload, find the first match.
-    constexpr uint32_t kProbeBufWords = 16;
+    // Single-word probe path: payload fits in one uint64_t (asserted in the
+    // BlobFilter layer; the > kProbeBufWords guard below stays as a safety
+    // net for future bigger payloads). Walk slots in [run_start..runend_pos],
+    // XOR-compare the low payload_size_ bits against target_payload, find
+    // the first match. Mask discards uninitialized high bits, so no memset
+    // is needed before GetPayload.
+    constexpr uint32_t kProbeBufWords = 1;
     const uint32_t payload_u64s = (payload_size_ + 63) / 64;
     if (payload_u64s > kProbeBufWords) {
         rwlock_unlock_write(infix_store.rwlock);
         return false;
     }
     uint64_t probe_buf[kProbeBufWords];
-
-    auto payload_bits_equal = [&](const void *a, const void *b) -> bool {
-        const uint32_t full_bytes = payload_size_ / 8;
-        if (full_bytes > 0 && std::memcmp(a, b, full_bytes) != 0) {
-            return false;
-        }
-        const uint32_t rem_bits = payload_size_ % 8;
-        if (rem_bits > 0) {
-            const uint8_t mask = static_cast<uint8_t>((1u << rem_bits) - 1u);
-            const uint8_t aa =
-                reinterpret_cast<const uint8_t *>(a)[full_bytes] & mask;
-            const uint8_t bb =
-                reinterpret_cast<const uint8_t *>(b)[full_bytes] & mask;
-            if (aa != bb) {
-                return false;
-            }
-        }
-        return true;
-    };
+    const uint64_t payload_eq_mask =
+        payload_size_ >= 64 ? ~uint64_t{0}
+                            : ((uint64_t{1} << payload_size_) - 1);
+    const uint64_t target_word =
+        *reinterpret_cast<const uint64_t *>(target_payload) & payload_eq_mask;
 
     int32_t target_pos = -1;
     for (int32_t pos = run_start; pos <= runend_pos; ++pos) {
-        std::memset(probe_buf, 0, sizeof(probe_buf));
         GetPayload(infix_store, pos, probe_buf, 0);
-        if (payload_bits_equal(probe_buf, target_payload)) {
+        if (((probe_buf[0] ^ target_word) & payload_eq_mask) == 0) {
             target_pos = pos;
             break;
         }
@@ -1586,7 +1584,6 @@ inline bool Diva<int_optimized, payload_type>::InsertAfterPayloadInInfixStore(
     const int32_t r = target_pos + 1;
     const int32_t next_empty = FindEmptySlotAfter(infix_store, mapped_pos);
     const uint64_t explicit_part = GetSlot(infix_store, target_pos);
-    (void)insertee;
     const bool shift_right =
         (next_empty < static_cast<int32_t>(scaled_sizes_[size_grade]));
 
@@ -1654,7 +1651,7 @@ inline void Diva<int_optimized, payload_type>::InsertSimple(const InfiniteByteSt
     // Stack working buffer for FOR-patched payload. Sized for any realistic
     // payload (1024 bits). MaybePatchPayloadForFOR returns the original
     // pointer when FOR mode is off, so this is a true no-op in legacy mode.
-    constexpr uint32_t kForPatchBufWords = 16;
+    constexpr uint32_t kForPatchBufWords = 1;
     uint64_t for_patch_buf[kForPatchBufWords];
     const uint64_t* effective_payload = MaybePatchPayloadForFOR(
         infix_store, reinterpret_cast<const uint64_t *>(payload),
@@ -1888,9 +1885,10 @@ inline uint32_t Diva<int_optimized, payload_type>::InsertSplit(const InfiniteByt
     rwlock_lock_write(infix_store_ptr->rwlock);
     InfixStore& infix_store = *infix_store_ptr;
 
-    // Stack working buffer for FOR-patched payloads (samples + the new key
-    // added to the right-side store). Sized for any realistic payload.
-    constexpr uint32_t kForSplitBufWords = 16;
+    // Stack working buffer for FOR-patched payload. Sized for the single-word
+    // payload used by the BlobFilter path. MaybePatchPayloadForFOR returns
+    // the caller's pointer when FOR mode is off or the fast path hits.
+    constexpr uint32_t kForSplitBufWords = 1;
     uint64_t for_split_buf[kForSplitBufWords];
 
     if (prev_key == key) {
@@ -5593,17 +5591,21 @@ inline typename Diva<int_optimized, payload_type>::InfixStore Diva<int_optimized
 template <bool int_optimized, PayloadType payload_type>
 inline uint32_t Diva<int_optimized, payload_type>::ReadFOROffsetFromPayload(
         const uint64_t *payload, uint32_t entry_index) const {
-    if (file_number_offset_bits_ == 0) return 0;
-    const uint32_t bit_pos =
-        entry_index * payload_size_ + for_field_bit_pos_;
-    uint32_t result = 0;
-    for (uint32_t i = 0; i < file_number_offset_bits_; i++) {
-        const uint32_t pos = bit_pos + i;
-        const uint32_t word = pos / 64;
-        const uint32_t bit = pos % 64;
-        result |= (static_cast<uint32_t>((payload[word] >> bit) & 1ULL) << i);
-    }
-    return result;
+  if (file_number_offset_bits_ == 0) return 0;
+
+  const uint32_t bit_pos = entry_index * payload_size_ + for_field_bit_pos_;
+  const uint32_t word = bit_pos / 64;
+  const uint32_t bit  = bit_pos % 64;
+
+  // 1. Grab the bits from the primary 64-bit word
+  uint64_t result_64 = payload[word] >> bit;
+
+  // 2. If the requested bits spill over into the next 64-bit word, grab them too
+  if (bit + file_number_offset_bits_ > 64) {
+    result_64 |= (payload[word + 1] << (64 - bit));
+  }
+  const uint64_t mask = (1ULL << file_number_offset_bits_) - 1;
+  return static_cast<uint32_t>(result_64 & mask);
 }
 
 
@@ -5611,15 +5613,35 @@ template <bool int_optimized, PayloadType payload_type>
 inline void Diva<int_optimized, payload_type>::WriteFOROffsetToPayload(
         uint64_t *payload, uint32_t entry_index, uint32_t for_offset) const {
     if (file_number_offset_bits_ == 0) return;
-    const uint32_t bit_pos =
-        entry_index * payload_size_ + for_field_bit_pos_;
-    for (uint32_t i = 0; i < file_number_offset_bits_; i++) {
-        const uint32_t pos = bit_pos + i;
-        const uint32_t word = pos / 64;
-        const uint32_t bit = pos % 64;
-        const uint64_t bit_value = (for_offset >> i) & 1ULL;
-        payload[word] = (payload[word] & ~(1ULL << bit)) | (bit_value << bit);
+    // we assume the offset is always smaller than 32 bits
+    const uint32_t total_bit_pos = entry_index * payload_size_ + for_field_bit_pos_;
+    const uint32_t byte_pos = total_bit_pos / 8;
+    const uint32_t bit_offset = total_bit_pos % 8;
+    uint32_t storage;
+    std::memcpy(&storage, reinterpret_cast<const uint8_t*>(payload) + byte_pos, 4);
+    const uint32_t mask = 0xFFFFU << bit_offset;
+    storage = (storage & ~mask) | ((static_cast<uint32_t>(for_offset) & 0xFFFFU) << bit_offset);
+    std::memcpy(reinterpret_cast<uint8_t*>(payload) + byte_pos, &storage, 4);
+}
+
+
+template <bool int_optimized, PayloadType payload_type>
+inline uint32_t Diva<int_optimized, payload_type>::ComputeFORReference(
+        uint32_t raw_file_number, uint32_t offset_bits) {
+    if (offset_bits == 0) return 0;
+    const uint64_t max_offset = 1ULL << offset_bits;
+    if (static_cast<uint64_t>(raw_file_number) < max_offset) {
+        return 0;
     }
+    // Power-of-2 floor: align the reference down to the nearest multiple of
+    // 2^offset_bits. Two benefits over "ref = raw_file_number":
+    //   * Adjacent stores whose first inserts fall in the same 2^offset_bits
+    //     block share the same reference — DeleteMerge avoids per-entry FOR
+    //     rebasing.
+    //   * Future inserts into the store have headroom both above and below
+    //     the first insert's file_number (anywhere in [ref, ref + max_offset)).
+    const uint32_t mask = static_cast<uint32_t>(max_offset - 1);
+    return raw_file_number & ~mask;
 }
 
 
@@ -5636,8 +5658,9 @@ inline void Diva<int_optimized, payload_type>::PatchPayloadFOR(
     const bool store_empty =
         (store.GetElemCount() == 0 && store.num_sample_payloads == 0);
     if (store_empty) {
-        store.reference_file_number = raw_file_number;
-        for_offset = 0;
+        store.reference_file_number =
+            ComputeFORReference(raw_file_number, file_number_offset_bits_);
+        for_offset = raw_file_number - store.reference_file_number;
     } else {
         assert(raw_file_number >= store.reference_file_number &&
                "FOR: raw_file_number < store.reference_file_number");
@@ -5646,7 +5669,16 @@ inline void Diva<int_optimized, payload_type>::PatchPayloadFOR(
                "FOR: offset overflows file_number_offset_bits_");
         for_offset = static_cast<uint32_t>(delta);
     }
-    WriteFOROffsetToPayload(payload, /*entry_index=*/0, for_offset);
+    // Single-word patch (payload fits in one uint64_t for the BlobFilter
+    // use case). Combines the FOR-field clear + new-offset OR into a single
+    // masked write — replaces two memcpys through uint32_t storage in
+    // WriteFOROffsetToPayload.
+    assert((payload_size_ + 63) / 64 == 1 &&
+           "PatchPayloadFOR fast path requires payload_size_ <= 64");
+    const uint64_t for_mask =
+        ((1ULL << file_number_offset_bits_) - 1) << for_field_bit_pos_;
+    payload[0] = (payload[0] & ~for_mask) |
+                 (static_cast<uint64_t>(for_offset) << for_field_bit_pos_);
 }
 
 
@@ -5655,10 +5687,81 @@ inline const uint64_t* Diva<int_optimized, payload_type>::MaybePatchPayloadForFO
         InfixStore &store, const uint64_t *payload, uint64_t *working_buf,
         uint32_t working_buf_words, uint32_t raw_file_number) {
     if (file_number_offset_bits_ == 0 || payload == nullptr) return payload;
-    const uint32_t buf_words = (payload_size_ + 63) / 64;
-    assert(buf_words <= working_buf_words);
-    memcpy(working_buf, payload, buf_words * sizeof(uint64_t));
-    PatchPayloadFOR(store, working_buf, raw_file_number);
+
+    assert((payload_size_ + 63) / 64 == 1 &&
+           "MaybePatchPayloadForFOR fast path requires payload_size_ <= 64");
+
+    const bool store_empty =
+        (store.GetElemCount() == 0 && store.num_sample_payloads == 0);
+
+    uint32_t target_for_offset;
+    if (store_empty) {
+        target_for_offset = raw_file_number -
+            ComputeFORReference(raw_file_number, file_number_offset_bits_);
+    } else {
+        // Overflow check: if raw_file_number is too high above the store's
+        // current ref, try to reclaim headroom by rebasing the store (which
+        // is possible iff GC has reaped enough low entries that the live
+        // entries' min for_offset > 0). If even after rebase the new file
+        // number still doesn't fit, the store genuinely cannot hold this
+        // entry abort with diagnostics.
+        const uint64_t for_max = (1ULL << file_number_offset_bits_);
+        const uint64_t delta_initial =
+            static_cast<uint64_t>(raw_file_number) - store.reference_file_number;
+        if (raw_file_number < store.reference_file_number ||
+            delta_initial >= for_max) {
+            const uint32_t old_ref = store.reference_file_number;
+            const uint32_t new_ref = RebaseInfixStoreFOR(store);
+            (void)old_ref;
+            if (new_ref == store.reference_file_number &&
+                (raw_file_number < new_ref ||
+                 static_cast<uint64_t>(raw_file_number) - new_ref >=
+                     for_max)) {
+                // Rebase didn't free room (or wasn't possible) AND the
+                // file_number still doesn't fit. Refuse — caller would
+                // otherwise corrupt the payload via silent truncation.
+                fprintf(stderr,
+                        "Diva FOR overflow: raw_file_number=%u store.ref=%u "
+                        "for_max=%lu — entry cannot fit; consider splitting "
+                        "the store or widening file_number_offset_bits_\n",
+                        raw_file_number, store.reference_file_number,
+                        for_max);
+                std::abort();
+            }
+        }
+        target_for_offset = raw_file_number - store.reference_file_number;
+    }
+
+    // Single-word FOR-field read.
+    const uint64_t for_mask =
+        ((1ULL << file_number_offset_bits_) - 1) << for_field_bit_pos_;
+    const uint64_t p = payload[0];
+    const uint32_t cur_for_offset =
+        static_cast<uint32_t>((p & for_mask) >> for_field_bit_pos_);
+
+    // Fast path: the encoded FOR offset already matches — return the
+    // caller's pointer untouched.
+    if (cur_for_offset == target_for_offset) {
+        if (store_empty) {
+            store.reference_file_number =
+                ComputeFORReference(raw_file_number,
+                                    file_number_offset_bits_);
+            store.SetDirty();
+        }
+        return payload;
+    }
+
+    // Slow path: single-word masked-OR write into working_buf. No memcpy,
+    // no per-byte twiddling — one ALU op + one store.
+    assert(working_buf_words >= 1);
+    if (store_empty) {
+        store.reference_file_number =
+            ComputeFORReference(raw_file_number, file_number_offset_bits_);
+    }
+    store.SetDirty();
+    working_buf[0] =
+        (p & ~for_mask) |
+        (static_cast<uint64_t>(target_for_offset) << for_field_bit_pos_);
     return working_buf;
 }
 
@@ -5678,6 +5781,71 @@ inline uint32_t Diva<int_optimized, payload_type>::RebasePayloadListFOR(
         WriteFOROffsetToPayload(payload_list, i, off - min_offset);
     }
     return old_reference + min_offset;
+}
+
+
+template <bool int_optimized, PayloadType payload_type>
+inline uint32_t Diva<int_optimized, payload_type>::RebaseInfixStoreFOR(
+        InfixStore &store) {
+    if (file_number_offset_bits_ == 0) return store.reference_file_number;
+    if constexpr (payload_type != PayloadType::FixedLength) {
+        return store.reference_file_number;
+    }
+
+    const uint32_t size_grade = store.GetSizeGrade();
+    const uint32_t store_size = scaled_sizes_[size_grade];
+
+    // First pass: find min for_offset across occupied slot payloads and
+    // sample payloads. Single-word payload assumption (asserted in our
+    // single-store optimization elsewhere — payload fits in one uint64_t
+    // for the BlobFilter use case).
+    assert((payload_size_ + 63) / 64 == 1 &&
+           "RebaseInfixStoreFOR fast path requires payload_size_ <= 64");
+    uint32_t min_offset = std::numeric_limits<uint32_t>::max();
+    uint64_t probe_payload = 0;
+    bool any_seen = false;
+
+    for (uint32_t i = 0; i < store_size; ++i) {
+        if (GetSlot(store, i) == 0) continue;  // empty slot
+        GetPayload(store, i, &probe_payload, 0);
+        const uint32_t off = ReadFOROffsetFromPayload(&probe_payload, 0);
+        if (off < min_offset) min_offset = off;
+        any_seen = true;
+    }
+    if (store.num_sample_payloads > 0) {
+        const uint64_t *sample_payloads =
+            reinterpret_cast<const uint64_t *>(store.ptr[1]);
+        for (uint32_t i = 0; i < store.num_sample_payloads; ++i) {
+            const uint32_t off = ReadFOROffsetFromPayload(sample_payloads, i);
+            if (off < min_offset) min_offset = off;
+            any_seen = true;
+        }
+    }
+
+    if (!any_seen || min_offset == 0) {
+        return store.reference_file_number;
+    }
+
+    // Second pass: subtract min_offset from every for_offset.
+    for (uint32_t i = 0; i < store_size; ++i) {
+        if (GetSlot(store, i) == 0) continue;
+        GetPayload(store, i, &probe_payload, 0);
+        const uint32_t old_off = ReadFOROffsetFromPayload(&probe_payload, 0);
+        WriteFOROffsetToPayload(&probe_payload, 0, old_off - min_offset);
+        SetPayload(store, i, &probe_payload, 0);
+    }
+    if (store.num_sample_payloads > 0) {
+        uint64_t *sample_payloads =
+            reinterpret_cast<uint64_t *>(store.ptr[1]);
+        for (uint32_t i = 0; i < store.num_sample_payloads; ++i) {
+            const uint32_t off = ReadFOROffsetFromPayload(sample_payloads, i);
+            WriteFOROffsetToPayload(sample_payloads, i, off - min_offset);
+        }
+    }
+
+    store.reference_file_number += min_offset;
+    store.SetDirty();
+    return store.reference_file_number;
 }
 
 
