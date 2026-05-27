@@ -200,6 +200,19 @@ public:
     void BulkLoadStreamingFinish();
     uint64_t GetNumKeys() const;
 
+    // Sample boundary keys for sharding a parallel range walk. Walks
+    // wormhole start-to-end via the existing iterator and records the key at
+    // each (k * total / num_shards) position for k=1..num_shards-1, yielding
+    // num_shards-1 internal boundaries. Combined with [nullptr, b[0]),
+    // [b[0], b[1]), ..., [b[N-2], nullptr) they partition the keyspace into
+    // num_shards roughly-equal-sized ranges.
+    //
+    // Returns true on success (out has num_shards-1 entries, sorted). Returns
+    // false (out unchanged) if num_shards <= 1 or the trie is too small to
+    // shard meaningfully (< num_shards entries).
+    bool SampleKeysForSharding(uint32_t num_shards,
+                               std::vector<std::string> *out) const;
+
     struct InfiniteByteString {
         const uint8_t *str;
         uint32_t length;
@@ -3992,6 +4005,67 @@ inline void Diva<int_optimized, payload_type>::BulkLoadStreamingFinish() {
 template <bool int_optimized, PayloadType payload_type>
 inline uint64_t Diva<int_optimized, payload_type>::GetNumKeys() const {
     return n_keys_.load(std::memory_order_acquire);
+}
+
+
+template <bool int_optimized, PayloadType payload_type>
+inline bool Diva<int_optimized, payload_type>::SampleKeysForSharding(
+        uint32_t num_shards, std::vector<std::string> *out) const {
+    if (num_shards <= 1 || out == nullptr) return false;
+    const uint64_t total = GetNumKeys();
+    if (total < num_shards) return false;
+    out->clear();
+    out->reserve(num_shards - 1);
+    // Open a read-mode wormhole iterator over the whole keyspace and skip
+    // forward by stride for each boundary. wh_iter_skip is O(stride) per
+    // call; total cost is O(total) — same order as one cleanup walk, run
+    // once per cleanup. The wormhole returns keys lexicographically.
+    // `better_tree_` is already a wormref* obtained at Diva construction.
+    // Sample boundary keys from the wormhole's existing split keys (each
+    // wormhole entry is a Diva split — InsertSplit creates them as Diva
+    // fills up an InfixStore). Wormhole entry count = ~NumKeys /
+    // records-per-store, much smaller than payload count, so we can walk
+    // the wormhole once and sample N-1 evenly-spaced boundaries.
+    //
+    // wh_iter_skip iterates wormhole entries, NOT Diva payloads — the
+    // distinction matters: GetNumKeys() returns payload count.
+    wormhole_iter *it = wh_iter_create(better_tree_);
+    if (it == nullptr) return false;
+    // Pass 1: count wormhole entries. unlock=true so the iterator
+    // releases per-leaf locks as it advances; without this Diva's
+    // destructor hangs waiting for the iterator to release them.
+    uint64_t wh_entries = 0;
+    for (wh_iter_seek(it, nullptr, 0, /*write=*/false); wh_iter_valid(it);
+         wh_iter_skip1(it, /*write=*/false, /*unlock=*/true)) {
+        ++wh_entries;
+    }
+    if (wh_entries < num_shards) {
+        // Trie too small to shard meaningfully.
+        wh_iter_destroy(it, /*write=*/false);
+        return false;
+    }
+    // Pass 2: collect boundary keys at positions stride, 2*stride, ...
+    // Use skip1 in a loop (wh_iter_skip(N) for large N hangs).
+    const uint64_t stride = wh_entries / num_shards;
+    wh_iter_seek(it, nullptr, 0, /*write=*/false);
+    void *dummy_val_ptr = nullptr;
+    uint32_t dummy_val_len = 0;
+    uint64_t pos = 0;
+    for (uint32_t k = 1; k < num_shards && wh_iter_valid(it); ++k) {
+        const uint64_t target = static_cast<uint64_t>(k) * stride;
+        while (pos < target && wh_iter_valid(it)) {
+            wh_iter_skip1(it, /*write=*/false, /*unlock=*/true);
+            ++pos;
+        }
+        if (!wh_iter_valid(it)) break;
+        const void *kbuf = nullptr;
+        uint32_t klen = 0;
+        wh_iter_peek_ref(it, &kbuf, &klen, &dummy_val_ptr, &dummy_val_len);
+        if (kbuf == nullptr || klen == 0) break;
+        out->emplace_back(static_cast<const char *>(kbuf), klen);
+    }
+    wh_iter_destroy(it, /*write=*/false);
+    return out->size() == num_shards - 1;
 }
 
 
