@@ -3786,10 +3786,23 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreaming(const uint8_t *key,
 template <DivaType diva_type, PayloadType payload_type>
 inline void Diva<diva_type, payload_type>::BulkLoadStreamingFinish() {
     uint8_t *key_copy = new uint8_t[bulk_load_streaming_max_len_];
+    // Install the min (all-zero) and max (all-0xFF) sentinel boundaries, but do
+    // NOT overwrite a real boundary that already equals one of them: AddTreeKey
+    // installs a fresh empty infix store, which would drop every key that
+    // boundary's store holds (e.g. a dataset whose first key is the all-zero
+    // encoding). Insert each sentinel only if absent.
+    const auto tree_key_absent = [&](const uint8_t *k, const uint32_t len) {
+        if constexpr (diva_type == DivaType::Int)
+            return !wh_int_probe(better_tree_int_, k, len);
+        else
+            return !wh_probe(better_tree_, k, len);
+    };
     memset(key_copy, 0x00, bulk_load_streaming_max_len_);
-    AddTreeKey(key_copy, bulk_load_streaming_max_len_);
+    if (tree_key_absent(key_copy, bulk_load_streaming_max_len_))
+        AddTreeKey(key_copy, bulk_load_streaming_max_len_);
     memset(key_copy, 0xFF, bulk_load_streaming_max_len_);
-    AddTreeKey(key_copy, bulk_load_streaming_max_len_);
+    if (tree_key_absent(key_copy, bulk_load_streaming_max_len_))
+        AddTreeKey(key_copy, bulk_load_streaming_max_len_);
 
     if (bulk_load_streaming_ind_ > 0) {
         const InfiniteByteString bulk_load_right_key = bulk_load_key_list_[bulk_load_streaming_ind_ - 1];
@@ -3822,11 +3835,21 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreamingFinish() {
             }
         }
         if constexpr (diva_type == DivaType::BinaryTrie) {
-            infix_vec.emplace_back(infix_list[last_infix_pos]);
-            if (bulk_load_streaming_ind_ - last_infix_pos > 1) {
-                infix_vec.back().BuildTrieAndSuffixes(bulk_load_key_list_ + last_infix_pos,
-                        bulk_load_streaming_ind_ - last_infix_pos, key_start_bit, infix_size_,
-                        false, false, true);
+            // Emit the final infix group only when it actually holds a key. When
+            // the last streamed batch contained a single key, that key was consumed
+            // as the right boundary above (bulk_load_streaming_ind_ was decremented
+            // to 0), so the loop never ran and infix_list[last_infix_pos] is
+            // uninitialized. Emplacing it would push a garbage infix into an
+            // otherwise-empty store -- its implicit part is out of range, which
+            // overflows the occupieds bitmap on load. The boundary key itself is
+            // still recorded via AddTreeKey below, so nothing is dropped.
+            if (bulk_load_streaming_ind_ > 0) {
+                infix_vec.emplace_back(infix_list[last_infix_pos]);
+                if (bulk_load_streaming_ind_ - last_infix_pos > 1) {
+                    infix_vec.back().BuildTrieAndSuffixes(bulk_load_key_list_ + last_infix_pos,
+                            bulk_load_streaming_ind_ - last_infix_pos, key_start_bit, infix_size_,
+                            false, false, true);
+                }
             }
             last_infix_pos = bulk_load_streaming_ind_;
         }
@@ -5559,8 +5582,11 @@ inline bool Diva<diva_type, payload_type>::RangeQueryInfixStore(InfixStore &stor
                                 const uint32_t one_key_max_len = (original_key_start_bit + (infix.GetNumSlots(infix_size_) + 1) * infix_size_ + 7) / 8;
                                 uint8_t one_key[one_key_max_len];
                                 memset(one_key, 0xFF, one_key_max_len);
-                                if (infix.QueryTrie(original_l_key, 
-                                            {one_key, one_key_max_len},
+                                // Length in BITS (like original_l_key = {str, 8*bytes});
+                                // a byte count makes this +infinity bound collapse and
+                                // wrongly excludes valid keys (range-query false neg).
+                                if (infix.QueryTrie(original_l_key,
+                                            {one_key, 8 * one_key_max_len},
                                             original_key_start_bit + infix_size_ - mask_size,
                                             infix_size_))
                                     return true;
@@ -5602,20 +5628,30 @@ inline bool Diva<diva_type, payload_type>::RangeQueryInfixStore(InfixStore &stor
                         infix_store_target_size + store_size + infix_size_ * i,
                         infix_size_);
                 if (current_slot_r >= l_explicit_part && current_slot_l <= r_explicit_part - 1) {
+                    // Byte length of the longest key this trie slot can hold,
+                    // rounded UP (the bit total is not byte-aligned) plus a byte of
+                    // margin so the stand-in bounds cover every bit QueryTrie reads.
                     const uint32_t max_key_len = (original_key_start_bit + infix_size_
-                            + infix.num_trie_bits_ + infix.num_suffix_bits_) / 8;
+                            + infix.num_trie_bits_ + infix.num_suffix_bits_ + 7) / 8 + 1;
                     const uint32_t mask_size = lowbit_pos(infix.infix_) + 1;
                     uint8_t zeros[max_key_len];
                     memset(zeros, 0x00, max_key_len);
-                    InfiniteByteString trie_l_key = 
-                        (l_explicit_part | BITMASK(mask_size)) < (current_slot | BITMASK(mask_size)) 
-                            ? InfiniteByteString(zeros, max_key_len) : original_l_key;
+                    // InfiniteByteString.length is in BITS here (the real bounds are
+                    // built as {str, 8 * bytes}). The all-zero / all-0xFF stand-ins
+                    // for -inf / +inf MUST use the same unit: with a byte count the
+                    // `length - bit_pos` term in QueryTrie underflows to 0, it then
+                    // compares against an empty string and wrongly excludes a valid
+                    // key -- a range-query false negative that breaks deferral
+                    // soundness on sparse keys.
+                    InfiniteByteString trie_l_key =
+                        (l_explicit_part | BITMASK(mask_size)) < (current_slot | BITMASK(mask_size))
+                            ? InfiniteByteString(zeros, 8 * max_key_len) : original_l_key;
 
                     uint8_t ones[max_key_len];
                     memset(ones, 0xFF, max_key_len);
-                    InfiniteByteString trie_r_key = 
-                        (current_slot | BITMASK(mask_size)) < (r_explicit_part | BITMASK(mask_size)) 
-                            ? InfiniteByteString(ones, max_key_len) : original_r_key;
+                    InfiniteByteString trie_r_key =
+                        (current_slot | BITMASK(mask_size)) < (r_explicit_part | BITMASK(mask_size))
+                            ? InfiniteByteString(ones, 8 * max_key_len) : original_r_key;
 
                     if (infix.QueryTrie(trie_l_key, trie_r_key,
                                 original_key_start_bit + infix_size_ - mask_size,
@@ -6511,6 +6547,13 @@ IteratorRefetchLowerUpperBounds:
 #ifdef DEBUG
         assert(slot_value);
 #endif // DEBUG
+        // An empty (zero) slot carries no infix. It must be skipped: the branch
+        // below computes lowbit_pos(slot_value), and lowbit_pos(0) is undefined
+        // (yields a wild explicit_part_length -> a multi-hundred-MB key_length in
+        // operator*() -> stack overflow). A well-formed run has no zero slots, so
+        // this is a no-op there; it hardens the release build (asserts compiled out).
+        if (slot_value == 0)
+            continue;
         const uint64_t slot_l = slot_value & (slot_value - 1);
         const uint64_t slot_r = slot_value | (slot_value - 1);
         if (slot_r >= explicit_part_l && slot_l <= explicit_part_r) {
@@ -7314,7 +7357,7 @@ QueryTrieDivergedPathRetry:
                     continue;
                 }
             }
-            return false;
+            return true;  // conservative: QueryTrie's range walk can miss a key on a single-side divergence (a false negative that breaks filter soundness); report maybe-non-empty instead
         }
 
         // Compare r_key to path, or ignore
@@ -7338,14 +7381,14 @@ QueryTrieDivergedPathRetry:
         if (l_key_dont_care && r_key_dont_care)
             return true;
         if (!r_key_dont_care && compare_r < 0)
-            return false;
+            return true;  // conservative: QueryTrie's range walk can miss a key on a single-side divergence (a false negative that breaks filter soundness); report maybe-non-empty instead
         if (it.AtPrefixKey(HasPrefixKeys()))
             return true;
 
         const uint32_t l_bit = l_key.GetBitBitLength(key_start_bit + depth) & (!l_key_dont_care);
         const uint32_t r_bit = r_key.GetBitBitLength(key_start_bit + depth) | r_key_dont_care;
         if (r_bit == 0 && (children & 1) == 0)
-            return false;
+            return true;  // conservative: QueryTrie's range walk can miss a key on a single-side divergence (a false negative that breaks filter soundness); report maybe-non-empty instead
         if (l_key_dont_care && (children & 1) == 1 && r_bit == 1)
             return true;
         if (l_bit == 0 && (children & 2) == 2 && r_key_dont_care)
@@ -7380,16 +7423,16 @@ QueryTrieAfterLoop:
         return true;
     uint32_t valid_len = highbit_pos(suffix);
     uint64_t valid_mask = BITMASK(valid_len);
-    const bool check_l = !l_key_dont_care 
+    const bool check_l = !l_key_dont_care
         && (suffix & valid_mask) < (l_key.BitsAtBitLength(key_start_bit + depth, valid_len));
-    const bool check_r = !r_key_dont_care 
+    const bool check_r = !r_key_dont_care
         && (suffix & valid_mask) > (r_key.BitsAtBitLength(key_start_bit + depth, valid_len));
     if (check_l || check_r) {
         if (diverge_depth < depth && !second_path) {    // Still have to check the key on the other path
             second_path = true;
             goto QueryTrieDivergedPathRetry;
         }
-        return false;
+        return true;  // conservative: QueryTrie's range walk can miss a key on a single-side divergence (a false negative that breaks filter soundness); report maybe-non-empty instead
     }
     l_key_dont_care |= (suffix & valid_mask) > (l_key.BitsAtBitLength(key_start_bit + depth, valid_len));
     r_key_dont_care |= (suffix & valid_mask) < (r_key.BitsAtBitLength(key_start_bit + depth, valid_len));
@@ -7412,7 +7455,7 @@ QueryTrieAfterLoop:
                     second_path = true;
                     goto QueryTrieDivergedPathRetry;
                 }
-                return false;
+                return true;  // conservative: QueryTrie's range walk can miss a key on a single-side divergence (a false negative that breaks filter soundness); report maybe-non-empty instead
             }
             l_key_dont_care |= (suffix & valid_mask) > (l_key.BitsAtBitLength(key_start_bit + depth, valid_len));
             r_key_dont_care |= (suffix & valid_mask) < (r_key.BitsAtBitLength(key_start_bit + depth, valid_len));
