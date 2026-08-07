@@ -21,6 +21,10 @@ endif ()
 
 set(BITHACKING_COMPILE_FLAGS -march=native)
 
+# Multi-instance optimizations used by RocksDB (one Diva per SST filter).
+add_compile_definitions(WORMHOLE_NO_DEBUG WORMHOLE_DISABLE_MLOCK
+                        WORMHOLE_GLOBAL_SLAB WORMHOLE_DISABLE_QSBR)
+
 add_library(WormholeLib STATIC ./include/wormhole/kv.c ./include/wormhole/lib.c ./include/wormhole/wh.c
                                ./include/wormhole/kv.h ./include/wormhole/lib.h ./include/wormhole/wh.h)
 set_target_properties(WormholeLib PROPERTIES LINKER_LANGUAGE CXX)
