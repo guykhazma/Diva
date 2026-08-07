@@ -559,6 +559,9 @@ private:
     uint32_t bulk_load_streaming_ind_, bulk_load_streaming_max_len_;
     InfiniteByteString bulk_load_left_key_, bulk_load_key_list_[infix_store_target_size];
     uint64_t *bulk_load_left_payload_ = nullptr, *bulk_load_payload_list_ = nullptr;
+    // When true, InfixStore::ptr (and FixedLength sample payloads) point into
+    // the serialized filter buffer and must not be freed by the destructor.
+    bool read_only_ = false;
 
     void AddTreeKey(const uint8_t *key, const uint32_t key_len, const uint64_t *payload=nullptr);
     void InsertSimple(const InfiniteByteString key, const void *payload=nullptr);
@@ -772,7 +775,8 @@ inline Diva<diva_type, payload_type>::Diva(const uint32_t infix_size, const uint
             load_factor_(load_factor),
             load_factor_alt_(load_factor),
             size_scalar_shrink_grow_sep(std::log(infix_store_target_size / 64) / std::log(1 / load_factor) + 1),
-            bulk_load_streaming_ind_(0) {
+            bulk_load_streaming_ind_(0),
+            read_only_(false) {
     if constexpr (diva_type == DivaType::Int) {
         wh_int_ = wh_int_create();
         better_tree_int_ = wh_int_ref(wh_int_);
@@ -822,7 +826,8 @@ Diva<diva_type, payload_type>::Diva(const uint32_t infix_size, const t_itr begin
         load_factor_(load_factor), 
         load_factor_alt_(load_factor),
         size_scalar_shrink_grow_sep(std::log(infix_store_target_size / 64) / std::log(1 / load_factor) + 1),
-        bulk_load_streaming_ind_(0) {
+        bulk_load_streaming_ind_(0),
+        read_only_(false) {
     if constexpr (diva_type == DivaType::Int) {
         wh_int_ = wh_int_create();
         better_tree_int_ = wh_int_ref(wh_int_);
@@ -867,7 +872,8 @@ Diva<diva_type, payload_type>::Diva(const uint32_t infix_size, const t_itr begin
         load_factor_(load_factor),
         load_factor_alt_(load_factor),
         size_scalar_shrink_grow_sep(std::log(infix_store_target_size / 64) / std::log(1 / load_factor) + 1),
-        bulk_load_streaming_ind_(0) {
+        bulk_load_streaming_ind_(0),
+        read_only_(false) {
     if constexpr (diva_type == DivaType::Int) {
         wh_int_ = wh_int_create();
         better_tree_int_ = wh_int_ref(wh_int_);
@@ -2302,38 +2308,55 @@ inline Diva<diva_type, payload_type>::~Diva() {
     uint32_t tree_key_len, dummy;
     InfixStore *store;
 
+    // read_only_ + PayloadType::None: InfixStore::ptr aliases the filter
+    // buffer — do not delete[]. FixedLength deser still allocates the word
+    // array (sample payloads may alias the buffer).
+    const bool free_infix_ptrs =
+        !read_only_ || payload_type == PayloadType::FixedLength;
+    const bool free_sample_payloads = !read_only_;
+
     if constexpr (diva_type == DivaType::Int) {
-        wormhole_int_iter it_int;
-        it_int.ref = better_tree_int_;
-        it_int.map = better_tree_int_->map;
-        it_int.leaf = nullptr;
-        it_int.is = 0;
-        for (wh_int_iter_seek(&it_int, nullptr, 0, write); wh_int_iter_valid(&it_int); wh_int_iter_skip1(&it_int, write, unlock)) {
-            wh_int_iter_peek_ref(&it_int, reinterpret_cast<const void **>(&tree_key), &tree_key_len, 
-                                          reinterpret_cast<void **>(&store), &dummy);
-            if constexpr (payload_type == PayloadType::FixedLength)
-                free(reinterpret_cast<void *>(store->ptr[1]));
-            delete[] store->ptr;
+        if (free_infix_ptrs) {
+            wormhole_int_iter it_int;
+            it_int.ref = better_tree_int_;
+            it_int.map = better_tree_int_->map;
+            it_int.leaf = nullptr;
+            it_int.is = 0;
+            for (wh_int_iter_seek(&it_int, nullptr, 0, write); wh_int_iter_valid(&it_int); wh_int_iter_skip1(&it_int, write, unlock)) {
+                wh_int_iter_peek_ref(&it_int, reinterpret_cast<const void **>(&tree_key), &tree_key_len,
+                                              reinterpret_cast<void **>(&store), &dummy);
+                if constexpr (payload_type == PayloadType::FixedLength) {
+                    if (free_sample_payloads)
+                        free(reinterpret_cast<void *>(store->ptr[1]));
+                }
+                delete[] store->ptr;
+            }
+            if (it_int.leaf)
+                wormleaf_int_unlock_write(it_int.leaf);
         }
-        if (it_int.leaf)
-            wormleaf_int_unlock_write(it_int.leaf);
+        wh_int_unref(better_tree_int_);
         wh_int_destroy(wh_int_);
     }
     else {
-        wormhole_iter it;
-        it.ref = better_tree_;
-        it.map = better_tree_->map;
-        it.leaf = nullptr;
-        it.is = 0;
-        for (wh_iter_seek(&it, nullptr, 0, write); wh_iter_valid(&it); wh_iter_skip1(&it, write, unlock)) {
-            wh_iter_peek_ref(&it, reinterpret_cast<const void **>(&tree_key), &tree_key_len, 
-                                  reinterpret_cast<void **>(&store), &dummy);
-            if constexpr (payload_type == PayloadType::FixedLength)
-                free(reinterpret_cast<void *>(store->ptr[1]));
-            delete[] store->ptr;
+        if (free_infix_ptrs) {
+            wormhole_iter it;
+            it.ref = better_tree_;
+            it.map = better_tree_->map;
+            it.leaf = nullptr;
+            it.is = 0;
+            for (wh_iter_seek(&it, nullptr, 0, write); wh_iter_valid(&it); wh_iter_skip1(&it, write, unlock)) {
+                wh_iter_peek_ref(&it, reinterpret_cast<const void **>(&tree_key), &tree_key_len,
+                                      reinterpret_cast<void **>(&store), &dummy);
+                if constexpr (payload_type == PayloadType::FixedLength) {
+                    if (free_sample_payloads)
+                        free(reinterpret_cast<void *>(store->ptr[1]));
+                }
+                delete[] store->ptr;
+            }
+            if (it.leaf)
+                wormleaf_unlock_write(it.leaf);
         }
-        if (it.leaf)
-            wormleaf_unlock_write(it.leaf);
+        wh_unref(better_tree_);
         wh_destroy(wh_);
     }
 }
@@ -2341,7 +2364,8 @@ inline Diva<diva_type, payload_type>::~Diva() {
 
 template <DivaType diva_type, PayloadType payload_type>
 inline Diva<diva_type, payload_type>::Diva(const char *deser_buf):
-        bulk_load_streaming_ind_(0) {
+        bulk_load_streaming_ind_(0),
+        read_only_(true) {
     uint32_t ind = DeserializeMetadata(deser_buf);
     if constexpr (diva_type == DivaType::Int) {
         wh_int_ = wh_int_create();
@@ -2471,16 +2495,23 @@ inline uint32_t Diva<diva_type, payload_type>::DeserializeInfixStore(const char 
     }
 
     const uint64_t word_count = store.GetPtrWordCount(scaled_sizes_[store.GetSizeGrade()], infix_size_, payload_size_);
-    store.ptr = new uint64_t[word_count];
-    memcpy(store.ptr, deser_buf + offset, word_count * sizeof(uint64_t));
-    offset += word_count * sizeof(uint64_t);
+    if constexpr (payload_type == PayloadType::None) {
+        // Zero-copy: point into the serialized buffer. Caller must keep
+        // deser_buf alive for the lifetime of this read_only_ Diva.
+        store.ptr = reinterpret_cast<uint64_t *>(const_cast<char *>(deser_buf + offset));
+        offset += word_count * sizeof(uint64_t);
+    } else {
+        // FixedLength overwrites ptr[1] with a sample-payload pointer, so the
+        // word array cannot alias the serialized buffer.
+        store.ptr = new uint64_t[word_count];
+        memcpy(store.ptr, deser_buf + offset, word_count * sizeof(uint64_t));
+        offset += word_count * sizeof(uint64_t);
 
-    if constexpr (payload_type == PayloadType::FixedLength) {
         if (store.num_sample_payloads > 0) {
-            const uint32_t sample_payload_byte_count = (store.num_sample_payloads * payload_size_ + 7) / 8;
-            uint8_t *sample_payloads = reinterpret_cast<uint8_t *>(malloc(sample_payload_byte_count));
-            store.ptr[1] = reinterpret_cast<uint64_t>(sample_payloads);
-            memcpy(sample_payloads, deser_buf + offset, sample_payload_byte_count);
+            const uint32_t sample_payload_byte_count =
+                (store.num_sample_payloads * payload_size_ + 7) / 8;
+            // Sample payloads are not mutated; alias the serialized bytes.
+            store.ptr[1] = reinterpret_cast<uint64_t>(const_cast<char *>(deser_buf + offset));
             offset += sample_payload_byte_count;
         }
     }
