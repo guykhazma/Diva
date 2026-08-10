@@ -6,6 +6,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <endian.h>
@@ -15,6 +16,7 @@
 #include <iostream>
 #include <iterator>
 #include <limits>
+#include <numeric>
 #include <random>
 #include <stdexcept>
 #include <string_view>
@@ -1339,6 +1341,10 @@ template <DivaType diva_type, PayloadType payload_type>
 inline bool Diva<diva_type, payload_type>::RangeQuery(const uint8_t *input_l, const uint32_t input_l_len,
                                                       const uint8_t *input_r, const uint32_t input_r_len) const {
     const bool it_write_lock = false;
+    // Empty/null r matches Iterator::SetEnd(len==0): open-ended [l, +∞).
+    // A length-0 InfiniteByteString pads with zeros and is NOT +∞ — that was
+    // causing false negatives on RocksDB unbounded range seeks.
+    const bool open_ended = (input_r == nullptr || input_r_len == 0);
     const InfiniteByteString l_key {input_l, static_cast<uint32_t>(input_l_len)};
     const InfiniteByteString r_key {input_r, static_cast<uint32_t>(input_r_len)};
 
@@ -1361,7 +1367,10 @@ inline bool Diva<diva_type, payload_type>::RangeQuery(const uint8_t *input_l, co
         }
     }
 
-    if (prev_key == l_key || (next_key.str != nullptr && next_key <= r_key)) {
+    // Open-ended: any later trie sample is in [l, +∞), so non-empty.
+    // Finite: non-empty if the next sample itself falls in [l, r].
+    if (prev_key == l_key ||
+        (next_key.str != nullptr && (open_ended || next_key <= r_key))) {
         UnlockLeaves(leaves_to_unlock, it_write_lock);
         return true;
     }
