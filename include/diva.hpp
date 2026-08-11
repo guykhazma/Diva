@@ -260,6 +260,8 @@ public:
         uint8_t next_to_fetch_contents_[iterator_local_buf_len], end_key_contents_[iterator_local_buf_len];
         uint8_t shared_prefix_[iterator_local_buf_len], current_key_contents_[iterator_local_buf_len];
         std::vector<uint64_t> infixes_, bit_counts_, payloads_;
+        std::vector<std::string> reconstructed_keys_;
+        std::vector<bool> reconstructed_key_present_;
         uint32_t ind_ = 0;
         std::function<bool(const uint64_t *)> should_remove_;
         bool first_store_to_fetched_and_delete_ = true;
@@ -6280,6 +6282,8 @@ inline typename Diva<diva_type, payload_type>::Iterator& Diva<diva_type, payload
     infixes_ = other.infixes_;
     bit_counts_ = other.bit_counts_;
     payloads_ = other.payloads_;
+    reconstructed_keys_ = other.reconstructed_keys_;
+    reconstructed_key_present_ = other.reconstructed_key_present_;
     ind_ = other.ind_;
     should_remove_ = other.should_remove_;
     first_store_to_fetched_and_delete_ = other.first_store_to_fetched_and_delete_;
@@ -6299,6 +6303,8 @@ inline Diva<diva_type, payload_type>::Iterator::Iterator(const Iterator& other):
         infixes_(other.infixes_),
         bit_counts_(other.bit_counts_),
         payloads_(other.payloads_),
+        reconstructed_keys_(other.reconstructed_keys_),
+        reconstructed_key_present_(other.reconstructed_key_present_),
         ind_(other.ind_),
         should_remove_(other.should_remove_),
         first_store_to_fetched_and_delete_(other.first_store_to_fetched_and_delete_){
@@ -6342,6 +6348,16 @@ inline std::pair<typename Diva<diva_type, payload_type>::Iterator::KeyType, uint
             return {nullptr, 0};
     }
     assert(ind_ < infixes_.size());
+
+    // BinaryTrie entries may expand one physical infix slot into multiple
+    // logical iterator entries. Those entries are reconstructed during Fetch()
+    // from the slot's trie payload, so return them directly instead of running
+    // the normal infix-based reconstruction below.
+    if constexpr (diva_type == DivaType::BinaryTrie) {
+        if (ind_ < reconstructed_key_present_.size() && reconstructed_key_present_[ind_]) {
+            return {reconstructed_keys_[ind_], bit_counts_[ind_]};
+        }
+    }
 
     // Reconstruct the known prefix of the key
     const uint32_t key_length = (bit_counts_[ind_] + 7) / 8;
@@ -6480,6 +6496,10 @@ inline void Diva<diva_type, payload_type>::Iterator::Fetch() {
     infixes_.reserve(64);
     bit_counts_.clear();
     bit_counts_.reserve(64);
+    reconstructed_keys_.clear();
+    reconstructed_keys_.reserve(64);
+    reconstructed_key_present_.clear();
+    reconstructed_key_present_.reserve(64);
     if constexpr (payload_type == PayloadType::FixedLength) {
         payloads_.clear();
         payloads_.reserve(2 * filter_->payload_size_);
@@ -6515,6 +6535,25 @@ IteratorRefetchLowerUpperBounds:
     rwlock_lock_read(infix_store.rwlock);
     filter_->UnlockLeaves(leaves_to_unlock, it_write_lock);
 
+    auto append_prev_key_entry = [&]() {
+        infixes_.push_back(0);
+        bit_counts_.push_back(8 * prev_key.length);
+
+        // `prev_key` is already a complete reconstructed tree-boundary entry.
+        // In BinaryTrie mode, all emitted entries go through reconstructed_keys_
+        // so boundary entries and trie-expanded entries are handled uniformly
+        // by operator*() and the per-batch ordering logic.
+        if constexpr (diva_type == DivaType::BinaryTrie) {
+            reconstructed_keys_.emplace_back(
+                reinterpret_cast<const char *>(prev_key.str), prev_key.length);
+            reconstructed_key_present_.push_back(true);
+        }
+        else {
+            reconstructed_keys_.emplace_back();
+            reconstructed_key_present_.push_back(false);
+        }
+    };
+
     if (next_to_fetch_ <= prev_key) {
         // Previous key was a partial key and a prefix of the query key
         if (end_key_.str != nullptr && prev_key > end_key_) {
@@ -6524,15 +6563,13 @@ IteratorRefetchLowerUpperBounds:
         }
         if constexpr (payload_type == PayloadType::FixedLength) {
             for (uint32_t i = 0; i < infix_store.num_sample_payloads; i++) {
-                infixes_.push_back(0);
-                bit_counts_.push_back(8 * prev_key.length);
+                append_prev_key_entry();
                 payloads_.resize((filter_->payload_size_ * infixes_.size() + 63) / 64 + 1);
                 filter_->GetSamplePayload(infix_store, i, payloads_.data(), filter_->payload_size_ * (infixes_.size() - 1));
             }
         }
         else {
-            infixes_.push_back(0);
-            bit_counts_.push_back(8 * prev_key.length);
+            append_prev_key_entry();
         }
     }
 
@@ -6581,43 +6618,215 @@ IteratorRefetchLowerUpperBounds:
         goto IteratorRefetchLowerUpperBounds;
     }
 
-    const int32_t rank = filter_->RankOccupieds(infix_store, implicit_part_l);
-    const int32_t runend_pos = filter_->SelectRunends(infix_store, rank);
-    const int32_t runstart_pos = std::max(rank ? static_cast<int32_t>(filter_->SelectRunends(infix_store, rank - 1)) : -1,
-                                          static_cast<int32_t>(filter_->FindEmptySlotBefore(infix_store, runend_pos))) + 1;
-    const uint64_t recovered_implicit = prev_implicit + implicit_part_l;
-    explicit_part_r = implicit_part_l == implicit_part_r ? explicit_part_r 
-                                                         : BITMASK(filter_->infix_size_);
-    for (int32_t pos = runstart_pos; pos <= runend_pos; pos++) {
-        const uint64_t slot_value = filter_->GetSlot(infix_store, pos);
-#ifdef DEBUG
-        assert(slot_value);
-#endif // DEBUG
-        // An empty (zero) slot carries no infix. It must be skipped: the branch
-        // below computes lowbit_pos(slot_value), and lowbit_pos(0) is undefined
-        // (yields a wild explicit_part_length -> a multi-hundred-MB key_length in
-        // operator*() -> stack overflow). A well-formed run has no zero slots, so
-        // this is a no-op there; it hardens the release build (asserts compiled out).
-        if (slot_value == 0)
-            continue;
-        const uint64_t slot_l = slot_value & (slot_value - 1);
-        const uint64_t slot_r = slot_value | (slot_value - 1);
-        if (slot_r >= explicit_part_l && slot_l <= explicit_part_r) {
-            const uint32_t explicit_part_length = filter_->infix_size_ - lowbit_pos(slot_value) - 1;
-#ifdef DEBUG
-            assert(explicit_part_length <= filter_->infix_size_);
-#endif // DEBUG
-            infixes_.push_back((recovered_implicit << filter_->infix_size_) | slot_value);
-            bit_counts_.push_back(shared + ignore + implicit_size + explicit_part_length);
-            if constexpr (payload_type == PayloadType::FixedLength) {
-                payloads_.resize((filter_->payload_size_ * infixes_.size() + 63) / 64 + 1);
-                filter_->GetPayload(infix_store, pos, payloads_.data(), filter_->payload_size_ * (infixes_.size() - 1));
+    auto append_normal_entry = [&](uint64_t infix_value, uint32_t bit_count, int32_t pos) {
+        infixes_.push_back(infix_value);
+        bit_counts_.push_back(bit_count);
+        reconstructed_keys_.emplace_back();
+        reconstructed_key_present_.push_back(false);
+        if constexpr (payload_type == PayloadType::FixedLength) {
+            payloads_.resize((filter_->payload_size_ * infixes_.size() + 63) / 64 + 1);
+            filter_->GetPayload(infix_store, pos, payloads_.data(),
+                                filter_->payload_size_ * (infixes_.size() - 1));
+        }
+    };
+
+    auto append_reconstructed_entry = [&](std::string key, uint32_t bit_count, int32_t pos) {
+        infixes_.push_back(0);
+        bit_counts_.push_back(bit_count);
+        reconstructed_keys_.push_back(std::move(key));
+        reconstructed_key_present_.push_back(true);
+        if constexpr (payload_type == PayloadType::FixedLength) {
+            payloads_.resize((filter_->payload_size_ * infixes_.size() + 63) / 64 + 1);
+            filter_->GetPayload(infix_store, pos, payloads_.data(),
+                                filter_->payload_size_ * (infixes_.size() - 1));
+        }
+    };
+
+    auto reconstruct_binary_trie_key = [&](uint64_t extraction, uint32_t explicit_part_length,
+                                           const InfiniteByteString trie_key) {
+        const uint32_t extraction_size = implicit_size + filter_->infix_size_;
+        const uint32_t trie_start_bit = shared + ignore + implicit_size + explicit_part_length;
+        const uint32_t key_length_bits = trie_start_bit + trie_key.length;
+        const uint32_t key_length = (key_length_bits + 7) / 8;
+        std::string key(key_length, '\0');
+        uint8_t *key_data = reinterpret_cast<uint8_t *>(key.data());
+
+        memcpy(key_data, prev_key.str, (shared + 7) / 8);
+        key_data[shared / 8] &= BITMASK(shared % 8) << (8 - shared % 8);
+        if (extraction >> (extraction_size - 1))
+            key_data[shared / 8] |= 1ULL << (7 - shared % 8);
+        else if (ignore > 0) {
+            uint32_t bit_pos = shared + 1;
+            uint32_t pos_rem = 8 - bit_pos % 8;
+            if (pos_rem < ignore) {
+                key_data[bit_pos / 8] |= BITMASK(pos_rem);
+                uint32_t tmp_ignore = ignore - pos_rem;
+                bit_pos += pos_rem;
+                if (tmp_ignore >= 8) {
+                    memset(key_data + bit_pos / 8, 0xFF, tmp_ignore / 8);
+                    bit_pos += tmp_ignore - tmp_ignore % 8;
+                    tmp_ignore %= 8;
+                }
+                key_data[bit_pos / 8] |= BITMASK(tmp_ignore) << (8 - tmp_ignore);
+            }
+            else {
+                key_data[bit_pos / 8] |= BITMASK(ignore) << (8 - bit_pos % 8 - ignore);
             }
         }
+
+        uint32_t bit_pos = shared + ignore + 1;
+        uint64_t extraction_copy = extraction << (65 - extraction_size);
+        extraction_copy = __builtin_bswap64(extraction_copy >> (bit_pos % 8));
+        const uint32_t loop_end_i = (bit_pos % 8 + implicit_size + explicit_part_length - 1 + 7) / 8;
+        for (uint32_t i = 0; i < loop_end_i; i++) {
+            key_data[bit_pos / 8] |= extraction_copy & 0xFF;
+            extraction_copy >>= 8;
+            bit_pos += 8 - bit_pos % 8;
+        }
+
+        for (uint32_t i = 0; i < trie_key.length; i++) {
+            if (trie_key.GetBitBitLength(i))
+                key_data[(trie_start_bit + i) / 8] |= 1U << (7 - (trie_start_bit + i) % 8);
+        }
+
+        return key;
+    };
+
+    auto reconstructed_key_less = [](const std::pair<std::string, uint32_t>& lhs,
+                                     const std::pair<std::string, uint32_t>& rhs) {
+        const uint32_t common_bits = std::min(lhs.second, rhs.second);
+        const uint32_t common_bytes = common_bits / 8;
+        const int cmp = memcmp(lhs.first.data(), rhs.first.data(), common_bytes);
+        if (cmp != 0)
+            return cmp < 0;
+        const uint32_t partial_bits = common_bits % 8;
+        if (partial_bits != 0) {
+            const uint8_t mask = BITMASK(partial_bits) << (8 - partial_bits);
+            const uint8_t lhs_byte = static_cast<uint8_t>(lhs.first[common_bytes]) & mask;
+            const uint8_t rhs_byte = static_cast<uint8_t>(rhs.first[common_bytes]) & mask;
+            if (lhs_byte != rhs_byte)
+                return lhs_byte < rhs_byte;
+        }
+        return lhs.second < rhs.second;
+    };
+
+    auto append_implicit_part = [&](uint64_t current_implicit_part,
+                                    uint64_t current_explicit_part_l,
+                                    uint64_t current_explicit_part_r) {
+        const int32_t rank = filter_->RankOccupieds(infix_store, current_implicit_part);
+        const int32_t runend_pos = filter_->SelectRunends(infix_store, rank);
+        const int32_t runstart_pos = std::max(rank ? static_cast<int32_t>(filter_->SelectRunends(infix_store, rank - 1)) : -1,
+                                              static_cast<int32_t>(filter_->FindEmptySlotBefore(infix_store, runend_pos))) + 1;
+        const uint64_t recovered_implicit = prev_implicit + current_implicit_part;
+
+        for (int32_t pos = runstart_pos; pos <= runend_pos; pos++) {
+            const uint64_t slot_value = filter_->GetSlot(infix_store, pos);
+#ifdef DEBUG
+            assert(slot_value);
+#endif // DEBUG
+            // An empty (zero) slot carries no infix. It must be skipped: the branch
+            // below computes lowbit_pos(slot_value), and lowbit_pos(0) is undefined
+            // (yields a wild explicit_part_length -> a multi-hundred-MB key_length in
+            // operator*() -> stack overflow). A well-formed run has no zero slots, so
+            // this is a no-op there; it hardens the release build (asserts compiled out).
+            if (slot_value == 0)
+                continue;
+            const uint64_t slot_l = slot_value & (slot_value - 1);
+            const uint64_t slot_r = slot_value | (slot_value - 1);
+            if (slot_r >= current_explicit_part_l && slot_l <= current_explicit_part_r) {
+                const uint32_t explicit_part_length = filter_->infix_size_ - lowbit_pos(slot_value) - 1;
+#ifdef DEBUG
+                assert(explicit_part_length <= filter_->infix_size_);
+#endif // DEBUG
+                if constexpr (diva_type == DivaType::BinaryTrie) {
+                    if (filter_->SlotHasTrie(infix_store, pos, runend_pos)) {
+                        const Infix infix(infix_store.ptr + num_metadata_offset_words,
+                                          infix_store_target_size +
+                                              filter_->scaled_sizes_[infix_store.GetSizeGrade()] +
+                                              filter_->infix_size_ * pos,
+                                          filter_->infix_size_);
+                        auto [trie_keys, trie_key_contents] = infix.GetStrings(filter_->infix_size_);
+                        const uint64_t extraction = (recovered_implicit << filter_->infix_size_) | slot_value;
+                        std::vector<std::pair<std::string, uint32_t>> expanded_keys;
+                        expanded_keys.reserve(trie_keys.size());
+                        for (const InfiniteByteString& trie_key : trie_keys) {
+                            const uint32_t bit_count =
+                                shared + ignore + implicit_size + explicit_part_length + trie_key.length;
+                            expanded_keys.emplace_back(
+                                reconstruct_binary_trie_key(extraction, explicit_part_length, trie_key),
+                                bit_count);
+                        }
+                        std::sort(expanded_keys.begin(), expanded_keys.end(), reconstructed_key_less);
+                        for (auto& [key, bit_count] : expanded_keys) {
+                            append_reconstructed_entry(std::move(key), bit_count, pos);
+                        }
+                        pos += infix.GetNumSlots(filter_->infix_size_) - 1;
+                        continue;
+                    }
+                    const uint64_t extraction = (recovered_implicit << filter_->infix_size_) | slot_value;
+                    append_reconstructed_entry(
+                        reconstruct_binary_trie_key(extraction, explicit_part_length, InfiniteByteString(nullptr, 0)),
+                        shared + ignore + implicit_size + explicit_part_length,
+                        pos);
+                }
+                else {
+                    append_normal_entry((recovered_implicit << filter_->infix_size_) | slot_value,
+                                        shared + ignore + implicit_size + explicit_part_length,
+                                        pos);
+                }
+            }
+        }
+    };
+
+    if constexpr (diva_type == DivaType::BinaryTrie && payload_type == PayloadType::None) {
+        const uint64_t last_implicit_part = std::min(implicit_part_r, total_implicit - 1);
+        while (implicit_part_l <= last_implicit_part) {
+            const uint64_t current_explicit_part_r =
+                implicit_part_l == implicit_part_r ? explicit_part_r : BITMASK(filter_->infix_size_);
+            append_implicit_part(implicit_part_l, explicit_part_l, current_explicit_part_r);
+            implicit_part_l = filter_->NextOccupied(infix_store, implicit_part_l);
+            explicit_part_l = 0;
+        }
+    }
+    else {
+        const uint64_t current_explicit_part_r =
+            implicit_part_l == implicit_part_r ? explicit_part_r : BITMASK(filter_->infix_size_);
+        append_implicit_part(implicit_part_l, explicit_part_l, current_explicit_part_r);
+    }
+
+    if constexpr (diva_type == DivaType::BinaryTrie && payload_type == PayloadType::None) {
+        std::vector<uint32_t> order(infixes_.size());
+        std::iota(order.begin(), order.end(), 0);
+        std::sort(order.begin(), order.end(), [&](uint32_t lhs, uint32_t rhs) {
+            return reconstructed_key_less(
+                {reconstructed_keys_[lhs], static_cast<uint32_t>(bit_counts_[lhs])},
+                {reconstructed_keys_[rhs], static_cast<uint32_t>(bit_counts_[rhs])});
+        });
+
+        std::vector<uint64_t> sorted_infixes;
+        std::vector<uint64_t> sorted_bit_counts;
+        std::vector<std::string> sorted_reconstructed_keys;
+        std::vector<bool> sorted_reconstructed_key_present;
+        sorted_infixes.reserve(infixes_.size());
+        sorted_bit_counts.reserve(bit_counts_.size());
+        sorted_reconstructed_keys.reserve(reconstructed_keys_.size());
+        sorted_reconstructed_key_present.reserve(reconstructed_key_present_.size());
+        for (uint32_t entry_ind : order) {
+            sorted_infixes.push_back(infixes_[entry_ind]);
+            sorted_bit_counts.push_back(bit_counts_[entry_ind]);
+            sorted_reconstructed_keys.push_back(std::move(reconstructed_keys_[entry_ind]));
+            sorted_reconstructed_key_present.push_back(reconstructed_key_present_[entry_ind]);
+        }
+        infixes_ = std::move(sorted_infixes);
+        bit_counts_ = std::move(sorted_bit_counts);
+        reconstructed_keys_ = std::move(sorted_reconstructed_keys);
+        reconstructed_key_present_ = std::move(sorted_reconstructed_key_present);
     }
 
     // Update `next_to_fetch_`
-    implicit_part_l = filter_->NextOccupied(infix_store, implicit_part_l);
+    if constexpr (!(diva_type == DivaType::BinaryTrie && payload_type == PayloadType::None)) {
+        implicit_part_l = filter_->NextOccupied(infix_store, implicit_part_l);
+    }
     if (implicit_part_l <= std::min(implicit_part_r, total_implicit - 1)) {
         const uint64_t recovered_extraction = (prev_implicit + implicit_part_l) << filter_->infix_size_;
         SetNextToFetchFromExtraction(prev_key, recovered_extraction);
@@ -6640,6 +6849,8 @@ inline void Diva<diva_type, payload_type>::Iterator::FetchDelete() {
     infixes_.clear();
     bit_counts_.clear();
     payloads_.clear();
+    reconstructed_keys_.clear();
+    reconstructed_key_present_.clear();
 
     const bool it_write_lock = true;
     
@@ -6779,6 +6990,8 @@ inline Diva<diva_type, payload_type>::Iterator::~Iterator() {
     infixes_.clear();
     bit_counts_.clear();
     payloads_.clear();
+    reconstructed_keys_.clear();
+    reconstructed_key_present_.clear();
 }
 
 
