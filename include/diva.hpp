@@ -3771,14 +3771,22 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreaming(const uint8_t *key,
         }
     }
     if constexpr (diva_type == DivaType::BinaryTrie) {
-        infix_vec.emplace_back(infix_list[last_infix_pos]);
-        if (bulk_load_streaming_ind_ - last_infix_pos > 1) {
-            infix_vec.back().BuildTrieAndSuffixes(bulk_load_key_list_ + last_infix_pos,
-                    bulk_load_streaming_ind_ - last_infix_pos, key_start_bit, infix_size_,
-                    false, false, true);
+            // Emit the final infix group only when it actually holds a key. When
+            // the last streamed batch contained a single key, that key was consumed
+            // as the right boundary above (bulk_load_streaming_ind_ was decremented
+            // to 0), so the loop never ran and infix_list[last_infix_pos] is
+            // uninitialized. Emplacing it would push a garbage infix into an
+            // otherwise-empty store.
+            if (bulk_load_streaming_ind_ > 0) {
+                infix_vec.emplace_back(infix_list[last_infix_pos]);
+                if (bulk_load_streaming_ind_ - last_infix_pos > 1) {
+                    infix_vec.back().BuildTrieAndSuffixes(bulk_load_key_list_ + last_infix_pos,
+                            bulk_load_streaming_ind_ - last_infix_pos, key_start_bit, infix_size_,
+                            false, false, true);
+                }
+            }
+            last_infix_pos = bulk_load_streaming_ind_;
         }
-        last_infix_pos = bulk_load_streaming_ind_;
-    }
     void *dummy_locked_leaf_addrs[3] = {nullptr, nullptr, nullptr};
     uint32_t allocation_size_grade = size_scalar_shrink_grow_sep;
     if constexpr (diva_type == DivaType::BinaryTrie) {
