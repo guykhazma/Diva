@@ -1341,10 +1341,6 @@ template <DivaType diva_type, PayloadType payload_type>
 inline bool Diva<diva_type, payload_type>::RangeQuery(const uint8_t *input_l, const uint32_t input_l_len,
                                                       const uint8_t *input_r, const uint32_t input_r_len) const {
     const bool it_write_lock = false;
-    // Empty/null r matches Iterator::SetEnd(len==0): open-ended [l, +∞).
-    // A length-0 InfiniteByteString pads with zeros and is NOT +∞ — that was
-    // causing false negatives on RocksDB unbounded range seeks.
-    const bool open_ended = (input_r == nullptr || input_r_len == 0);
     const InfiniteByteString l_key {input_l, static_cast<uint32_t>(input_l_len)};
     const InfiniteByteString r_key {input_r, static_cast<uint32_t>(input_r_len)};
 
@@ -1367,10 +1363,7 @@ inline bool Diva<diva_type, payload_type>::RangeQuery(const uint8_t *input_l, co
         }
     }
 
-    // Open-ended: any later trie sample is in [l, +∞), so non-empty.
-    // Finite: non-empty if the next sample itself falls in [l, r].
-    if (prev_key == l_key ||
-        (next_key.str != nullptr && (open_ended || next_key <= r_key))) {
+    if (prev_key == l_key || (next_key.str != nullptr && next_key <= r_key)) {
         UnlockLeaves(leaves_to_unlock, it_write_lock);
         return true;
     }
@@ -2373,6 +2366,11 @@ inline Diva<diva_type, payload_type>::~Diva() {
 
 template <DivaType diva_type, PayloadType payload_type>
 inline Diva<diva_type, payload_type>::Diva(const char *deser_buf):
+        wh_(nullptr),
+        better_tree_(nullptr),
+        wh_int_(nullptr),
+        better_tree_int_(nullptr),
+        payload_size_(0),
         bulk_load_streaming_ind_(0),
         read_only_(true) {
     uint32_t ind = DeserializeMetadata(deser_buf);
@@ -2474,7 +2472,7 @@ inline uint32_t Diva<diva_type, payload_type>::DeserializeMetadata(const char *d
     rng_.seed(rng_seed_);
 
     uint64_t n_keys_val;
-    memcpy(&n_keys_val, deser_buf + res, sizeof(rng_seed_));
+    memcpy(&n_keys_val, deser_buf + res, sizeof(n_keys_val));
     res += sizeof(n_keys_val);
     n_keys_.store(n_keys_val, std::memory_order_release);
 
@@ -8812,5 +8810,3 @@ inline void Diva<diva_type, payload_type>::Infix::TrieIterator::SkipSubtree(bool
 }
 
 }
-
-
