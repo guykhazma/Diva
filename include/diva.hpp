@@ -7397,7 +7397,7 @@ QueryTrieDivergedPathRetry:
                     continue;
                 }
             }
-            return true;  // conservative: QueryTrie's range walk can miss a key on a single-side divergence (a false negative that breaks filter soundness); report maybe-non-empty instead
+            return false;
         }
 
         // Compare r_key to path, or ignore
@@ -7421,14 +7421,14 @@ QueryTrieDivergedPathRetry:
         if (l_key_dont_care && r_key_dont_care)
             return true;
         if (!r_key_dont_care && compare_r < 0)
-            return true;  // conservative: QueryTrie's range walk can miss a key on a single-side divergence (a false negative that breaks filter soundness); report maybe-non-empty instead
+            return false;
         if (it.AtPrefixKey(HasPrefixKeys()))
             return true;
 
         const uint32_t l_bit = l_key.GetBitBitLength(key_start_bit + depth) & (!l_key_dont_care);
         const uint32_t r_bit = r_key.GetBitBitLength(key_start_bit + depth) | r_key_dont_care;
         if (r_bit == 0 && (children & 1) == 0)
-            return true;  // conservative: QueryTrie's range walk can miss a key on a single-side divergence (a false negative that breaks filter soundness); report maybe-non-empty instead
+            return false;
         if (l_key_dont_care && (children & 1) == 1 && r_bit == 1)
             return true;
         if (l_bit == 0 && (children & 2) == 2 && r_key_dont_care)
@@ -7472,7 +7472,7 @@ QueryTrieAfterLoop:
             second_path = true;
             goto QueryTrieDivergedPathRetry;
         }
-        return true;  // conservative: QueryTrie's range walk can miss a key on a single-side divergence (a false negative that breaks filter soundness); report maybe-non-empty instead
+        return false;
     }
     l_key_dont_care |= (suffix & valid_mask) > (l_key.BitsAtBitLength(key_start_bit + depth, valid_len));
     r_key_dont_care |= (suffix & valid_mask) < (r_key.BitsAtBitLength(key_start_bit + depth, valid_len));
@@ -7495,7 +7495,7 @@ QueryTrieAfterLoop:
                     second_path = true;
                     goto QueryTrieDivergedPathRetry;
                 }
-                return true;  // conservative: QueryTrie's range walk can miss a key on a single-side divergence (a false negative that breaks filter soundness); report maybe-non-empty instead
+                return false;
             }
             l_key_dont_care |= (suffix & valid_mask) > (l_key.BitsAtBitLength(key_start_bit + depth, valid_len));
             r_key_dont_care |= (suffix & valid_mask) < (r_key.BitsAtBitLength(key_start_bit + depth, valid_len));
