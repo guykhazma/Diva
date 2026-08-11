@@ -6684,9 +6684,17 @@ IteratorRefetchLowerUpperBounds:
             bit_pos += 8 - bit_pos % 8;
         }
 
+        // The extraction copy above may already have bits set in the byte range
+        // where the trie suffix is overlaid. Copy both one and zero trie bits so
+        // the reconstructed key exactly matches the BinaryTrie entry.
         for (uint32_t i = 0; i < trie_key.length; i++) {
-            if (trie_key.GetBitBitLength(i))
-                key_data[(trie_start_bit + i) / 8] |= 1U << (7 - (trie_start_bit + i) % 8);
+            const uint8_t mask = 1U << (7 - (trie_start_bit + i) % 8);
+            if (trie_key.GetBitBitLength(i)) {
+                key_data[(trie_start_bit + i) / 8] |= mask;
+            }
+            else {
+                key_data[(trie_start_bit + i) / 8] &= ~mask;
+            }
         }
 
         return key;
