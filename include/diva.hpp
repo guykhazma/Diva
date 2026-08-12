@@ -405,6 +405,8 @@ private:
             uint32_t num_prefix_keys_read_ = 0;
             uint32_t num_keys_read_ = 0;
             uint32_t bit_pos_ = 0;
+            uint32_t max_bit_pos_ = UINT32_MAX;
+            bool valid_ = true;
             std::vector<std::pair<int32_t, int32_t>> depth_branch_ = {{-1, 0b11}};
 
             TrieIterator(const void *buf);
@@ -468,7 +470,8 @@ private:
                                 uint32_t slot_size) const;
         void SerializeToInfixStore(InfixStore& store, uint32_t pos, uint32_t store_size, uint32_t slot_size) const;
         void SerializeToPtr(void *ptr, uint32_t bit_pos, uint32_t slot_size) const;
-        void DeserializeFromPtr(void *ptr, uint32_t bit_pos, uint32_t slot_size);
+        void DeserializeFromPtr(void *ptr, uint32_t bit_pos, uint32_t slot_size,
+                                uint32_t max_bit_pos=UINT32_MAX);
         uint32_t GetNumTrieBitsFromInfixStore(const InfixStore& infix_store,
                                               uint32_t slot_pos, uint32_t slot_size) const;
         uint32_t GetNumTrieSlotsFromInfixStore(const InfixStore& infix_store,
@@ -6741,43 +6744,56 @@ IteratorRefetchLowerUpperBounds:
                 continue;
             const uint64_t slot_l = slot_value & (slot_value - 1);
             const uint64_t slot_r = slot_value | (slot_value - 1);
-            if (slot_r >= current_explicit_part_l && slot_l <= current_explicit_part_r) {
-                const uint32_t explicit_part_length = filter_->infix_size_ - lowbit_pos(slot_value) - 1;
+            const bool slot_overlaps_query =
+                slot_r >= current_explicit_part_l && slot_l <= current_explicit_part_r;
+            const uint32_t explicit_part_length = filter_->infix_size_ - lowbit_pos(slot_value) - 1;
 #ifdef DEBUG
-                assert(explicit_part_length <= filter_->infix_size_);
+            assert(explicit_part_length <= filter_->infix_size_);
 #endif // DEBUG
-                if constexpr (diva_type == DivaType::BinaryTrie) {
-                    if (filter_->SlotHasTrie(infix_store, pos, runend_pos)) {
-                        const Infix infix(infix_store.ptr + num_metadata_offset_words,
-                                          infix_store_target_size +
-                                              filter_->scaled_sizes_[infix_store.GetSizeGrade()] +
-                                              filter_->infix_size_ * pos,
-                                          filter_->infix_size_);
-                        auto [trie_keys, trie_key_contents] = infix.GetStrings(filter_->infix_size_);
-                        const uint64_t extraction = (recovered_implicit << filter_->infix_size_) | slot_value;
-                        std::vector<std::pair<std::string, uint32_t>> expanded_keys;
-                        expanded_keys.reserve(trie_keys.size());
-                        for (const InfiniteByteString& trie_key : trie_keys) {
-                            const uint32_t bit_count =
-                                shared + ignore + implicit_size + explicit_part_length + trie_key.length;
-                            expanded_keys.emplace_back(
-                                reconstruct_binary_trie_key(extraction, explicit_part_length, trie_key),
-                                bit_count);
-                        }
-                        std::sort(expanded_keys.begin(), expanded_keys.end(), reconstructed_key_less);
-                        for (auto& [key, bit_count] : expanded_keys) {
-                            append_reconstructed_entry(std::move(key), bit_count, pos);
+            if constexpr (diva_type == DivaType::BinaryTrie) {
+                if (filter_->SlotHasTrie(infix_store, pos, runend_pos)) {
+                    Infix infix;
+                    const uint32_t store_slots_bit_pos =
+                        infix_store_target_size +
+                        filter_->scaled_sizes_[infix_store.GetSizeGrade()];
+                    infix.DeserializeFromPtr(
+                        infix_store.ptr + num_metadata_offset_words,
+                        store_slots_bit_pos + filter_->infix_size_ * pos,
+                        filter_->infix_size_,
+                        store_slots_bit_pos + filter_->infix_size_ * (runend_pos + 1));
+                    if (infix.num_trie_bits_ != 0 && infix.num_suffixes_ != 0) {
+                        if (slot_overlaps_query) {
+                            auto [trie_keys, trie_key_contents] = infix.GetStrings(filter_->infix_size_);
+                            const uint64_t extraction =
+                                (recovered_implicit << filter_->infix_size_) | slot_value;
+                            std::vector<std::pair<std::string, uint32_t>> expanded_keys;
+                            expanded_keys.reserve(trie_keys.size());
+                            for (const InfiniteByteString& trie_key : trie_keys) {
+                                const uint32_t bit_count =
+                                    shared + ignore + implicit_size + explicit_part_length + trie_key.length;
+                                expanded_keys.emplace_back(
+                                    reconstruct_binary_trie_key(extraction, explicit_part_length, trie_key),
+                                    bit_count);
+                            }
+                            std::sort(expanded_keys.begin(), expanded_keys.end(), reconstructed_key_less);
+                            for (auto& [key, bit_count] : expanded_keys) {
+                                append_reconstructed_entry(std::move(key), bit_count, pos);
+                            }
                         }
                         pos += infix.GetNumSlots(filter_->infix_size_) - 1;
                         continue;
                     }
+                }
+                if (slot_overlaps_query) {
                     const uint64_t extraction = (recovered_implicit << filter_->infix_size_) | slot_value;
                     append_reconstructed_entry(
                         reconstruct_binary_trie_key(extraction, explicit_part_length, InfiniteByteString(nullptr, 0)),
                         shared + ignore + implicit_size + explicit_part_length,
                         pos);
                 }
-                else {
+            }
+            else {
+                if (slot_overlaps_query) {
                     append_normal_entry((recovered_implicit << filter_->infix_size_) | slot_value,
                                         shared + ignore + implicit_size + explicit_part_length,
                                         pos);
@@ -6786,21 +6802,9 @@ IteratorRefetchLowerUpperBounds:
         }
     };
 
-    if constexpr (diva_type == DivaType::BinaryTrie && payload_type == PayloadType::None) {
-        const uint64_t last_implicit_part = std::min(implicit_part_r, total_implicit - 1);
-        while (implicit_part_l <= last_implicit_part) {
-            const uint64_t current_explicit_part_r =
-                implicit_part_l == implicit_part_r ? explicit_part_r : BITMASK(filter_->infix_size_);
-            append_implicit_part(implicit_part_l, explicit_part_l, current_explicit_part_r);
-            implicit_part_l = filter_->NextOccupied(infix_store, implicit_part_l);
-            explicit_part_l = 0;
-        }
-    }
-    else {
-        const uint64_t current_explicit_part_r =
-            implicit_part_l == implicit_part_r ? explicit_part_r : BITMASK(filter_->infix_size_);
-        append_implicit_part(implicit_part_l, explicit_part_l, current_explicit_part_r);
-    }
+    const uint64_t current_explicit_part_r =
+        implicit_part_l == implicit_part_r ? explicit_part_r : BITMASK(filter_->infix_size_);
+    append_implicit_part(implicit_part_l, explicit_part_l, current_explicit_part_r);
 
     if constexpr (diva_type == DivaType::BinaryTrie && payload_type == PayloadType::None) {
         std::vector<uint32_t> order(infixes_.size());
@@ -6832,9 +6836,7 @@ IteratorRefetchLowerUpperBounds:
     }
 
     // Update `next_to_fetch_`
-    if constexpr (!(diva_type == DivaType::BinaryTrie && payload_type == PayloadType::None)) {
-        implicit_part_l = filter_->NextOccupied(infix_store, implicit_part_l);
-    }
+    implicit_part_l = filter_->NextOccupied(infix_store, implicit_part_l);
     if (implicit_part_l <= std::min(implicit_part_r, total_implicit - 1)) {
         const uint64_t recovered_extraction = (prev_implicit + implicit_part_l) << filter_->infix_size_;
         SetNextToFetchFromExtraction(prev_key, recovered_extraction);
@@ -8851,7 +8853,8 @@ void Diva<diva_type, payload_type>::Infix::SerializeToPtr(void *ptr,
 template <DivaType diva_type, PayloadType payload_type>
 void Diva<diva_type, payload_type>::Infix::DeserializeFromPtr(void *ptr,
                                                               uint32_t bit_pos,
-                                                              uint32_t slot_size) {
+                                                              uint32_t slot_size,
+                                                              uint32_t max_bit_pos) {
     // TODO: This has concurrency issues with the modification it makes to ptr. Make it work without modifying ptr.
     uint64_t read_buf;
     uint32_t read_buf_filled_len = 0, read_bit_pos = bit_pos;
@@ -8885,9 +8888,23 @@ void Diva<diva_type, payload_type>::Infix::DeserializeFromPtr(void *ptr,
     // Parse trie
     TrieIterator it(ptr);
     it.bit_pos_ = trie_start;
+    it.max_bit_pos_ = max_bit_pos;
     do {
         it.Advance(has_prefix_keys);
-    } while (it.depth_branch_.back().first != -1);
+    } while (it.valid_ && it.depth_branch_.back().first != -1);
+    if (!it.valid_) {
+        num_prefix_keys_ = 0;
+        num_trie_bits_ = 0;
+        num_suffixes_ = 0;
+        num_suffix_bits_ = 0;
+        trie_.clear();
+        trie_suffixes_.clear();
+        if (infix_ != 1) {  // Revert changes
+            write_bits_to_bitmap(ptr, bit_pos + slot_size,
+                    second_slot_backup, slot_size);
+        }
+        return;
+    }
 
     // Setup infix
     num_prefix_keys_ = has_prefix_keys + it.num_prefix_keys_read_;
@@ -8896,6 +8913,15 @@ void Diva<diva_type, payload_type>::Infix::DeserializeFromPtr(void *ptr,
     memset(trie_.data(), 0, trie_.size() * sizeof(trie_[0]));
     copy_bitmap_to_bitmap(ptr, trie_start, trie_.data(), 0, num_trie_bits_);
     num_suffixes_ = it.num_keys_read_;
+    if (num_suffixes_ == 0) {
+        num_suffix_bits_ = 0;
+        trie_suffixes_.clear();
+        if (infix_ != 1) {  // Revert changes
+            write_bits_to_bitmap(ptr, bit_pos + slot_size,
+                    second_slot_backup, slot_size);
+        }
+        return;
+    }
     num_suffix_bits_ = GetSuffixBitPos(reinterpret_cast<const uint64_t *>(ptr), num_suffixes_, 
                                        slot_size, GetActualSuffixLen(slot_size), it.bit_pos_) - it.bit_pos_;
     trie_suffixes_.resize((num_suffix_bits_ + 63) / 64);
@@ -8948,6 +8974,8 @@ inline Diva<diva_type, payload_type>::Infix::TrieIterator::TrieIterator(const Tr
         num_prefix_keys_read_(other.num_prefix_keys_read_),
         num_keys_read_(other.num_keys_read_),
         bit_pos_(other.bit_pos_),
+        max_bit_pos_(other.max_bit_pos_),
+        valid_(other.valid_),
         depth_branch_(other.depth_branch_) { 
     depth_branch_.reserve(depth_reserve_size);
 }
@@ -8959,14 +8987,25 @@ Diva<diva_type, payload_type>::Infix::TrieIterator::operator=(const TrieIterator
     num_prefix_keys_read_ = other.num_prefix_keys_read_;
     num_keys_read_ = other.num_keys_read_;
     bit_pos_ = other.bit_pos_;
+    max_bit_pos_ = other.max_bit_pos_;
+    valid_ = other.valid_;
     depth_branch_ = other.depth_branch_;
+    return *this;
 }
 
 
 template <DivaType diva_type, PayloadType payload_type>
 inline void Diva<diva_type, payload_type>::Infix::TrieIterator::Advance(bool has_prefix_keys) {
+    if (!valid_ || bit_pos_ >= max_bit_pos_) {
+        valid_ = false;
+        return;
+    }
     const bool is_leaf = AtLeaf();
     bit_pos_++;
+    if (bit_pos_ > max_bit_pos_) {
+        valid_ = false;
+        return;
+    }
     if (is_leaf) {
         while (!depth_branch_.empty()) {
             if (depth_branch_.back().second == 0b11) {
@@ -8980,14 +9019,26 @@ inline void Diva<diva_type, payload_type>::Infix::TrieIterator::Advance(bool has
     }
 
     uint32_t advance_bits = bit_pos_;
-    while ((buf_[bit_pos_ / 64] >> (bit_pos_ % 64)) == 0)
+    while (bit_pos_ < max_bit_pos_ && (buf_[bit_pos_ / 64] >> (bit_pos_ % 64)) == 0)
         bit_pos_ += 64 - bit_pos_ % 64;
+    if (bit_pos_ >= max_bit_pos_) {
+        valid_ = false;
+        return;
+    }
     bit_pos_ += lowbit_pos(buf_[bit_pos_ / 64] >> (bit_pos_ % 64)) + 1;
+    if (bit_pos_ > max_bit_pos_) {
+        valid_ = false;
+        return;
+    }
     advance_bits = bit_pos_ - advance_bits - 1;
     if (has_prefix_keys) {
         uint64_t counter = 0, pw = 1, read_buf = 0;
         uint32_t read_buf_filled_len = 0, read_bit_pos = bit_pos_;
         const uint32_t num_fragments_to_read = advance_bits + 1;
+        if (bit_pos_ + num_fragments_to_read * varlen_counter_encoding_fragment_length > max_bit_pos_) {
+            valid_ = false;
+            return;
+        }
         for (uint32_t i = 0; i < num_fragments_to_read; i++) {
             counter += read_data_from_bitmap(buf_, read_bit_pos,
                     read_buf, read_buf_filled_len,
@@ -8997,6 +9048,10 @@ inline void Diva<diva_type, payload_type>::Infix::TrieIterator::Advance(bool has
         }
         if (counter == 0) {
             num_prefix_keys_read_++;
+            if (bit_pos_ + 2 > max_bit_pos_) {
+                valid_ = false;
+                return;
+            }
             depth_branch_[depth_branch_.size() - 1].second = read_data_from_bitmap(buf_, read_bit_pos,
                     read_buf, read_buf_filled_len, 
                     2);
@@ -9004,10 +9059,18 @@ inline void Diva<diva_type, payload_type>::Infix::TrieIterator::Advance(bool has
             return;
         }
         bit_pos_ += counter - 1;
+        if (bit_pos_ > max_bit_pos_) {
+            valid_ = false;
+            return;
+        }
         depth_branch_.emplace_back(depth_branch_.back().first + counter, 0b11);
     }
     else {
         bit_pos_ += advance_bits;
+        if (bit_pos_ > max_bit_pos_) {
+            valid_ = false;
+            return;
+        }
         depth_branch_.emplace_back(depth_branch_.back().first + advance_bits + 1, 0b11);
     }
 }
