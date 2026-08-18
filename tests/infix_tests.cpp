@@ -3291,7 +3291,8 @@ public:
                     REQUIRE_EQ(memcmp(infix_store_buf, infix_store_expected_buf, sizeof(infix_store_expected_buf)), 0);
 
                     Diva<>::Infix deserialized_infix;
-                    deserialized_infix.DeserializeFromPtr(infix_store_buf, slot_pos * slot_size, slot_size);
+                    deserialized_infix.DeserializeFromPtr(infix_store_buf, slot_pos * slot_size, slot_size,
+                                                          sizeof(infix_store_buf) * 8);
                     AssertInfix(infix, deserialized_infix);
                     REQUIRE_EQ(memcmp(infix_store_buf, infix_store_expected_buf, sizeof(infix_store_expected_buf)), 0);
                 }
@@ -3309,7 +3310,8 @@ public:
                     REQUIRE_EQ(memcmp(infix_store_buf, infix_store_expected_buf, sizeof(infix_store_expected_buf)), 0);
 
                     Diva<>::Infix deserialized_infix;
-                    deserialized_infix.DeserializeFromPtr(infix_store_buf, slot_pos * slot_size, slot_size);
+                    deserialized_infix.DeserializeFromPtr(infix_store_buf, slot_pos * slot_size, slot_size,
+                                                          sizeof(infix_store_buf) * 8);
                     AssertInfix(infix, deserialized_infix);
                     REQUIRE_EQ(memcmp(infix_store_buf, infix_store_expected_buf, sizeof(infix_store_expected_buf)), 0);
                 }
@@ -3328,7 +3330,8 @@ public:
                     REQUIRE_EQ(memcmp(infix_store_buf, infix_store_expected_buf, sizeof(infix_store_expected_buf)), 0);
 
                     Diva<>::Infix deserialized_infix;
-                    deserialized_infix.DeserializeFromPtr(infix_store_buf, slot_pos * slot_size, slot_size);
+                    deserialized_infix.DeserializeFromPtr(infix_store_buf, slot_pos * slot_size, slot_size,
+                                                          sizeof(infix_store_buf) * 8);
                     AssertInfix(infix, deserialized_infix);
                     REQUIRE_EQ(memcmp(infix_store_buf, infix_store_expected_buf, sizeof(infix_store_expected_buf)), 0);
                 }
@@ -3346,7 +3349,8 @@ public:
                     REQUIRE_EQ(memcmp(infix_store_buf, infix_store_expected_buf, sizeof(infix_store_expected_buf)), 0);
 
                     Diva<>::Infix deserialized_infix;
-                    deserialized_infix.DeserializeFromPtr(infix_store_buf, slot_pos * slot_size, slot_size);
+                    deserialized_infix.DeserializeFromPtr(infix_store_buf, slot_pos * slot_size, slot_size,
+                                                          sizeof(infix_store_buf) * 8);
                     AssertInfix(infix, deserialized_infix);
                     REQUIRE_EQ(memcmp(infix_store_buf, infix_store_expected_buf, sizeof(infix_store_expected_buf)), 0);
                 }
@@ -3381,7 +3385,8 @@ public:
                     REQUIRE_EQ(memcmp(infix_store_buf, infix_store_expected_buf, sizeof(infix_store_expected_buf)), 0);
 
                     Diva<>::Infix deserialized_infix;
-                    deserialized_infix.DeserializeFromPtr(infix_store_buf, slot_pos * slot_size, slot_size);
+                    deserialized_infix.DeserializeFromPtr(infix_store_buf, slot_pos * slot_size, slot_size,
+                                                          sizeof(infix_store_buf) * 8);
                     AssertInfix(infix, deserialized_infix);
                     REQUIRE_EQ(memcmp(infix_store_buf, infix_store_expected_buf, sizeof(infix_store_expected_buf)), 0);
                 }
@@ -3399,7 +3404,8 @@ public:
                     REQUIRE_EQ(memcmp(infix_store_buf, infix_store_expected_buf, sizeof(infix_store_expected_buf)), 0);
 
                     Diva<>::Infix deserialized_infix;
-                    deserialized_infix.DeserializeFromPtr(infix_store_buf, slot_pos * slot_size, slot_size);
+                    deserialized_infix.DeserializeFromPtr(infix_store_buf, slot_pos * slot_size, slot_size,
+                                                          sizeof(infix_store_buf) * 8);
                     AssertInfix(infix, deserialized_infix);
                     REQUIRE_EQ(memcmp(infix_store_buf, infix_store_expected_buf, sizeof(infix_store_expected_buf)), 0);
                 }
@@ -3418,7 +3424,8 @@ public:
                     REQUIRE_EQ(memcmp(infix_store_buf, infix_store_expected_buf, sizeof(infix_store_expected_buf)), 0);
 
                     Diva<>::Infix deserialized_infix;
-                    deserialized_infix.DeserializeFromPtr(infix_store_buf, slot_pos * slot_size, slot_size);
+                    deserialized_infix.DeserializeFromPtr(infix_store_buf, slot_pos * slot_size, slot_size,
+                                                          sizeof(infix_store_buf) * 8);
                     AssertInfix(infix, deserialized_infix);
                     REQUIRE_EQ(memcmp(infix_store_buf, infix_store_expected_buf, sizeof(infix_store_expected_buf)), 0);
                 }
@@ -3436,7 +3443,8 @@ public:
                     REQUIRE_EQ(memcmp(infix_store_buf, infix_store_expected_buf, sizeof(infix_store_expected_buf)), 0);
 
                     Diva<>::Infix deserialized_infix;
-                    deserialized_infix.DeserializeFromPtr(infix_store_buf, slot_pos * slot_size, slot_size);
+                    deserialized_infix.DeserializeFromPtr(infix_store_buf, slot_pos * slot_size, slot_size,
+                                                          sizeof(infix_store_buf) * 8);
                     AssertInfix(infix, deserialized_infix);
                     REQUIRE_EQ(memcmp(infix_store_buf, infix_store_expected_buf, sizeof(infix_store_expected_buf)), 0);
                 }

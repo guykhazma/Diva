@@ -4464,7 +4464,10 @@ public:
                 key_length, seed, load_factor);
 
         const uint8_t adaptee[4] = {0b00110001, 0b01011010, 0b01011001, 0b10011001};
-        s.Adapt(adaptee, sizeof(adaptee), 25);
+        // Preserve the legacy fixture bytes. The old implementation mapped
+        // argument 25 to the same internal adaptation length that the
+        // count-based API maps from 24.
+        s.Adapt(adaptee, sizeof(adaptee), 24);
 
         const uint8_t *res_key;
         uint32_t res_size, dummy;
@@ -4478,6 +4481,274 @@ public:
             ReadStoreContentsFromFile("binary_trie/adapt");
         AssertStoreContents(s, *store, occupieds_pos, checks);
         wh_iter_destroy(it, check_it_write);
+    }
+
+
+    static void BinaryTrieFalsePositiveAdaptation() {
+        const uint32_t infix_size = 5;
+        const uint32_t seed = 1;
+        const float load_factor = 0.95;
+        std::vector<std::string> keys;
+        for (uint32_t value = 257; value < 65535; value += 61) {
+            std::string key(2, '\0');
+            key[0] = static_cast<char>(value >> 8);
+            key[1] = static_cast<char>(value);
+            keys.push_back(std::move(key));
+        }
+        std::sort(keys.begin(), keys.end());
+
+        // 316 is absent but collides with the 14-bit representation of the
+        // stored key 318. Their first differing bit is bit 15 (one-based), so
+        // retaining at least 15 MSB-first bits must reject the query.
+        const std::string query("\x01\x3c", 2);
+        const std::string witness("\x01\x3e", 2);
+        REQUIRE_FALSE(std::binary_search(keys.begin(), keys.end(), query));
+        REQUIRE(std::binary_search(keys.begin(), keys.end(), witness));
+
+        BinaryTrieDiva s(infix_size, keys.begin(), keys.end(), seed, load_factor);
+        REQUIRE(s.PointQuery(query));
+        REQUIRE(s.PointQuery(witness));
+
+        SUBCASE("eliminate a confirmed false positive") {
+            CHECK(s.Adapt(witness, 15) == BinaryTrieDiva::AdaptResult::kAdapted);
+            CHECK_FALSE(s.PointQuery(query));
+            for (const std::string& key : keys)
+                CHECK(s.PointQuery(key));
+            CHECK(s.Adapt(witness, 15) ==
+                  BinaryTrieDiva::AdaptResult::kAlreadySufficient);
+        }
+
+        SUBCASE("publish only the decoded witness that removes the query") {
+            CHECK(s.AdaptFalsePositive(query, witness) ==
+                  BinaryTrieDiva::AdaptResult::kAdapted);
+            CHECK_FALSE(s.PointQuery(query));
+            for (const std::string& key : keys)
+                CHECK(s.PointQuery(key));
+            CHECK(s.AdaptFalsePositive(query, witness) ==
+                  BinaryTrieDiva::AdaptResult::kAlreadySufficient);
+        }
+
+        SUBCASE("grow a serialized streaming store before publishing feedback") {
+            BinaryTrieDiva streaming(infix_size, seed, load_factor);
+            for (const std::string& key : keys)
+                streaming.BulkLoadStreaming(key);
+            streaming.BulkLoadStreamingFinish();
+            REQUIRE(streaming.PointQuery(query));
+
+            std::vector<char> serialized(streaming.Size());
+            const uint32_t serialized_size =
+                streaming.Serialize(serialized.data());
+            REQUIRE(serialized_size <= serialized.size());
+            serialized.resize(serialized_size);
+            const std::vector<char> original_bytes = serialized;
+            BinaryTrieDiva deserialized(serialized.data());
+
+            REQUIRE(deserialized.AdaptFalsePositive(query, witness) ==
+                    BinaryTrieDiva::AdaptResult::kAdapted);
+            CHECK(deserialized.GetCopyOnWriteBytes() > 0);
+            CHECK_FALSE(deserialized.PointQuery(query));
+            for (const std::string& key : keys)
+                CHECK(deserialized.PointQuery(key));
+            CHECK(serialized == original_bytes);
+        }
+
+        SUBCASE("discard an unrelated decoded key") {
+            const std::string unrelated("\x01\x7b", 2);  // Stored key 379.
+            REQUIRE(std::binary_search(keys.begin(), keys.end(), unrelated));
+            CHECK(s.AdaptFalsePositive(query, unrelated) ==
+                  BinaryTrieDiva::AdaptResult::kWitnessNotFound);
+            CHECK(s.PointQuery(query));
+            for (const std::string& key : keys)
+                CHECK(s.PointQuery(key));
+        }
+
+        SUBCASE("reject invalid adaptations") {
+            CHECK(s.Adapt(nullptr, 0, 0) ==
+                  BinaryTrieDiva::AdaptResult::kInvalidArgument);
+            CHECK(s.Adapt(witness, 17) ==
+                  BinaryTrieDiva::AdaptResult::kInvalidArgument);
+        }
+
+        SUBCASE("copy on write after deserialization") {
+            std::vector<char> serialized(s.Size());
+            const uint32_t serialized_size = s.Serialize(serialized.data());
+            REQUIRE(serialized_size <= serialized.size());
+            serialized.resize(serialized_size);
+            const std::vector<char> original_bytes = serialized;
+
+            BinaryTrieDiva deserialized(serialized.data());
+            BinaryTrieDiva untouched_reader(serialized.data());
+            CHECK(deserialized.GetCopyOnWriteBytes() == 0);
+
+            typename BinaryTrieDiva::InfiniteByteString witness_key{
+                reinterpret_cast<const uint8_t *>(witness.data()),
+                static_cast<uint32_t>(witness.size())};
+            typename BinaryTrieDiva::InfiniteByteString prev_key, next_key;
+            typename BinaryTrieDiva::InfixStore *store = nullptr;
+            void *leaves_to_unlock[3] = {};
+            wormhole_iter it;
+            wormhole_int_iter it_int;
+            deserialized.GetLowerUpperBounds(witness_key, false,
+                                             leaves_to_unlock, it, it_int,
+                                             prev_key, next_key, store);
+            deserialized.UnlockLeaves(leaves_to_unlock, false);
+            REQUIRE(store != nullptr);
+            REQUIRE_FALSE(store->owns_ptr);
+            uint64_t *const serialized_store_ptr = store->ptr;
+            const uint64_t word_count = store->GetPtrWordCount(
+                deserialized.scaled_sizes_[store->GetSizeGrade()],
+                deserialized.infix_size_, deserialized.payload_size_);
+
+            typename BinaryTrieDiva::InfiniteByteString unrelated_key{
+                reinterpret_cast<const uint8_t *>(keys.back().data()),
+                static_cast<uint32_t>(keys.back().size())};
+            typename BinaryTrieDiva::InfixStore *unrelated_store = nullptr;
+            leaves_to_unlock[0] = leaves_to_unlock[1] =
+                leaves_to_unlock[2] = nullptr;
+            deserialized.GetLowerUpperBounds(
+                unrelated_key, false, leaves_to_unlock, it, it_int, prev_key,
+                next_key, unrelated_store);
+            deserialized.UnlockLeaves(leaves_to_unlock, false);
+            REQUIRE(unrelated_store != nullptr);
+            REQUIRE(unrelated_store != store);
+            REQUIRE_FALSE(unrelated_store->owns_ptr);
+            uint64_t *const unrelated_serialized_ptr = unrelated_store->ptr;
+
+            // A no-op does not allocate or stop using the serialized store.
+            CHECK(deserialized.Adapt(witness, 14) ==
+                  BinaryTrieDiva::AdaptResult::kAlreadySufficient);
+            CHECK_FALSE(store->owns_ptr);
+            CHECK(store->ptr == serialized_store_ptr);
+            CHECK(deserialized.GetCopyOnWriteBytes() == 0);
+
+            CHECK(deserialized.Adapt(witness, 15) ==
+                  BinaryTrieDiva::AdaptResult::kAdapted);
+            CHECK(store->owns_ptr);
+            CHECK(store->ptr != serialized_store_ptr);
+            CHECK_FALSE(unrelated_store->owns_ptr);
+            CHECK(unrelated_store->ptr == unrelated_serialized_ptr);
+            CHECK(deserialized.GetCopyOnWriteBytes() ==
+                  word_count * sizeof(uint64_t));
+            CHECK_FALSE(deserialized.PointQuery(query));
+            CHECK(deserialized.PointQuery(witness));
+            for (const std::string& key : keys)
+                CHECK(deserialized.PointQuery(key));
+
+            // Repeating the adaptation neither allocates another generation
+            // nor changes the serialized source used by another reader.
+            CHECK(deserialized.Adapt(witness, 15) ==
+                  BinaryTrieDiva::AdaptResult::kAlreadySufficient);
+            CHECK(deserialized.GetCopyOnWriteBytes() ==
+                  word_count * sizeof(uint64_t));
+            CHECK(serialized == original_bytes);
+            CHECK(untouched_reader.GetCopyOnWriteBytes() == 0);
+            CHECK(untouched_reader.PointQuery(query));
+            CHECK(untouched_reader.PointQuery(witness));
+        }
+
+        SUBCASE("concurrent readers observe complete COW generations") {
+            std::vector<char> serialized(s.Size());
+            const uint32_t serialized_size = s.Serialize(serialized.data());
+            REQUIRE(serialized_size <= serialized.size());
+            serialized.resize(serialized_size);
+            const std::vector<char> original_bytes = serialized;
+            BinaryTrieDiva deserialized(serialized.data());
+
+            std::atomic<bool> start{false};
+            std::atomic<bool> witness_missing{false};
+            std::vector<std::thread> readers;
+            for (uint32_t thread = 0; thread < 4; ++thread) {
+                readers.emplace_back([&] {
+                    while (!start.load(std::memory_order_acquire))
+                        std::this_thread::yield();
+                    for (uint32_t i = 0; i < 20000; ++i) {
+                        if (!deserialized.PointQuery(witness))
+                            witness_missing.store(true,
+                                                  std::memory_order_release);
+                        // The colliding absent query may change from true to
+                        // false while this loop is running; either generation
+                        // is a sound observation.
+                        static_cast<void>(deserialized.PointQuery(query));
+                    }
+                });
+            }
+            start.store(true, std::memory_order_release);
+            CHECK(deserialized.Adapt(witness, 15) ==
+                  BinaryTrieDiva::AdaptResult::kAdapted);
+            for (std::thread& reader : readers)
+                reader.join();
+
+            CHECK_FALSE(witness_missing.load(std::memory_order_acquire));
+            CHECK_FALSE(deserialized.PointQuery(query));
+            CHECK(deserialized.PointQuery(witness));
+            CHECK(deserialized.GetCopyOnWriteBytes() > 0);
+            CHECK(serialized == original_bytes);
+        }
+
+        SUBCASE("no capacity leaves the store unchanged") {
+            typename BinaryTrieDiva::InfiniteByteString witness_key{
+                reinterpret_cast<const uint8_t *>(witness.data()),
+                static_cast<uint32_t>(witness.size())};
+            typename BinaryTrieDiva::InfiniteByteString prev_key, next_key;
+            typename BinaryTrieDiva::InfixStore *store = nullptr;
+            void *leaves_to_unlock[3] = {};
+            wormhole_iter it;
+            wormhole_int_iter it_int;
+            s.GetLowerUpperBounds(witness_key, false, leaves_to_unlock, it, it_int,
+                                  prev_key, next_key, store);
+            s.UnlockLeaves(leaves_to_unlock, false);
+            REQUIRE(store != nullptr);
+
+            const uint64_t saved_status = store->status;
+            const uint32_t size_grade = store->GetSizeGrade();
+            store->SetFullSlotCount(s.scaled_sizes_[size_grade] - 1);
+            const uint64_t forced_status = store->status;
+            const uint64_t word_count = store->GetPtrWordCount(
+                s.scaled_sizes_[size_grade], s.infix_size_, s.payload_size_);
+            const std::vector<uint64_t> before(store->ptr,
+                                               store->ptr + word_count);
+
+            CHECK(s.Adapt(witness, 15) ==
+                  BinaryTrieDiva::AdaptResult::kNoCapacity);
+            CHECK(store->status == forced_status);
+            CHECK(std::equal(before.begin(), before.end(), store->ptr));
+
+            // Restore the valid count before the filter is queried or freed.
+            store->status = saved_status;
+            CHECK(s.PointQuery(query));
+            CHECK(s.PointQuery(witness));
+        }
+
+        SUBCASE("variable-length prefix keys survive serialized adaptation") {
+            std::vector<std::string> variable_keys = keys;
+            // Keep a key and its strict extension in a later store. They
+            // exercise BinaryTrie's prefix-key encoding without changing the
+            // known 316/318 collision near the beginning of the filter.
+            variable_keys.emplace_back("z", 1);
+            variable_keys.emplace_back("z\x00", 2);
+            std::sort(variable_keys.begin(), variable_keys.end());
+
+            BinaryTrieDiva variable(
+                infix_size, variable_keys.begin(), variable_keys.end(), seed,
+                load_factor);
+            REQUIRE(variable.PointQuery(query));
+            REQUIRE(variable.PointQuery(witness));
+
+            std::vector<char> serialized(variable.Size());
+            const uint32_t serialized_size =
+                variable.Serialize(serialized.data());
+            REQUIRE(serialized_size <= serialized.size());
+            serialized.resize(serialized_size);
+            const std::vector<char> original_bytes = serialized;
+            BinaryTrieDiva deserialized(serialized.data());
+
+            REQUIRE(deserialized.Adapt(witness, 15) ==
+                    BinaryTrieDiva::AdaptResult::kAdapted);
+            CHECK_FALSE(deserialized.PointQuery(query));
+            for (const std::string& key : variable_keys)
+                CHECK(deserialized.PointQuery(key));
+            CHECK(serialized == original_bytes);
+        }
     }
 
 
@@ -4993,6 +5264,10 @@ TEST_SUITE("binary trie") {
 
     TEST_CASE("adapt") {
         DivaTests::BinaryTrieAdapt();
+    }
+
+    TEST_CASE("false positive adaptation") {
+        DivaTests::BinaryTrieFalsePositiveAdaptation();
     }
 }
 
