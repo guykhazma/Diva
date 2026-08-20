@@ -166,6 +166,17 @@ public:
                                    uint32_t query_len,
                                    const uint8_t *witness,
                                    uint32_t witness_len);
+    // Best-effort feedback for an inclusive range [l, r] that storage has
+    // proved empty. `witness` is the first real key after r and must have been
+    // decoded by that lookup. The update is published only if extending the
+    // witness makes the complete inclusive range negative.
+    AdaptResult AdaptFalsePositiveRange(std::string_view l,
+                                        std::string_view r,
+                                        std::string_view witness);
+    AdaptResult AdaptFalsePositiveRange(const uint8_t *l, uint32_t l_len,
+                                        const uint8_t *r, uint32_t r_len,
+                                        const uint8_t *witness,
+                                        uint32_t witness_len);
     void ShrinkInfixSize(const uint32_t new_infix_size);
     uint64_t Size() const;
     uint32_t Serialize(char *out) const;
@@ -730,7 +741,11 @@ private:
                           uint32_t input_key_len,
                           uint32_t new_prefix_len,
                           const uint8_t *query_to_reject,
-                          uint32_t query_to_reject_len);
+                          uint32_t query_to_reject_len,
+                          const uint8_t *range_l_to_reject = nullptr,
+                          uint32_t range_l_to_reject_len = 0,
+                          const uint8_t *range_r_to_reject = nullptr,
+                          uint32_t range_r_to_reject_len = 0);
     // Assumes that `key` is a full length infix.
     void DeleteRawFromInfixStore(InfixStore &store, const uint64_t key,
                                  const uint32_t total_implicit=infix_store_target_size,
@@ -3275,15 +3290,82 @@ Diva<diva_type, payload_type>::AdaptFalsePositive(
 
 template <DivaType diva_type, PayloadType payload_type>
 inline typename Diva<diva_type, payload_type>::AdaptResult
+Diva<diva_type, payload_type>::AdaptFalsePositiveRange(
+        std::string_view l, std::string_view r, std::string_view witness) {
+    return AdaptFalsePositiveRange(
+        reinterpret_cast<const uint8_t *>(l.data()), l.size(),
+        reinterpret_cast<const uint8_t *>(r.data()), r.size(),
+        reinterpret_cast<const uint8_t *>(witness.data()), witness.size());
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline typename Diva<diva_type, payload_type>::AdaptResult
+Diva<diva_type, payload_type>::AdaptFalsePositiveRange(
+        const uint8_t *l, const uint32_t l_len,
+        const uint8_t *r, const uint32_t r_len,
+        const uint8_t *witness, const uint32_t witness_len) {
+    if (l == nullptr || l_len == 0 || r == nullptr || r_len == 0 ||
+        witness == nullptr || witness_len == 0) {
+        return AdaptResult::kInvalidArgument;
+    }
+
+    const InfiniteByteString l_key{l, l_len};
+    const InfiniteByteString r_key{r, r_len};
+    const InfiniteByteString witness_key{witness, witness_len};
+    // RocksDB invokes this only after Seek(l) returned a real key strictly
+    // after its exclusive upper bound r. Keeping that condition here makes the
+    // inclusive Diva feedback contract independently safe.
+    if (r_key < l_key || !(r_key < witness_key)) {
+        return AdaptResult::kInvalidArgument;
+    }
+    if (!RangeQuery(l, l_len, r, r_len)) {
+        return AdaptResult::kAlreadySufficient;
+    }
+
+    const uint32_t shared_bytes = std::min(r_len, witness_len);
+    uint32_t first_different_bit = 8 * shared_bytes;
+    for (uint32_t i = 0; i < shared_bytes; ++i) {
+        const uint8_t diff = r[i] ^ witness[i];
+        if (diff != 0) {
+            first_different_bit = 8 * i + __builtin_clz(
+                static_cast<uint32_t>(diff)) - 24;
+            break;
+        }
+    }
+    // r < witness guarantees that the keys differ. For a strict-prefix pair,
+    // request the complete witness and let private-candidate validation decide
+    // whether Diva can represent enough information to reject [l, r].
+    const uint32_t new_prefix_len =
+        first_different_bit < 8 * shared_bytes
+            ? first_different_bit + 1
+            : 8 * witness_len;
+    return AdaptImpl(witness, witness_len, new_prefix_len,
+                     nullptr, 0, l, l_len, r, r_len);
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline typename Diva<diva_type, payload_type>::AdaptResult
 Diva<diva_type, payload_type>::AdaptImpl(
         const uint8_t *input_key, const uint32_t input_key_len,
         const uint32_t new_prefix_len, const uint8_t *query_to_reject,
-        const uint32_t query_to_reject_len) {
+        const uint32_t query_to_reject_len,
+        const uint8_t *range_l_to_reject,
+        const uint32_t range_l_to_reject_len,
+        const uint8_t *range_r_to_reject,
+        const uint32_t range_r_to_reject_len) {
+    const bool validate_point_rejection = query_to_reject != nullptr;
+    const bool validate_range_rejection = range_l_to_reject != nullptr;
     static_assert(diva_type == DivaType::BinaryTrie,
                   "Adapt is supported only by BinaryTrie Diva");
     if (input_key == nullptr || input_key_len == 0 ||
         new_prefix_len > 8ULL * input_key_len ||
-        ((query_to_reject == nullptr) != (query_to_reject_len == 0))) {
+        ((query_to_reject == nullptr) != (query_to_reject_len == 0)) ||
+        ((range_l_to_reject == nullptr) != (range_l_to_reject_len == 0)) ||
+        ((range_r_to_reject == nullptr) != (range_r_to_reject_len == 0)) ||
+        (validate_range_rejection != (range_r_to_reject != nullptr)) ||
+        (validate_point_rejection && validate_range_rejection)) {
         return AdaptResult::kInvalidArgument;
     }
     // BinaryTrie with payloads is not used by RocksDB. Its deserialized sample
@@ -3321,14 +3403,26 @@ Diva<diva_type, payload_type>::AdaptImpl(
         return AdaptResult::kWitnessNotFound;
     }
 
-    const bool validate_point_rejection = query_to_reject != nullptr;
-    const bool validate_rejection = validate_point_rejection;
+    const bool validate_rejection =
+        validate_point_rejection || validate_range_rejection;
     const InfiniteByteString query = {query_to_reject, query_to_reject_len};
     if (validate_point_rejection &&
         (!(prev_key < query) || next_key.str == nullptr || !(query < next_key))) {
         // The query and witness route to different infix stores (or the query
         // is itself a fully stored tree key), so this witness cannot justify
         // mutating the query's matching representation.
+        UnlockLeaves(leaves_to_unlock, it_write_lock);
+        return AdaptResult::kWitnessNotFound;
+    }
+    const InfiniteByteString range_l = {range_l_to_reject,
+                                        range_l_to_reject_len};
+    const InfiniteByteString range_r = {range_r_to_reject,
+                                        range_r_to_reject_len};
+    if (validate_range_rejection &&
+        (range_r < range_l || !(prev_key < range_l) ||
+         next_key.str == nullptr || !(range_r < next_key))) {
+        // A confirmed-empty inclusive range cannot cross or equal a fully
+        // stored trie key. Both endpoints must route to the witness's store.
         UnlockLeaves(leaves_to_unlock, it_write_lock);
         return AdaptResult::kWitnessNotFound;
     }
@@ -3373,6 +3467,26 @@ Diva<diva_type, payload_type>::AdaptImpl(
         }
     }
 
+    uint64_t range_l_key = 0;
+    uint64_t range_r_key = 0;
+    if (validate_range_rejection) {
+        const uint64_t range_l_extraction = ExtractPartialKey(
+            range_l, shared, ignore, implicit_size, range_l.GetBit(shared));
+        const uint64_t range_r_extraction = ExtractPartialKey(
+            range_r, shared, ignore, implicit_size, range_r.GetBit(shared));
+        range_l_key = (range_l_extraction | 1ULL) -
+                      (prev_implicit << infix_size_);
+        range_r_key = (range_r_extraction | 1ULL) -
+                      (prev_implicit << infix_size_);
+        if (!RangeQueryInfixStore(
+                infix_store, range_l_key, range_r_key, total_implicit,
+                {range_l.str, 8 * range_l.length},
+                {range_r.str, 8 * range_r.length}, key_start_bit)) {
+            rwlock_unlock_write(infix_store.rwlock);
+            return AdaptResult::kWitnessNotFound;
+        }
+    }
+
     // Always adapt a private candidate. Besides preserving zero-copy source
     // bytes, this lets false-positive feedback verify that this exact witness
     // removes the query before publishing the new generation.
@@ -3401,6 +3515,14 @@ Diva<diva_type, payload_type>::AdaptImpl(
                              {query.str, 8 * query.length}, key_start_bit)) {
         // The decoded data-block key is real, but a different representation
         // caused this false positive. Discard the speculative update.
+        result = AdaptResult::kWitnessNotFound;
+    } else if (result == AdaptResult::kAdapted && validate_range_rejection &&
+               RangeQueryInfixStore(
+                   candidate, range_l_key, range_r_key, total_implicit,
+                   {range_l.str, 8 * range_l.length},
+                   {range_r.str, 8 * range_r.length}, key_start_bit)) {
+        // The real successor did not cause the complete range false positive
+        // (for example, the left endpoint collided with a predecessor).
         result = AdaptResult::kWitnessNotFound;
     } else if (result == AdaptResult::kAlreadySufficient && validate_rejection) {
         result = AdaptResult::kWitnessNotFound;

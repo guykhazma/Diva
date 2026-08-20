@@ -4528,6 +4528,24 @@ public:
                   BinaryTrieDiva::AdaptResult::kAlreadySufficient);
         }
 
+        SUBCASE("publish only a successor that removes the complete range") {
+            const std::string range_l("\x01\x3b", 2);  // 315, absent.
+            const std::string range_r("\x01\x3c", 2);  // 316, absent.
+            REQUIRE(s.RangeQuery(range_l, range_r));
+            CHECK(s.AdaptFalsePositiveRange(range_l, range_r, witness) ==
+                  BinaryTrieDiva::AdaptResult::kAdapted);
+            CHECK_FALSE(s.RangeQuery(range_l, range_r));
+            for (const std::string& key : keys)
+                CHECK(s.PointQuery(key));
+            CHECK(s.AdaptFalsePositiveRange(range_l, range_r, witness) ==
+                  BinaryTrieDiva::AdaptResult::kAlreadySufficient);
+
+            // An inclusive range containing its witness is not false-positive
+            // feedback and has no distinguishing bit to add.
+            CHECK(s.AdaptFalsePositiveRange(range_l, witness, witness) ==
+                  BinaryTrieDiva::AdaptResult::kInvalidArgument);
+        }
+
         SUBCASE("grow a serialized streaming store before publishing feedback") {
             BinaryTrieDiva streaming(infix_size, seed, load_factor);
             for (const std::string& key : keys)
@@ -4558,6 +4576,28 @@ public:
             CHECK(s.AdaptFalsePositive(query, unrelated) ==
                   BinaryTrieDiva::AdaptResult::kWitnessNotFound);
             CHECK(s.PointQuery(query));
+            for (const std::string& key : keys)
+                CHECK(s.PointQuery(key));
+        }
+
+        SUBCASE("retry the predecessor when the successor is unrelated") {
+            const std::string predecessor("\x01\x3e", 2);  // Stored key 318.
+            const std::string predecessor_query("\x01\x3f", 2);  // 319.
+            const std::string successor("\x01\x7b", 2);  // Stored key 379.
+            REQUIRE_FALSE(std::binary_search(keys.begin(), keys.end(),
+                                             predecessor_query));
+            REQUIRE(std::binary_search(keys.begin(), keys.end(), predecessor));
+            REQUIRE(std::binary_search(keys.begin(), keys.end(), successor));
+            REQUIRE(s.PointQuery(predecessor_query));
+
+            // SeekForGet naturally decodes 379, but this false positive is
+            // caused by 318's representation on the other side of the query.
+            CHECK(s.AdaptFalsePositive(predecessor_query, successor) ==
+                  BinaryTrieDiva::AdaptResult::kWitnessNotFound);
+            CHECK(s.PointQuery(predecessor_query));
+            CHECK(s.AdaptFalsePositive(predecessor_query, predecessor) ==
+                  BinaryTrieDiva::AdaptResult::kAdapted);
+            CHECK_FALSE(s.PointQuery(predecessor_query));
             for (const std::string& key : keys)
                 CHECK(s.PointQuery(key));
         }
