@@ -4485,6 +4485,11 @@ public:
 
 
     static void BinaryTrieFalsePositiveAdaptation() {
+        using FixedPayloadBinaryTrieDiva =
+            Diva<DivaType::BinaryTrie, PayloadType::FixedLength>;
+        static_assert(sizeof(typename BinaryTrieDiva::InfixStore) <
+                      sizeof(typename FixedPayloadBinaryTrieDiva::InfixStore));
+
         const uint32_t infix_size = 5;
         const uint32_t seed = 1;
         const float load_factor = 0.95;
@@ -4508,6 +4513,66 @@ public:
         BinaryTrieDiva s(infix_size, keys.begin(), keys.end(), seed, load_factor);
         REQUIRE(s.PointQuery(query));
         REQUIRE(s.PointQuery(witness));
+
+        SUBCASE("return a stable opaque token for one collision generation") {
+            BinaryTrieDiva::CollisionToken first = 0;
+            BinaryTrieDiva::CollisionToken second = 0;
+            CHECK(s.GetCollisionToken(query, &first) ==
+                  BinaryTrieDiva::CollisionTokenResult::kFound);
+            CHECK(s.GetCollisionToken(query, &second) ==
+                  BinaryTrieDiva::CollisionTokenResult::kFound);
+            CHECK(first != 0);
+            CHECK(first == second);
+
+            BinaryTrieDiva::CollisionToken from_initial_probe = 0;
+            CHECK(s.PointQueryWithCollisionToken(
+                query, &from_initial_probe));
+            CHECK(from_initial_probe == first);
+        }
+
+        SUBCASE("different queries identify the same stored representation") {
+            const std::string same_collision_query("\x01\x3f", 2);  // 319.
+            REQUIRE(s.PointQuery(same_collision_query));
+            BinaryTrieDiva::CollisionToken first = 0;
+            BinaryTrieDiva::CollisionToken second = 0;
+            CHECK(s.GetCollisionToken(query, &first) ==
+                  BinaryTrieDiva::CollisionTokenResult::kFound);
+            CHECK(s.GetCollisionToken(same_collision_query, &second) ==
+                  BinaryTrieDiva::CollisionTokenResult::kFound);
+            CHECK(first == second);
+        }
+
+        SUBCASE("a new store generation has a different token") {
+            typename BinaryTrieDiva::InfiniteByteString witness_key{
+                reinterpret_cast<const uint8_t *>(witness.data()),
+                static_cast<uint32_t>(witness.size())};
+            typename BinaryTrieDiva::InfiniteByteString prev_key, next_key;
+            typename BinaryTrieDiva::InfixStore *store = nullptr;
+            void *leaves_to_unlock[3] = {};
+            wormhole_iter it;
+            wormhole_int_iter it_int;
+            s.GetLowerUpperBounds(witness_key, false, leaves_to_unlock, it,
+                                  it_int, prev_key, next_key, store);
+            s.UnlockLeaves(leaves_to_unlock, false);
+            REQUIRE(store != nullptr);
+
+            typename BinaryTrieDiva::CollisionLocation old_generation;
+            old_generation.store = store;
+            old_generation.group_slot = 7;
+            old_generation.local_ordinal = 11;
+            old_generation.mutation_epoch = store->mutation_epoch;
+            old_generation.valid = true;
+            BinaryTrieDiva::CollisionToken old_token = 0;
+            CHECK(s.BuildCollisionToken(old_generation, &old_token) ==
+                  BinaryTrieDiva::CollisionTokenResult::kFound);
+
+            auto new_generation = old_generation;
+            ++new_generation.mutation_epoch;
+            BinaryTrieDiva::CollisionToken new_token = 0;
+            CHECK(s.BuildCollisionToken(new_generation, &new_token) ==
+                  BinaryTrieDiva::CollisionTokenResult::kFound);
+            CHECK(old_token != new_token);
+        }
 
         SUBCASE("eliminate a confirmed false positive") {
             CHECK(s.Adapt(witness, 15) == BinaryTrieDiva::AdaptResult::kAdapted);
@@ -4561,9 +4626,14 @@ public:
             const std::vector<char> original_bytes = serialized;
             BinaryTrieDiva deserialized(serialized.data());
 
+            const uint64_t owned_bytes_before =
+                deserialized.GetOwnedInfixStoreBytes();
+            REQUIRE(owned_bytes_before > 0);
             REQUIRE(deserialized.AdaptFalsePositive(query, witness) ==
                     BinaryTrieDiva::AdaptResult::kAdapted);
-            CHECK(deserialized.GetCopyOnWriteBytes() > 0);
+            CHECK(deserialized.GetResizeAdaptationCount() == 1);
+            CHECK(deserialized.GetAdaptationResizeBytes() > 0);
+            CHECK(deserialized.GetOwnedInfixStoreBytes() > owned_bytes_before);
             CHECK_FALSE(deserialized.PointQuery(query));
             for (const std::string& key : keys)
                 CHECK(deserialized.PointQuery(key));
@@ -4609,7 +4679,7 @@ public:
                   BinaryTrieDiva::AdaptResult::kInvalidArgument);
         }
 
-        SUBCASE("copy on write after deserialization") {
+        SUBCASE("deserialized stores are independently owned and reused") {
             std::vector<char> serialized(s.Size());
             const uint32_t serialized_size = s.Serialize(serialized.data());
             REQUIRE(serialized_size <= serialized.size());
@@ -4618,7 +4688,9 @@ public:
 
             BinaryTrieDiva deserialized(serialized.data());
             BinaryTrieDiva untouched_reader(serialized.data());
-            CHECK(deserialized.GetCopyOnWriteBytes() == 0);
+            const uint64_t owned_bytes =
+                deserialized.GetOwnedInfixStoreBytes();
+            REQUIRE(owned_bytes > 0);
 
             typename BinaryTrieDiva::InfiniteByteString witness_key{
                 reinterpret_cast<const uint8_t *>(witness.data()),
@@ -4633,11 +4705,11 @@ public:
                                              prev_key, next_key, store);
             deserialized.UnlockLeaves(leaves_to_unlock, false);
             REQUIRE(store != nullptr);
-            REQUIRE_FALSE(store->owns_ptr);
-            uint64_t *const serialized_store_ptr = store->ptr;
-            const uint64_t word_count = store->GetPtrWordCount(
-                deserialized.scaled_sizes_[store->GetSizeGrade()],
-                deserialized.infix_size_, deserialized.payload_size_);
+            uint64_t *const owned_store_ptr = store->ptr;
+            const char* const store_bytes =
+                reinterpret_cast<const char*>(store->ptr);
+            CHECK((store_bytes < serialized.data() ||
+                   store_bytes >= serialized.data() + serialized.size()));
 
             typename BinaryTrieDiva::InfiniteByteString unrelated_key{
                 reinterpret_cast<const uint8_t *>(keys.back().data()),
@@ -4651,42 +4723,59 @@ public:
             deserialized.UnlockLeaves(leaves_to_unlock, false);
             REQUIRE(unrelated_store != nullptr);
             REQUIRE(unrelated_store != store);
-            REQUIRE_FALSE(unrelated_store->owns_ptr);
-            uint64_t *const unrelated_serialized_ptr = unrelated_store->ptr;
+            uint64_t *const unrelated_owned_ptr = unrelated_store->ptr;
 
-            // A no-op does not allocate or stop using the serialized store.
+            // A no-op leaves the independently owned store untouched.
             CHECK(deserialized.Adapt(witness, 14) ==
                   BinaryTrieDiva::AdaptResult::kAlreadySufficient);
-            CHECK_FALSE(store->owns_ptr);
-            CHECK(store->ptr == serialized_store_ptr);
-            CHECK(deserialized.GetCopyOnWriteBytes() == 0);
+            CHECK(store->ptr == owned_store_ptr);
+            CHECK(deserialized.GetOwnedInfixStoreBytes() == owned_bytes);
 
             CHECK(deserialized.Adapt(witness, 15) ==
                   BinaryTrieDiva::AdaptResult::kAdapted);
-            CHECK(store->owns_ptr);
-            CHECK(store->ptr != serialized_store_ptr);
-            CHECK_FALSE(unrelated_store->owns_ptr);
-            CHECK(unrelated_store->ptr == unrelated_serialized_ptr);
-            CHECK(deserialized.GetCopyOnWriteBytes() ==
-                  word_count * sizeof(uint64_t));
+            CHECK(store->ptr == owned_store_ptr);
+            CHECK(unrelated_store->ptr == unrelated_owned_ptr);
+            CHECK(deserialized.GetOwnedInfixStoreBytes() == owned_bytes);
+            CHECK(deserialized.GetInPlaceAdaptationCount() == 1);
+            CHECK(deserialized.GetResizeAdaptationCount() == 0);
             CHECK_FALSE(deserialized.PointQuery(query));
             CHECK(deserialized.PointQuery(witness));
             for (const std::string& key : keys)
                 CHECK(deserialized.PointQuery(key));
 
-            // Repeating the adaptation neither allocates another generation
-            // nor changes the serialized source used by another reader.
+            // Repeating the adaptation does not allocate another generation
+            // or affect an independently deserialized reader.
             CHECK(deserialized.Adapt(witness, 15) ==
                   BinaryTrieDiva::AdaptResult::kAlreadySufficient);
-            CHECK(deserialized.GetCopyOnWriteBytes() ==
-                  word_count * sizeof(uint64_t));
+            CHECK(deserialized.GetOwnedInfixStoreBytes() == owned_bytes);
+            CHECK(deserialized.GetInPlaceAdaptationCount() == 1);
             CHECK(serialized == original_bytes);
-            CHECK(untouched_reader.GetCopyOnWriteBytes() == 0);
+            CHECK(untouched_reader.GetOwnedInfixStoreBytes() == owned_bytes);
             CHECK(untouched_reader.PointQuery(query));
             CHECK(untouched_reader.PointQuery(witness));
         }
 
-        SUBCASE("concurrent readers observe complete COW generations") {
+        SUBCASE("deserialized no-payload stores outlive their source bytes") {
+            std::unique_ptr<BinaryTrieDiva> deserialized;
+            {
+                std::vector<char> serialized(s.Size());
+                const uint32_t serialized_size =
+                    s.Serialize(serialized.data());
+                REQUIRE(serialized_size <= serialized.size());
+                serialized.resize(serialized_size);
+                deserialized =
+                    std::make_unique<BinaryTrieDiva>(serialized.data());
+                std::fill(serialized.begin(), serialized.end(), '\0');
+            }
+
+            REQUIRE(deserialized->GetOwnedInfixStoreBytes() > 0);
+            CHECK(deserialized->PointQuery(query));
+            CHECK(deserialized->PointQuery(witness));
+            for (const std::string& key : keys)
+                CHECK(deserialized->PointQuery(key));
+        }
+
+        SUBCASE("concurrent readers observe complete in-place generations") {
             std::vector<char> serialized(s.Size());
             const uint32_t serialized_size = s.Serialize(serialized.data());
             REQUIRE(serialized_size <= serialized.size());
@@ -4721,7 +4810,8 @@ public:
             CHECK_FALSE(witness_missing.load(std::memory_order_acquire));
             CHECK_FALSE(deserialized.PointQuery(query));
             CHECK(deserialized.PointQuery(witness));
-            CHECK(deserialized.GetCopyOnWriteBytes() > 0);
+            CHECK(deserialized.GetInPlaceAdaptationCount() == 1);
+            CHECK(deserialized.GetResizeAdaptationCount() == 0);
             CHECK(serialized == original_bytes);
         }
 
@@ -4951,7 +5041,7 @@ private:
 
         const uint8_t *tree_key_a, *tree_key_b;
         uint32_t tree_key_a_len, tree_key_b_len, dummy;
-        typename Diva<diva_type>::InfixStore *store_a, *store_b;
+        typename Diva<diva_type, payload_type>::InfixStore *store_a, *store_b;
         const bool check_it_write = false;
         const bool check_it_unlock = true;
         if constexpr (diva_type == DivaType::Int) {

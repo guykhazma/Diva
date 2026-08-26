@@ -21,6 +21,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <tuple>
+#include <type_traits>
 #include <vector>
 #include <x86intrin.h>
 
@@ -153,6 +154,27 @@ public:
         kReadOnly,
     };
 
+    // Diva identifies a mutable representation without owning the policy that
+    // decides when it is worth adapting. The token is opaque to callers and
+    // changes whenever that representation's store generation changes.
+    using CollisionToken = uint64_t;
+    enum class CollisionTokenResult : uint8_t {
+        kFound,
+        // The query is no longer positive, or it matched a fully stored tree
+        // key rather than an adaptable infix representation.
+        kNoCollision,
+        kReadOnly,
+    };
+    // Performs the ordinary point probe and, when the positive answer comes
+    // from an adaptable BinaryTrie representation, returns its non-zero
+    // collision token from the same traversal. Other positive/negative
+    // answers leave `token` zero.
+    bool PointQueryWithCollisionToken(std::string_view query,
+                                      CollisionToken *token) const;
+    bool PointQueryWithCollisionToken(const uint8_t *query,
+                                      uint32_t query_len,
+                                      CollisionToken *token) const;
+
     AdaptResult Adapt(uint64_t key, const uint32_t new_prefix_len);
     AdaptResult Adapt(std::string_view key, const uint32_t new_prefix_len);
     AdaptResult Adapt(const uint8_t *input_key, const uint32_t input_key_len,
@@ -177,6 +199,11 @@ public:
                                         const uint8_t *r, uint32_t r_len,
                                         const uint8_t *witness,
                                         uint32_t witness_len);
+    CollisionTokenResult GetCollisionToken(std::string_view query,
+                                           CollisionToken *token) const;
+    CollisionTokenResult GetCollisionToken(const uint8_t *query,
+                                           uint32_t query_len,
+                                           CollisionToken *token) const;
     void ShrinkInfixSize(const uint32_t new_infix_size);
     uint64_t Size() const;
     uint32_t Serialize(char *out) const;
@@ -185,13 +212,21 @@ public:
     void BulkLoadStreaming(const uint8_t *key, const uint32_t key_len, const uint64_t *payload=nullptr);
     void BulkLoadStreamingFinish();
     uint64_t GetNumKeys() const;
-    // Heap bytes allocated by copy-on-write adaptations of a deserialized
-    // PayloadType::None filter. Untouched stores continue to alias the
-    // serialized buffer and do not contribute to this count.
-    uint64_t GetCopyOnWriteBytes() const {
-        return copy_on_write_bytes_.load(std::memory_order_relaxed);
+    // Current bytes in independently owned infix-store allocations of a
+    // deserialized PayloadType::None filter. The serialized source buffer is
+    // no longer needed after construction.
+    uint64_t GetOwnedInfixStoreBytes() const {
+        return owned_infix_store_bytes_.load(std::memory_order_relaxed);
     }
-
+    uint64_t GetInPlaceAdaptationCount() const {
+        return in_place_adaptation_count_.load(std::memory_order_relaxed);
+    }
+    uint64_t GetResizeAdaptationCount() const {
+        return resize_adaptation_count_.load(std::memory_order_relaxed);
+    }
+    uint64_t GetAdaptationResizeBytes() const {
+        return adaptation_resize_bytes_.load(std::memory_order_relaxed);
+    }
     struct InfiniteByteString {
         const uint8_t *str;
         uint32_t length;
@@ -371,18 +406,25 @@ private:
     static constexpr uint32_t heap_alloc_threshold = 20000U;
     static constexpr uint64_t max_exp_backoff = BITMASK(14);
 
-    struct InfixStore {
+    struct EmptyInfixStorePayloadMetadata {};
+    struct FixedInfixStorePayloadMetadata {
+        uint16_t num_sample_payloads = 0;
+    };
+    using InfixStorePayloadMetadata = std::conditional_t<
+        payload_type == PayloadType::FixedLength,
+        FixedInfixStorePayloadMetadata, EmptyInfixStorePayloadMetadata>;
+
+    struct InfixStore : InfixStorePayloadMetadata {
         static const uint32_t size_grade_bit_count = 12;
         static const uint32_t full_slot_count_bit_count = 48;
 
         uint64_t status = 0;
-        uint16_t num_sample_payloads = 0;
         std::atomic<lock_t> rwlock {0};
+        // Changes whenever an adaptation publishes a new logical
+        // representation. It invalidates admission tokens derived from the
+        // previous contents without having to find and erase them eagerly.
+        uint32_t mutation_epoch = 0;
         uint64_t *ptr = nullptr;
-        // `ptr` normally owns its allocation. A zero-copy deserialized
-        // PayloadType::None store instead aliases the caller's serialized
-        // buffer until its first successful adaptation.
-        bool owns_ptr = false;
 
         InfixStore(const uint32_t slot_count, const uint32_t slot_size,
                    const uint32_t size_grade, const uint32_t payload_size=0) {
@@ -390,17 +432,15 @@ private:
             const uint64_t word_count = GetPtrWordCount(slot_count, slot_size, payload_size);
             rwlock.store(0, std::memory_order_release);
             ptr = new uint64_t[word_count];
-            owns_ptr = true;
             memset(ptr, 0, sizeof(uint64_t) * word_count);
         }
-        InfixStore(uint64_t *ptr): status(0), ptr(ptr), owns_ptr(false) {};
         InfixStore() = default;
         InfixStore(const InfixStore &other):
+                    InfixStorePayloadMetadata(other),
                     status(other.status),
-                    num_sample_payloads(other.num_sample_payloads),
                     rwlock(0),
-                    ptr(other.ptr),
-                    owns_ptr(other.owns_ptr) {
+                    mutation_epoch(other.mutation_epoch),
+                    ptr(other.ptr) {
             rwlock.store(0, std::memory_order_release);
         }
         InfixStore(InfixStore &&other) = default;
@@ -442,6 +482,17 @@ private:
             status &= ~(BITMASK(size_grade_bit_count) << full_slot_count_bit_count);
             status |= size_grade << full_slot_count_bit_count;
         }
+    };
+    static_assert(payload_type != PayloadType::None ||
+                      sizeof(InfixStore) == 3 * sizeof(uint64_t),
+                  "The mutation epoch should occupy existing alignment padding");
+
+    struct CollisionLocation {
+        InfixStore *store = nullptr;
+        uint32_t group_slot = 0;
+        uint32_t local_ordinal = 0;
+        uint32_t mutation_epoch = 0;
+        bool valid = false;
     };
 
     class Infix {
@@ -525,8 +576,9 @@ private:
         bool QueryTrie(const InfiniteByteString l_key, const InfiniteByteString r_key, 
                        uint32_t key_start_bit, uint32_t slot_size) const;
         int32_t GetLongestMatch(const InfiniteByteString key,
-                                uint32_t key_start_bit, 
-                                uint32_t slot_size) const;
+                                uint32_t key_start_bit,
+                                uint32_t slot_size,
+                                uint32_t *local_ordinal = nullptr) const;
         void SerializeToInfixStore(InfixStore& store, uint32_t pos, uint32_t store_size, uint32_t slot_size) const;
         void SerializeToPtr(void *ptr, uint32_t bit_pos, uint32_t slot_size) const;
         void DeserializeFromPtr(const void *ptr, uint32_t bit_pos,
@@ -622,15 +674,16 @@ private:
     uint64_t size_scalars_[size_scalar_count], scaled_sizes_[size_scalar_count], exception_scaled_size_;
     uint64_t implicit_scalars_[infix_store_target_size / 2 + 1];
     std::atomic<uint64_t> n_keys_ = 0;
-    std::atomic<uint64_t> copy_on_write_bytes_ = 0;
-
+    mutable std::atomic<uint64_t> owned_infix_store_bytes_ = 0;
+    std::atomic<uint64_t> in_place_adaptation_count_ = 0;
+    std::atomic<uint64_t> resize_adaptation_count_ = 0;
+    std::atomic<uint64_t> adaptation_resize_bytes_ = 0;
     uint32_t bulk_load_streaming_ind_, bulk_load_streaming_max_len_;
     InfiniteByteString bulk_load_left_key_, bulk_load_key_list_[infix_store_target_size];
     uint64_t *bulk_load_left_payload_ = nullptr, *bulk_load_payload_list_ = nullptr;
-    // The object was constructed from a serialized filter buffer. For
-    // PayloadType::None, each store initially aliases that buffer and can
-    // independently transition to owned memory through copy-on-write.
-    // FixedLength sample payloads still alias the serialized buffer.
+    // The object was constructed from serialized filter bytes. Infix stores
+    // are independently owned after deserialization; FixedLength sample
+    // payloads still alias the serialized buffer.
     bool deserialized_ = false;
 
     void AddTreeKey(const uint8_t *key, const uint32_t key_len, const uint64_t *payload=nullptr);
@@ -781,7 +834,16 @@ private:
     bool PointQueryInfixStore(InfixStore &store, const uint64_t key,
                               const uint32_t total_implicit=infix_store_target_size,
                               const InfiniteByteString original_key={nullptr, 0},
-                              const uint32_t original_key_start_bit=0) const;
+                              const uint32_t original_key_start_bit=0,
+                              CollisionLocation *location=nullptr) const;
+    // Shared point-probe implementation. Normal PointQuery passes nullptr;
+    // token-enabled probes request the matching representation's location so
+    // the original traversal can also derive the adaptation-admission token.
+    bool PointQueryImpl(const uint8_t *input_key, uint32_t key_len,
+                        CollisionLocation *location) const;
+    CollisionTokenResult BuildCollisionToken(
+        const CollisionLocation& location, CollisionToken *token) const;
+    static uint64_t MixCollisionToken(uint64_t value);
     // Resizes the infix store to the appropriate size based on its number of
     // elements.
     void ResizeInfixStore(InfixStore &store, const uint32_t total_implicit=infix_store_target_size);
@@ -1521,6 +1583,45 @@ inline bool Diva<diva_type, payload_type>::PointQuery(std::string_view key) cons
 
 template <DivaType diva_type, PayloadType payload_type>
 inline bool Diva<diva_type, payload_type>::PointQuery(const uint8_t *input_key, const uint32_t key_len) const {
+    return PointQueryImpl(input_key, key_len, nullptr);
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline bool Diva<diva_type, payload_type>::PointQueryWithCollisionToken(
+        std::string_view query, CollisionToken *token) const {
+    return PointQueryWithCollisionToken(
+        reinterpret_cast<const uint8_t *>(query.data()), query.size(), token);
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline bool Diva<diva_type, payload_type>::PointQueryWithCollisionToken(
+        const uint8_t *query, const uint32_t query_len,
+        CollisionToken *token) const {
+    if (token != nullptr)
+        *token = 0;
+    if constexpr (diva_type != DivaType::BinaryTrie ||
+                  payload_type != PayloadType::None) {
+        return PointQueryImpl(query, query_len, nullptr);
+    }
+
+    CollisionLocation location;
+    const bool may_match = PointQueryImpl(query, query_len, &location);
+    if (may_match && token != nullptr)
+        static_cast<void>(BuildCollisionToken(location, token));
+    return may_match;
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline bool Diva<diva_type, payload_type>::PointQueryImpl(
+        const uint8_t *input_key, const uint32_t key_len,
+        CollisionLocation *location) const {
+    if (location != nullptr)
+        *location = {};
+    if (input_key == nullptr || key_len == 0)
+        return false;
     const bool it_write_lock = false;
     const InfiniteByteString key {input_key, static_cast<uint32_t>(key_len)};
     
@@ -1569,10 +1670,77 @@ inline bool Diva<diva_type, payload_type>::PointQuery(const uint8_t *input_key, 
     const uint64_t query_key = extraction - (prev_implicit << infix_size_);
     const bool res = PointQueryInfixStore(infix_store, query_key, total_implicit,
                                           {key.str, 8 * key.length},
-                                          key_start_bit);
+                                          key_start_bit, location);
+    if (res && location != nullptr && location->valid) {
+        location->store = &infix_store;
+        location->mutation_epoch = infix_store.mutation_epoch;
+    }
 
     rwlock_unlock_read(infix_store.rwlock);
     return res;
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline uint64_t Diva<diva_type, payload_type>::MixCollisionToken(
+        uint64_t value) {
+    // SplitMix64 finalizer. Admission is a performance policy, so a vanishing
+    // hash-collision probability can only cause an unnecessary adaptation;
+    // private-candidate validation still protects filter correctness.
+    value ^= value >> 30;
+    value *= 0xbf58476d1ce4e5b9ULL;
+    value ^= value >> 27;
+    value *= 0x94d049bb133111ebULL;
+    value ^= value >> 31;
+    return value;
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline typename Diva<diva_type, payload_type>::CollisionTokenResult
+Diva<diva_type, payload_type>::BuildCollisionToken(
+        const CollisionLocation& location, CollisionToken *token) const {
+    if (token == nullptr || !location.valid || location.store == nullptr)
+        return CollisionTokenResult::kNoCollision;
+
+    uint64_t value = MixCollisionToken(
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(location.store)));
+    value ^= MixCollisionToken(
+        (static_cast<uint64_t>(location.mutation_epoch) << 32) |
+        location.group_slot);
+    value ^= MixCollisionToken(
+        static_cast<uint64_t>(location.local_ordinal) +
+        0x9e3779b97f4a7c15ULL);
+    value = MixCollisionToken(value);
+    if (value == 0)
+        value = 1;  // Admission policies reserve zero as an empty entry.
+    *token = value;
+    return CollisionTokenResult::kFound;
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline typename Diva<diva_type, payload_type>::CollisionTokenResult
+Diva<diva_type, payload_type>::GetCollisionToken(
+        std::string_view query, CollisionToken *token) const {
+    return GetCollisionToken(reinterpret_cast<const uint8_t *>(query.data()),
+                             query.size(), token);
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline typename Diva<diva_type, payload_type>::CollisionTokenResult
+Diva<diva_type, payload_type>::GetCollisionToken(
+        const uint8_t *query, const uint32_t query_len,
+        CollisionToken *token) const {
+    if constexpr (diva_type != DivaType::BinaryTrie ||
+                  payload_type != PayloadType::None) {
+        return CollisionTokenResult::kReadOnly;
+    }
+    CollisionLocation location;
+    if (!PointQueryImpl(query, query_len, &location))
+        return CollisionTokenResult::kNoCollision;
+    return BuildCollisionToken(location, token);
 }
 
 
@@ -2387,9 +2555,6 @@ inline Diva<diva_type, payload_type>::~Diva() {
     uint32_t tree_key_len, dummy;
     InfixStore *store;
 
-    // A deserialized PayloadType::None filter can contain a mixture of
-    // zero-copy stores and stores privately allocated by adaptation. Ownership
-    // is therefore tracked per store rather than by `deserialized_`.
     const bool free_sample_payloads = !deserialized_;
 
     if constexpr (diva_type == DivaType::Int) {
@@ -2405,8 +2570,7 @@ inline Diva<diva_type, payload_type>::~Diva() {
                 if (free_sample_payloads)
                     free(reinterpret_cast<void *>(store->ptr[1]));
             }
-            if (store->owns_ptr)
-                delete[] store->ptr;
+            delete[] store->ptr;
         }
         if (it_int.leaf)
             wormleaf_int_unlock_write(it_int.leaf);
@@ -2426,8 +2590,7 @@ inline Diva<diva_type, payload_type>::~Diva() {
                 if (free_sample_payloads)
                     free(reinterpret_cast<void *>(store->ptr[1]));
             }
-            if (store->owns_ptr)
-                delete[] store->ptr;
+            delete[] store->ptr;
         }
         if (it.leaf)
             wormleaf_unlock_write(it.leaf);
@@ -2575,20 +2738,16 @@ inline uint32_t Diva<diva_type, payload_type>::DeserializeInfixStore(const char 
     }
 
     const uint64_t word_count = store.GetPtrWordCount(scaled_sizes_[store.GetSizeGrade()], infix_size_, payload_size_);
+    // Each store owns its word array after deserialization. This permits
+    // same-capacity adaptation in place and lets a resized store release its
+    // previous allocation independently of the serialized filter block.
+    store.ptr = new uint64_t[word_count];
+    memcpy(store.ptr, deser_buf + offset, word_count * sizeof(uint64_t));
+    offset += word_count * sizeof(uint64_t);
     if constexpr (payload_type == PayloadType::None) {
-        // Zero-copy: point into the serialized buffer. Caller must keep
-        // deser_buf alive while this store remains unowned. Adaptation can
-        // replace this pointer with a private copy under the store write lock.
-        store.ptr = reinterpret_cast<uint64_t *>(const_cast<char *>(deser_buf + offset));
-        store.owns_ptr = false;
-        offset += word_count * sizeof(uint64_t);
+        owned_infix_store_bytes_.fetch_add(word_count * sizeof(uint64_t),
+                                           std::memory_order_relaxed);
     } else {
-        // FixedLength overwrites ptr[1] with a sample-payload pointer, so the
-        // word array cannot alias the serialized buffer.
-        store.ptr = new uint64_t[word_count];
-        store.owns_ptr = true;
-        memcpy(store.ptr, deser_buf + offset, word_count * sizeof(uint64_t));
-        offset += word_count * sizeof(uint64_t);
 
         if (store.num_sample_payloads > 0) {
             const uint32_t sample_payload_byte_count =
@@ -3487,14 +3646,12 @@ Diva<diva_type, payload_type>::AdaptImpl(
         }
     }
 
-    // Always adapt a private candidate. Besides preserving zero-copy source
-    // bytes, this lets false-positive feedback verify that this exact witness
-    // removes the query before publishing the new generation.
+    // Adapt a private candidate so false-positive feedback can verify that
+    // this exact witness removes the query before changing the live store.
     const uint64_t word_count = infix_store.GetPtrWordCount(
         scaled_sizes_[infix_store.GetSizeGrade()], infix_size_, payload_size_);
     InfixStore candidate(infix_store);
     candidate.ptr = new uint64_t[word_count];
-    candidate.owns_ptr = true;
     memcpy(candidate.ptr, infix_store.ptr, word_count * sizeof(uint64_t));
 
     AdaptResult result = AdaptRawInInfixStore(
@@ -3529,25 +3686,48 @@ Diva<diva_type, payload_type>::AdaptImpl(
     }
 
     if (result == AdaptResult::kAdapted) {
-        const bool replaced_owned_store = infix_store.owns_ptr;
-        uint64_t *const replaced_ptr = infix_store.ptr;
         const uint64_t candidate_word_count = candidate.GetPtrWordCount(
             scaled_sizes_[candidate.GetSizeGrade()], infix_size_, payload_size_);
-        infix_store.status = candidate.status;
-        infix_store.num_sample_payloads = candidate.num_sample_payloads;
-        infix_store.ptr = candidate.ptr;
-        infix_store.owns_ptr = true;
-        if (replaced_owned_store) {
-            delete[] replaced_ptr;
-            if (deserialized_ && candidate_word_count > word_count) {
-                copy_on_write_bytes_.fetch_add(
-                    (candidate_word_count - word_count) * sizeof(uint64_t),
-                    std::memory_order_relaxed);
+        if (candidate_word_count == word_count) {
+            // The live store already has sufficient capacity. Publish the
+            // validated bytes into its existing allocation, avoiding any
+            // persistent replacement allocation.
+            infix_store.status = candidate.status;
+            if constexpr (payload_type == PayloadType::FixedLength) {
+                infix_store.num_sample_payloads = candidate.num_sample_payloads;
             }
+            memcpy(infix_store.ptr, candidate.ptr,
+                   candidate_word_count * sizeof(uint64_t));
+            delete[] candidate.ptr;
+            in_place_adaptation_count_.fetch_add(1,
+                                                  std::memory_order_relaxed);
         } else {
-            copy_on_write_bytes_.fetch_add(candidate_word_count * sizeof(uint64_t),
-                                           std::memory_order_relaxed);
+            // A resized store is independently replaceable: publish the new
+            // allocation and release the old one rather than stranding its
+            // bytes in a monolithic serialized buffer.
+            uint64_t *const replaced_ptr = infix_store.ptr;
+            infix_store.status = candidate.status;
+            if constexpr (payload_type == PayloadType::FixedLength) {
+                infix_store.num_sample_payloads = candidate.num_sample_payloads;
+            }
+            infix_store.ptr = candidate.ptr;
+            delete[] replaced_ptr;
+            resize_adaptation_count_.fetch_add(1,
+                                                std::memory_order_relaxed);
+            if (candidate_word_count > word_count) {
+                const uint64_t added_bytes =
+                    (candidate_word_count - word_count) * sizeof(uint64_t);
+                adaptation_resize_bytes_.fetch_add(added_bytes,
+                                                    std::memory_order_relaxed);
+                if (deserialized_) {
+                    owned_infix_store_bytes_.fetch_add(
+                        added_bytes, std::memory_order_relaxed);
+                }
+            }
         }
+        // Any pending admission token for the previous representation now
+        // carries a stale generation and cannot trigger another adaptation.
+        ++infix_store.mutation_epoch;
     } else {
         delete[] candidate.ptr;
     }
@@ -6097,7 +6277,8 @@ template <DivaType diva_type, PayloadType payload_type>
 inline bool Diva<diva_type, payload_type>::PointQueryInfixStore(InfixStore &store, const uint64_t key,
                                                                 const uint32_t total_implicit,
                                                                 const InfiniteByteString original_key,
-                                                                const uint32_t original_key_start_bit) const {
+                                                                const uint32_t original_key_start_bit,
+                                                                CollisionLocation *location) const {
     const uint64_t implicit_part = key >> infix_size_;
     const uint64_t explicit_part = key & BITMASK(infix_size_);
     const uint32_t size_grade = store.GetSizeGrade();
@@ -6121,13 +6302,32 @@ inline bool Diva<diva_type, payload_type>::PointQueryInfixStore(InfixStore &stor
                             + infix_size_ * (runend_pos + 1));
                 if ((explicit_part | mask) == (slot_value | mask)) {
                     const uint32_t key_start_bit = original_key_start_bit + infix_size_ - mask_size;
-                    if (infix_to_query.QueryTrie(original_key, original_key, key_start_bit, infix_size_))
+                    if (infix_to_query.QueryTrie(original_key, original_key,
+                                                 key_start_bit, infix_size_)) {
+                        if (location != nullptr) {
+                            uint32_t local_ordinal = 0;
+                            const int32_t match = infix_to_query.GetLongestMatch(
+                                original_key, key_start_bit, infix_size_,
+                                &local_ordinal);
+                            if (match < 0)
+                                return true;
+                            location->group_slot = static_cast<uint32_t>(i);
+                            location->local_ordinal = local_ordinal;
+                            location->valid = true;
+                        }
                         return true;
+                    }
                 }
                 i += infix_to_query.GetNumSlots(infix_size_) - 1;
             }
-            else if ((explicit_part | mask) == (slot_value | mask))
+            else if ((explicit_part | mask) == (slot_value | mask)) {
+                if (location != nullptr) {
+                    location->group_slot = static_cast<uint32_t>(i);
+                    location->local_ordinal = 0;
+                    location->valid = true;
+                }
                 return true;
+            }
             if ((slot_value & (slot_value - 1)) > explicit_part - 1)
                 break;
         }
@@ -6137,8 +6337,14 @@ inline bool Diva<diva_type, payload_type>::PointQueryInfixStore(InfixStore &stor
         uint64_t slot_value = GetSlot(store, pos);
         do {
             const uint64_t mask = ((slot_value & (-slot_value)) << 1) - 1;
-            if ((explicit_part | mask) == (slot_value | mask))
+            if ((explicit_part | mask) == (slot_value | mask)) {
+                if (location != nullptr) {
+                    location->group_slot = static_cast<uint32_t>(pos);
+                    location->local_ordinal = 0;
+                    location->valid = true;
+                }
                 return true;
+            }
             if (pos == 0)
                 break;
             slot_value = GetSlot(store, --pos);
@@ -8622,7 +8828,10 @@ Diva<diva_type, payload_type>::Infix::GetStrings(uint32_t slot_size) const {
 template <DivaType diva_type, PayloadType payload_type>
 int32_t Diva<diva_type, payload_type>::Infix::GetLongestMatch(const InfiniteByteString key, 
                                                               uint32_t key_start_bit,
-                                                              uint32_t slot_size) const {
+                                                              uint32_t slot_size,
+                                                              uint32_t *local_ordinal) const {
+    if (local_ordinal != nullptr)
+        *local_ordinal = std::numeric_limits<uint32_t>::max();
     TrieIterator it(trie_.data());
     const bool has_prefix_keys = HasPrefixKeys();
     const uint32_t actual_suffix_len_backup = GetActualSuffixLen(slot_size);
@@ -8648,6 +8857,13 @@ int32_t Diva<diva_type, payload_type>::Infix::GetLongestMatch(const InfiniteByte
         }
         if (it.AtPrefixKey(has_prefix_keys)) {
             res = depth;
+            if (local_ordinal != nullptr) {
+                // Advance() has already counted this prefix key, while
+                // num_keys_read_ counts all leaf keys preceding it in the
+                // trie's in-order traversal.
+                *local_ordinal = it.num_keys_read_ +
+                                 it.num_prefix_keys_read_ - 1;
+            }
             it.Advance(has_prefix_keys);
             depth = it.depth_branch_.back().first;
             children = it.depth_branch_.back().second;
@@ -8685,6 +8901,11 @@ GetLongestMatchAfterLoop:
         depth += bits_to_compare;
     }
     res = depth;
+    if (local_ordinal != nullptr) {
+        // The current leaf has not yet been advanced, so both counters cover
+        // exactly the logical entries preceding it.
+        *local_ordinal = it.num_keys_read_ + it.num_prefix_keys_read_;
+    }
     return res;
 }
 
