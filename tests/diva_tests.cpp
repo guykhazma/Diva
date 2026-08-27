@@ -4530,6 +4530,84 @@ public:
             CHECK(from_initial_probe == first);
         }
 
+        SUBCASE("capture a reusable collision location from the original probe") {
+            BinaryTrieDiva::CollisionContext context;
+            CHECK(s.PointQueryWithCollisionContext(query, &context));
+            CHECK(context.valid);
+            CHECK(context.admission_token != 0);
+            CHECK(context.store != nullptr);
+            CHECK(context.prev_key != nullptr);
+            CHECK(context.next_key != nullptr);
+
+            BinaryTrieDiva::CollisionToken token = 0;
+            CHECK(s.PointQueryWithCollisionToken(query, &token));
+            CHECK(token == context.admission_token);
+
+            CHECK(s.AdaptFalsePositive(query, witness, &context) ==
+                  BinaryTrieDiva::AdaptResult::kAdapted);
+            CHECK_FALSE(s.PointQuery(query));
+            for (const std::string& key : keys)
+                CHECK(s.PointQuery(key));
+            CHECK(s.AdaptFalsePositive(query, witness, &context) ==
+                  BinaryTrieDiva::AdaptResult::kAlreadySufficient);
+        }
+
+        SUBCASE("a collision context with a mismatched recorded epoch still adapts in the captured store") {
+            BinaryTrieDiva::CollisionContext context;
+            REQUIRE(s.PointQueryWithCollisionContext(query, &context));
+            REQUIRE(context.valid);
+            ++context.mutation_epoch;
+            CHECK(s.AdaptFalsePositive(query, witness, &context) ==
+                  BinaryTrieDiva::AdaptResult::kAdapted);
+            CHECK_FALSE(s.PointQuery(query));
+            for (const std::string& key : keys)
+                CHECK(s.PointQuery(key));
+        }
+
+        SUBCASE("an invalid supplied collision context is not re-walked") {
+            BinaryTrieDiva::CollisionContext context;
+            REQUIRE(s.PointQuery(query));
+            CHECK(s.AdaptFalsePositive(query, witness, &context) ==
+                  BinaryTrieDiva::AdaptResult::kAlreadySufficient);
+            CHECK(s.PointQuery(query));
+        }
+
+        SUBCASE("context-directed adaptation still rejects an unrelated witness") {
+            const std::string unrelated("\x01\x7b", 2);  // Stored key 379.
+            REQUIRE(std::binary_search(keys.begin(), keys.end(), unrelated));
+            BinaryTrieDiva::CollisionContext context;
+            REQUIRE(s.PointQueryWithCollisionContext(query, &context));
+            CHECK(s.AdaptFalsePositive(query, unrelated, &context) ==
+                  BinaryTrieDiva::AdaptResult::kWitnessNotFound);
+            CHECK(s.PointQuery(query));
+            CHECK(s.AdaptFalsePositive(query, witness, &context) ==
+                  BinaryTrieDiva::AdaptResult::kAdapted);
+            CHECK_FALSE(s.PointQuery(query));
+        }
+
+        SUBCASE("predecessor retry reuses the original collision context") {
+            const std::string predecessor("\x01\x3e", 2);  // Stored key 318.
+            const std::string predecessor_query("\x01\x3f", 2);  // 319.
+            const std::string successor("\x01\x7b", 2);  // Stored key 379.
+            REQUIRE_FALSE(std::binary_search(keys.begin(), keys.end(),
+                                             predecessor_query));
+            REQUIRE(std::binary_search(keys.begin(), keys.end(), predecessor));
+            REQUIRE(std::binary_search(keys.begin(), keys.end(), successor));
+            BinaryTrieDiva::CollisionContext context;
+            REQUIRE(s.PointQueryWithCollisionContext(predecessor_query,
+                                                     &context));
+            CHECK(s.AdaptFalsePositive(predecessor_query, successor,
+                                       &context) ==
+                  BinaryTrieDiva::AdaptResult::kWitnessNotFound);
+            CHECK(s.PointQuery(predecessor_query));
+            CHECK(s.AdaptFalsePositive(predecessor_query, predecessor,
+                                       &context) ==
+                  BinaryTrieDiva::AdaptResult::kAdapted);
+            CHECK_FALSE(s.PointQuery(predecessor_query));
+            for (const std::string& key : keys)
+                CHECK(s.PointQuery(key));
+        }
+
         SUBCASE("different queries identify the same stored representation") {
             const std::string same_collision_query("\x01\x3f", 2);  // 319.
             REQUIRE(s.PointQuery(same_collision_query));
@@ -4609,6 +4687,55 @@ public:
             // feedback and has no distinguishing bit to add.
             CHECK(s.AdaptFalsePositiveRange(range_l, witness, witness) ==
                   BinaryTrieDiva::AdaptResult::kInvalidArgument);
+        }
+
+        SUBCASE("capture a reusable range collision location from the original probe") {
+            const std::string range_l("\x01\x3b", 2);  // 315, absent.
+            const std::string range_r("\x01\x3c", 2);  // 316, absent.
+            BinaryTrieDiva::CollisionContext context;
+            CHECK(s.RangeQueryWithCollisionContext(range_l, range_r, &context));
+            CHECK(context.valid);
+            CHECK(context.store != nullptr);
+            CHECK(context.prev_key != nullptr);
+            CHECK(context.next_key != nullptr);
+            CHECK(context.admission_token != 0);
+
+            CHECK(s.AdaptFalsePositiveRange(range_l, range_r, witness,
+                                            &context) ==
+                  BinaryTrieDiva::AdaptResult::kAdapted);
+            CHECK_FALSE(s.RangeQuery(range_l, range_r));
+            for (const std::string& key : keys)
+                CHECK(s.PointQuery(key));
+            CHECK(s.AdaptFalsePositiveRange(range_l, range_r, witness,
+                                            &context) ==
+                  BinaryTrieDiva::AdaptResult::kAlreadySufficient);
+        }
+
+        SUBCASE("a range collision context with a mismatched recorded epoch still adapts in the captured store") {
+            const std::string range_l("\x01\x3b", 2);
+            const std::string range_r("\x01\x3c", 2);
+            BinaryTrieDiva::CollisionContext context;
+            REQUIRE(s.RangeQueryWithCollisionContext(range_l, range_r,
+                                                     &context));
+            REQUIRE(context.valid);
+            ++context.mutation_epoch;
+            CHECK(s.AdaptFalsePositiveRange(range_l, range_r, witness,
+                                            &context) ==
+                  BinaryTrieDiva::AdaptResult::kAdapted);
+            CHECK_FALSE(s.RangeQuery(range_l, range_r));
+            for (const std::string& key : keys)
+                CHECK(s.PointQuery(key));
+        }
+
+        SUBCASE("an invalid supplied range context is not re-walked") {
+            const std::string range_l("\x01\x3b", 2);
+            const std::string range_r("\x01\x3c", 2);
+            REQUIRE(s.RangeQuery(range_l, range_r));
+            BinaryTrieDiva::CollisionContext context;
+            CHECK(s.AdaptFalsePositiveRange(range_l, range_r, witness,
+                                            &context) ==
+                  BinaryTrieDiva::AdaptResult::kAlreadySufficient);
+            CHECK(s.RangeQuery(range_l, range_r));
         }
 
         SUBCASE("grow a serialized streaming store before publishing feedback") {

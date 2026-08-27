@@ -165,6 +165,24 @@ public:
         kNoCollision,
         kReadOnly,
     };
+    // Match location captured by the original point or range probe. Pointer
+    // fields are valid only while this Diva instance remains alive. Adaptation
+    // that is given a location stays on that store under its write lock; a
+    // newer mutation epoch is observed locally rather than by walking Diva
+    // again. Callers that cannot supply a location pass null so the standalone
+    // lookup API can locate the store once.
+    struct CollisionContext {
+        CollisionToken admission_token = 0;
+        bool valid = false;
+        void *store = nullptr;
+        uint32_t mutation_epoch = 0;
+        uint32_t group_slot = 0;
+        uint32_t local_ordinal = 0;
+        const uint8_t *prev_key = nullptr;
+        uint32_t prev_key_len = 0;
+        const uint8_t *next_key = nullptr;
+        uint32_t next_key_len = 0;
+    };
     // Performs the ordinary point probe and, when the positive answer comes
     // from an adaptable BinaryTrie representation, returns its non-zero
     // collision token from the same traversal. Other positive/negative
@@ -174,6 +192,20 @@ public:
     bool PointQueryWithCollisionToken(const uint8_t *query,
                                       uint32_t query_len,
                                       CollisionToken *token) const;
+    // Same probe as PointQueryWithCollisionToken, but also returns the
+    // representation location so a later AdaptFalsePositive can skip
+    // re-traversing Diva while this instance remains alive.
+    bool PointQueryWithCollisionContext(std::string_view query,
+                                        CollisionContext *context) const;
+    bool PointQueryWithCollisionContext(const uint8_t *query,
+                                        uint32_t query_len,
+                                        CollisionContext *context) const;
+    bool RangeQueryWithCollisionContext(std::string_view l,
+                                        std::string_view r,
+                                        CollisionContext *context) const;
+    bool RangeQueryWithCollisionContext(const uint8_t *l, uint32_t l_len,
+                                        const uint8_t *r, uint32_t r_len,
+                                        CollisionContext *context) const;
 
     AdaptResult Adapt(uint64_t key, const uint32_t new_prefix_len);
     AdaptResult Adapt(std::string_view key, const uint32_t new_prefix_len);
@@ -182,23 +214,35 @@ public:
     // Best-effort false-positive feedback. `witness` must be an actual stored
     // key obtained from the data I/O that disproved `query`. The update is
     // published only if extending that witness makes `query` negative.
+    // `collision` is an optional location from PointQueryWithCollisionContext
+    // on this same instance. When a location is supplied, adaptation stays on
+    // that store under its write lock and does not re-walk Diva, even if the
+    // recorded epoch no longer matches. Passing null keeps the standalone
+    // lookup API used by tests.
     AdaptResult AdaptFalsePositive(std::string_view query,
-                                   std::string_view witness);
+                                   std::string_view witness,
+                                   const CollisionContext *collision = nullptr);
     AdaptResult AdaptFalsePositive(const uint8_t *query,
                                    uint32_t query_len,
                                    const uint8_t *witness,
-                                   uint32_t witness_len);
+                                   uint32_t witness_len,
+                                   const CollisionContext *collision = nullptr);
     // Best-effort feedback for an inclusive range [l, r] that storage has
     // proved empty. `witness` is the first real key after r and must have been
     // decoded by that lookup. The update is published only if extending the
     // witness makes the complete inclusive range negative.
+    // `collision` is an optional location from RangeQueryWithCollisionContext
+    // on this same instance. When omitted, the range is located once and then
+    // adapted in that store without a second top-level walk from `witness`.
     AdaptResult AdaptFalsePositiveRange(std::string_view l,
                                         std::string_view r,
-                                        std::string_view witness);
+                                        std::string_view witness,
+                                        const CollisionContext *collision = nullptr);
     AdaptResult AdaptFalsePositiveRange(const uint8_t *l, uint32_t l_len,
                                         const uint8_t *r, uint32_t r_len,
                                         const uint8_t *witness,
-                                        uint32_t witness_len);
+                                        uint32_t witness_len,
+                                        const CollisionContext *collision = nullptr);
     CollisionTokenResult GetCollisionToken(std::string_view query,
                                            CollisionToken *token) const;
     CollisionTokenResult GetCollisionToken(const uint8_t *query,
@@ -492,6 +536,10 @@ private:
         uint32_t group_slot = 0;
         uint32_t local_ordinal = 0;
         uint32_t mutation_epoch = 0;
+        const uint8_t *prev_key = nullptr;
+        uint32_t prev_key_len = 0;
+        const uint8_t *next_key = nullptr;
+        uint32_t next_key_len = 0;
         bool valid = false;
     };
 
@@ -799,6 +847,30 @@ private:
                           uint32_t range_l_to_reject_len = 0,
                           const uint8_t *range_r_to_reject = nullptr,
                           uint32_t range_r_to_reject_len = 0);
+    // `infix_store` must already be write-locked. Unlocks it before returning.
+    AdaptResult AdaptInLocatedStore(
+            InfixStore &infix_store,
+            const InfiniteByteString &prev_key,
+            const InfiniteByteString &next_key,
+            const uint8_t *input_key, uint32_t input_key_len,
+            uint32_t new_prefix_len,
+            const uint8_t *query_to_reject, uint32_t query_to_reject_len,
+            const uint8_t *range_l_to_reject, uint32_t range_l_to_reject_len,
+            const uint8_t *range_r_to_reject, uint32_t range_r_to_reject_len,
+            bool collision_already_located);
+    bool TryAdaptFromCollisionContext(
+            const CollisionContext *collision,
+            const uint8_t *witness, uint32_t witness_len,
+            uint32_t new_prefix_len,
+            const uint8_t *query, uint32_t query_len,
+            AdaptResult *result,
+            const uint8_t *range_l = nullptr, uint32_t range_l_len = 0,
+            const uint8_t *range_r = nullptr, uint32_t range_r_len = 0);
+    bool RangeQueryImpl(const uint8_t *input_l, uint32_t input_l_len,
+                        const uint8_t *input_r, uint32_t input_r_len,
+                        CollisionLocation *location) const;
+    void FillCollisionContext(const CollisionLocation &location,
+                              CollisionContext *context) const;
     // Assumes that `key` is a full length infix.
     void DeleteRawFromInfixStore(InfixStore &store, const uint64_t key,
                                  const uint32_t total_implicit=infix_store_target_size,
@@ -1479,6 +1551,45 @@ inline bool Diva<diva_type, payload_type>::RangeQuery(std::string_view input_l, 
 template <DivaType diva_type, PayloadType payload_type>
 inline bool Diva<diva_type, payload_type>::RangeQuery(const uint8_t *input_l, const uint32_t input_l_len,
                                                       const uint8_t *input_r, const uint32_t input_r_len) const {
+    return RangeQueryImpl(input_l, input_l_len, input_r, input_r_len, nullptr);
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline bool Diva<diva_type, payload_type>::RangeQueryWithCollisionContext(
+        std::string_view l, std::string_view r, CollisionContext *context) const {
+    return RangeQueryWithCollisionContext(
+        reinterpret_cast<const uint8_t *>(l.data()), l.size(),
+        reinterpret_cast<const uint8_t *>(r.data()), r.size(), context);
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline bool Diva<diva_type, payload_type>::RangeQueryWithCollisionContext(
+        const uint8_t *l, const uint32_t l_len,
+        const uint8_t *r, const uint32_t r_len,
+        CollisionContext *context) const {
+    if (context != nullptr)
+        *context = {};
+    if constexpr (diva_type != DivaType::BinaryTrie ||
+                  payload_type != PayloadType::None) {
+        return RangeQueryImpl(l, l_len, r, r_len, nullptr);
+    }
+    CollisionLocation location;
+    const bool maybe = RangeQueryImpl(l, l_len, r, r_len, &location);
+    if (maybe && context != nullptr)
+        FillCollisionContext(location, context);
+    return maybe;
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline bool Diva<diva_type, payload_type>::RangeQueryImpl(
+        const uint8_t *input_l, const uint32_t input_l_len,
+        const uint8_t *input_r, const uint32_t input_r_len,
+        CollisionLocation *location) const {
+    if (location != nullptr)
+        *location = {};
     const bool it_write_lock = false;
     const InfiniteByteString l_key {input_l, static_cast<uint32_t>(input_l_len)};
     const InfiniteByteString r_key {input_r, static_cast<uint32_t>(input_r_len)};
@@ -1561,6 +1672,15 @@ inline bool Diva<diva_type, payload_type>::RangeQuery(const uint8_t *input_l, co
                                               {l_key.str, 8 * l_key.length},
                                               {r_key.str, 8 * r_key.length},
                                               key_start_bit);
+        if (res && location != nullptr) {
+            location->store = &infix_store;
+            location->mutation_epoch = infix_store.mutation_epoch;
+            location->prev_key = prev_key.str;
+            location->prev_key_len = prev_key.length;
+            location->next_key = next_key.str;
+            location->next_key_len = next_key.length;
+            location->valid = true;
+        }
 
         rwlock_unlock_read(infix_store.rwlock);
         return res;
@@ -1599,8 +1719,50 @@ template <DivaType diva_type, PayloadType payload_type>
 inline bool Diva<diva_type, payload_type>::PointQueryWithCollisionToken(
         const uint8_t *query, const uint32_t query_len,
         CollisionToken *token) const {
+    CollisionContext context;
+    const bool may_match =
+        PointQueryWithCollisionContext(query, query_len, &context);
     if (token != nullptr)
-        *token = 0;
+        *token = context.admission_token;
+    return may_match;
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline bool Diva<diva_type, payload_type>::PointQueryWithCollisionContext(
+        std::string_view query, CollisionContext *context) const {
+    return PointQueryWithCollisionContext(
+        reinterpret_cast<const uint8_t *>(query.data()), query.size(), context);
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline void Diva<diva_type, payload_type>::FillCollisionContext(
+        const CollisionLocation &location, CollisionContext *context) const {
+    if (context == nullptr)
+        return;
+    *context = {};
+    if (!location.valid || location.store == nullptr)
+        return;
+    static_cast<void>(BuildCollisionToken(location, &context->admission_token));
+    context->valid = true;
+    context->store = location.store;
+    context->mutation_epoch = location.mutation_epoch;
+    context->group_slot = location.group_slot;
+    context->local_ordinal = location.local_ordinal;
+    context->prev_key = location.prev_key;
+    context->prev_key_len = location.prev_key_len;
+    context->next_key = location.next_key;
+    context->next_key_len = location.next_key_len;
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline bool Diva<diva_type, payload_type>::PointQueryWithCollisionContext(
+        const uint8_t *query, const uint32_t query_len,
+        CollisionContext *context) const {
+    if (context != nullptr)
+        *context = {};
     if constexpr (diva_type != DivaType::BinaryTrie ||
                   payload_type != PayloadType::None) {
         return PointQueryImpl(query, query_len, nullptr);
@@ -1608,8 +1770,8 @@ inline bool Diva<diva_type, payload_type>::PointQueryWithCollisionToken(
 
     CollisionLocation location;
     const bool may_match = PointQueryImpl(query, query_len, &location);
-    if (may_match && token != nullptr)
-        static_cast<void>(BuildCollisionToken(location, token));
+    if (may_match && context != nullptr)
+        FillCollisionContext(location, context);
     return may_match;
 }
 
@@ -1674,6 +1836,10 @@ inline bool Diva<diva_type, payload_type>::PointQueryImpl(
     if (res && location != nullptr && location->valid) {
         location->store = &infix_store;
         location->mutation_epoch = infix_store.mutation_epoch;
+        location->prev_key = prev_key.str;
+        location->prev_key_len = prev_key.length;
+        location->next_key = next_key.str;
+        location->next_key_len = next_key.length;
     }
 
     rwlock_unlock_read(infix_store.rwlock);
@@ -3400,10 +3566,12 @@ Diva<diva_type, payload_type>::Adapt(const uint8_t *input_key, const uint32_t in
 template <DivaType diva_type, PayloadType payload_type>
 inline typename Diva<diva_type, payload_type>::AdaptResult
 Diva<diva_type, payload_type>::AdaptFalsePositive(std::string_view query,
-                                                   std::string_view witness) {
+                                                   std::string_view witness,
+                                                   const CollisionContext *collision) {
     return AdaptFalsePositive(
         reinterpret_cast<const uint8_t *>(query.data()), query.size(),
-        reinterpret_cast<const uint8_t *>(witness.data()), witness.size());
+        reinterpret_cast<const uint8_t *>(witness.data()), witness.size(),
+        collision);
 }
 
 
@@ -3411,13 +3579,11 @@ template <DivaType diva_type, PayloadType payload_type>
 inline typename Diva<diva_type, payload_type>::AdaptResult
 Diva<diva_type, payload_type>::AdaptFalsePositive(
         const uint8_t *query, const uint32_t query_len,
-        const uint8_t *witness, const uint32_t witness_len) {
+        const uint8_t *witness, const uint32_t witness_len,
+        const CollisionContext *collision) {
     if (query == nullptr || query_len == 0 || witness == nullptr ||
         witness_len == 0) {
         return AdaptResult::kInvalidArgument;
-    }
-    if (!PointQuery(query, query_len)) {
-        return AdaptResult::kAlreadySufficient;
     }
 
     const uint32_t shared_bytes = std::min(query_len, witness_len);
@@ -3443,6 +3609,23 @@ Diva<diva_type, payload_type>::AdaptFalsePositive(
         first_different_bit < 8 * shared_bytes
             ? first_different_bit + 1
             : 8 * witness_len;
+
+    AdaptResult context_result;
+    if (collision != nullptr) {
+        if (TryAdaptFromCollisionContext(collision, witness, witness_len,
+                                         new_prefix_len, query, query_len,
+                                         &context_result)) {
+            return context_result;
+        }
+        // A supplied location that cannot be used is not re-routed by
+        // walking Diva again; that would race the same way the original
+        // context was trying to avoid.
+        return AdaptResult::kAlreadySufficient;
+    }
+
+    if (!PointQuery(query, query_len)) {
+        return AdaptResult::kAlreadySufficient;
+    }
     return AdaptImpl(witness, witness_len, new_prefix_len, query, query_len);
 }
 
@@ -3450,11 +3633,13 @@ Diva<diva_type, payload_type>::AdaptFalsePositive(
 template <DivaType diva_type, PayloadType payload_type>
 inline typename Diva<diva_type, payload_type>::AdaptResult
 Diva<diva_type, payload_type>::AdaptFalsePositiveRange(
-        std::string_view l, std::string_view r, std::string_view witness) {
+        std::string_view l, std::string_view r, std::string_view witness,
+        const CollisionContext *collision) {
     return AdaptFalsePositiveRange(
         reinterpret_cast<const uint8_t *>(l.data()), l.size(),
         reinterpret_cast<const uint8_t *>(r.data()), r.size(),
-        reinterpret_cast<const uint8_t *>(witness.data()), witness.size());
+        reinterpret_cast<const uint8_t *>(witness.data()), witness.size(),
+        collision);
 }
 
 
@@ -3463,7 +3648,8 @@ inline typename Diva<diva_type, payload_type>::AdaptResult
 Diva<diva_type, payload_type>::AdaptFalsePositiveRange(
         const uint8_t *l, const uint32_t l_len,
         const uint8_t *r, const uint32_t r_len,
-        const uint8_t *witness, const uint32_t witness_len) {
+        const uint8_t *witness, const uint32_t witness_len,
+        const CollisionContext *collision) {
     if (l == nullptr || l_len == 0 || r == nullptr || r_len == 0 ||
         witness == nullptr || witness_len == 0) {
         return AdaptResult::kInvalidArgument;
@@ -3477,9 +3663,6 @@ Diva<diva_type, payload_type>::AdaptFalsePositiveRange(
     // inclusive Diva feedback contract independently safe.
     if (r_key < l_key || !(r_key < witness_key)) {
         return AdaptResult::kInvalidArgument;
-    }
-    if (!RangeQuery(l, l_len, r, r_len)) {
-        return AdaptResult::kAlreadySufficient;
     }
 
     const uint32_t shared_bytes = std::min(r_len, witness_len);
@@ -3499,8 +3682,33 @@ Diva<diva_type, payload_type>::AdaptFalsePositiveRange(
         first_different_bit < 8 * shared_bytes
             ? first_different_bit + 1
             : 8 * witness_len;
-    return AdaptImpl(witness, witness_len, new_prefix_len,
-                     nullptr, 0, l, l_len, r, r_len);
+
+    AdaptResult context_result;
+    if (collision != nullptr) {
+        if (TryAdaptFromCollisionContext(collision, witness, witness_len,
+                                         new_prefix_len, nullptr, 0,
+                                         &context_result, l, l_len, r,
+                                         r_len)) {
+            return context_result;
+        }
+        return AdaptResult::kAlreadySufficient;
+    }
+
+    CollisionContext located;
+    if (!RangeQueryWithCollisionContext(l, l_len, r, r_len, &located)) {
+        return AdaptResult::kAlreadySufficient;
+    }
+    if (!located.valid) {
+        // RangeQuery was positive because of a fully stored tree key, which
+        // is not an infix representation we can extend.
+        return AdaptResult::kWitnessNotFound;
+    }
+    if (TryAdaptFromCollisionContext(&located, witness, witness_len,
+                                     new_prefix_len, nullptr, 0,
+                                     &context_result, l, l_len, r, r_len)) {
+        return context_result;
+    }
+    return AdaptResult::kAlreadySufficient;
 }
 
 
@@ -3562,8 +3770,6 @@ Diva<diva_type, payload_type>::AdaptImpl(
         return AdaptResult::kWitnessNotFound;
     }
 
-    const bool validate_rejection =
-        validate_point_rejection || validate_range_rejection;
     const InfiniteByteString query = {query_to_reject, query_to_reject_len};
     if (validate_point_rejection &&
         (!(prev_key < query) || next_key.str == nullptr || !(query < next_key))) {
@@ -3588,6 +3794,100 @@ Diva<diva_type, payload_type>::AdaptImpl(
     InfixStore& infix_store = *infix_store_ptr;
     rwlock_lock_write(infix_store.rwlock);
     UnlockLeaves(leaves_to_unlock, it_write_lock);
+    return AdaptInLocatedStore(
+        infix_store, prev_key, next_key, input_key, input_key_len,
+        new_prefix_len, query_to_reject, query_to_reject_len,
+        range_l_to_reject, range_l_to_reject_len, range_r_to_reject,
+        range_r_to_reject_len, /*collision_already_located=*/false);
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline bool Diva<diva_type, payload_type>::TryAdaptFromCollisionContext(
+        const CollisionContext *collision,
+        const uint8_t *witness, const uint32_t witness_len,
+        const uint32_t new_prefix_len,
+        const uint8_t *query, const uint32_t query_len,
+        AdaptResult *result,
+        const uint8_t *range_l, const uint32_t range_l_len,
+        const uint8_t *range_r, const uint32_t range_r_len) {
+    if (result == nullptr)
+        return false;
+    if constexpr (diva_type != DivaType::BinaryTrie ||
+                  payload_type != PayloadType::None) {
+        return false;
+    }
+    if (collision == nullptr)
+        return false;
+    if (!collision->valid || collision->store == nullptr ||
+        collision->prev_key == nullptr) {
+        *result = AdaptResult::kAlreadySufficient;
+        return true;
+    }
+
+    auto *const store = static_cast<InfixStore *>(collision->store);
+    rwlock_lock_write(store->rwlock);
+    const InfiniteByteString prev_key{collision->prev_key,
+                                      collision->prev_key_len};
+    const InfiniteByteString next_key{collision->next_key,
+                                      collision->next_key_len};
+    *result = AdaptInLocatedStore(
+        *store, prev_key, next_key, witness, witness_len, new_prefix_len,
+        query, query_len, range_l, range_l_len, range_r, range_r_len,
+        /*collision_already_located=*/true);
+    return true;
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline typename Diva<diva_type, payload_type>::AdaptResult
+Diva<diva_type, payload_type>::AdaptInLocatedStore(
+        InfixStore &infix_store,
+        const InfiniteByteString &prev_key,
+        const InfiniteByteString &next_key,
+        const uint8_t *input_key, const uint32_t input_key_len,
+        const uint32_t new_prefix_len,
+        const uint8_t *query_to_reject, const uint32_t query_to_reject_len,
+        const uint8_t *range_l_to_reject, const uint32_t range_l_to_reject_len,
+        const uint8_t *range_r_to_reject, const uint32_t range_r_to_reject_len,
+        const bool collision_already_located) {
+    const bool validate_point_rejection = query_to_reject != nullptr;
+    const bool validate_range_rejection = range_l_to_reject != nullptr;
+    const bool validate_rejection =
+        validate_point_rejection || validate_range_rejection;
+    const InfiniteByteString key{input_key, input_key_len};
+    const InfiniteByteString query{query_to_reject, query_to_reject_len};
+    const InfiniteByteString range_l{range_l_to_reject,
+                                     range_l_to_reject_len};
+    const InfiniteByteString range_r{range_r_to_reject,
+                                     range_r_to_reject_len};
+
+    if (collision_already_located && validate_point_rejection) {
+        if (!(prev_key < key) || next_key.str == nullptr ||
+            !(key < next_key)) {
+            // The recorded collision lives in this store, but the decoded
+            // witness does not, so extending it cannot be shown to be safe.
+            rwlock_unlock_write(infix_store.rwlock);
+            return AdaptResult::kWitnessNotFound;
+        }
+        if (!(prev_key < query) || next_key.str == nullptr ||
+            !(query < next_key)) {
+            rwlock_unlock_write(infix_store.rwlock);
+            return AdaptResult::kAlreadySufficient;
+        }
+    }
+    if (collision_already_located && validate_range_rejection) {
+        if (!(prev_key < key) || next_key.str == nullptr ||
+            !(key < next_key)) {
+            rwlock_unlock_write(infix_store.rwlock);
+            return AdaptResult::kWitnessNotFound;
+        }
+        if (range_r < range_l || !(prev_key < range_l) ||
+            next_key.str == nullptr || !(range_r < next_key)) {
+            rwlock_unlock_write(infix_store.rwlock);
+            return AdaptResult::kAlreadySufficient;
+        }
+    }
 
     if (prev_key == key) { // Tree keys are already stored in full.
         rwlock_unlock_write(infix_store.rwlock);
@@ -3622,7 +3922,9 @@ Diva<diva_type, payload_type>::AdaptImpl(
                                   {query.str, 8 * query.length},
                                   key_start_bit)) {
             rwlock_unlock_write(infix_store.rwlock);
-            return AdaptResult::kWitnessNotFound;
+            return collision_already_located
+                       ? AdaptResult::kAlreadySufficient
+                       : AdaptResult::kWitnessNotFound;
         }
     }
 
@@ -3642,7 +3944,9 @@ Diva<diva_type, payload_type>::AdaptImpl(
                 {range_l.str, 8 * range_l.length},
                 {range_r.str, 8 * range_r.length}, key_start_bit)) {
             rwlock_unlock_write(infix_store.rwlock);
-            return AdaptResult::kWitnessNotFound;
+            return collision_already_located
+                       ? AdaptResult::kAlreadySufficient
+                       : AdaptResult::kWitnessNotFound;
         }
     }
 
