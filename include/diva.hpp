@@ -19,6 +19,7 @@
 #include <numeric>
 #include <random>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <tuple>
 #include <type_traits>
@@ -154,46 +155,39 @@ public:
         kReadOnly,
     };
 
-    // Diva identifies a mutable representation without owning the policy that
-    // decides when it is worth adapting. The token is opaque to callers and
-    // changes whenever that representation's store generation changes.
-    using CollisionToken = uint64_t;
-    enum class CollisionTokenResult : uint8_t {
-        kFound,
-        // The query is no longer positive, or it matched a fully stored tree
-        // key rather than an adaptable infix representation.
+    enum class AdmissionResult : uint8_t {
+        // First confirmed false positive for this logical infix; its pending
+        // bit was set and no adaptation should run yet.
+        kDeferred,
+        // The bit was already set and has now been consumed; run one
+        // transactional adaptation attempt.
+        kAdmitted,
+        // Feedback did not identify a live adaptable logical infix (for
+        // example, a tree-key match, stale context, or shadowed key).
         kNoCollision,
+        // This Diva configuration has no mutable no-payload BinaryTrie state.
         kReadOnly,
     };
-    // Match location captured by the original point or range probe. Pointer
-    // fields are valid only while this Diva instance remains alive. Adaptation
-    // that is given a location stays on that store under its write lock; a
-    // newer mutation epoch is observed locally rather than by walking Diva
-    // again. Callers that cannot supply a location pass null so the standalone
+    // Match location captured by the original point or range probe. A point
+    // context identifies one logical entry. An optimized range probe can
+    // identify only the matching store, so logical_ordinal is UINT32_MAX;
+    // range admission separately maps the already-decoded strict-successor
+    // witness. Pointer fields are
+    // valid only while this Diva instance remains alive. Adaptation that is
+    // given a location stays on that store under its write lock.
+    // Callers that cannot supply a location pass null so the standalone
     // lookup API can locate the store once.
     struct CollisionContext {
-        CollisionToken admission_token = 0;
         bool valid = false;
         void *store = nullptr;
-        uint32_t mutation_epoch = 0;
-        uint32_t group_slot = 0;
-        uint32_t local_ordinal = 0;
+        uint32_t logical_ordinal = std::numeric_limits<uint32_t>::max();
         const uint8_t *prev_key = nullptr;
         uint32_t prev_key_len = 0;
         const uint8_t *next_key = nullptr;
         uint32_t next_key_len = 0;
     };
-    // Performs the ordinary point probe and, when the positive answer comes
-    // from an adaptable BinaryTrie representation, returns its non-zero
-    // collision token from the same traversal. Other positive/negative
-    // answers leave `token` zero.
-    bool PointQueryWithCollisionToken(std::string_view query,
-                                      CollisionToken *token) const;
-    bool PointQueryWithCollisionToken(const uint8_t *query,
-                                      uint32_t query_len,
-                                      CollisionToken *token) const;
-    // Same probe as PointQueryWithCollisionToken, but also returns the
-    // representation location so a later AdaptFalsePositive can skip
+    // Performs the ordinary point probe and returns the matching logical
+    // representation so admission and a later AdaptFalsePositive can avoid
     // re-traversing Diva while this instance remains alive.
     bool PointQueryWithCollisionContext(std::string_view query,
                                         CollisionContext *context) const;
@@ -206,6 +200,13 @@ public:
     bool RangeQueryWithCollisionContext(const uint8_t *l, uint32_t l_len,
                                         const uint8_t *r, uint32_t r_len,
                                         CollisionContext *context) const;
+    // Exact second-hit admission. Every logical infix owns one bit in its
+    // store. The first confirmed false positive sets it; the second consumes
+    // it and admits one adaptation attempt.
+    AdmissionResult ObserveFalsePositive(const CollisionContext& context);
+    AdmissionResult ObserveFalsePositive(std::string_view witness);
+    AdmissionResult ObserveFalsePositive(const uint8_t *witness,
+                                          uint32_t witness_len);
 
     AdaptResult Adapt(uint64_t key, const uint32_t new_prefix_len);
     AdaptResult Adapt(std::string_view key, const uint32_t new_prefix_len);
@@ -216,9 +217,9 @@ public:
     // published only if extending that witness makes `query` negative.
     // `collision` is an optional location from PointQueryWithCollisionContext
     // on this same instance. When a location is supplied, adaptation stays on
-    // that store under its write lock and does not re-walk Diva, even if the
-    // recorded epoch no longer matches. Passing null keeps the standalone
-    // lookup API used by tests.
+    // that store under its write lock and verifies the point witness's stable
+    // logical ordinal instead of trusting a physical slot. Passing null keeps
+    // the standalone lookup API used by tests.
     AdaptResult AdaptFalsePositive(std::string_view query,
                                    std::string_view witness,
                                    const CollisionContext *collision = nullptr);
@@ -243,11 +244,17 @@ public:
                                         const uint8_t *witness,
                                         uint32_t witness_len,
                                         const CollisionContext *collision = nullptr);
-    CollisionTokenResult GetCollisionToken(std::string_view query,
-                                           CollisionToken *token) const;
-    CollisionTokenResult GetCollisionToken(const uint8_t *query,
-                                           uint32_t query_len,
-                                           CollisionToken *token) const;
+    // Logically hide one stored key without changing its ordinal. Tree keys
+    // use a status bit and infix keys use the store-local shadow bitmap. The
+    // caller (RocksDB) must prove that no snapshot still needs this version.
+    enum class ShadowResult : uint8_t {
+        kShadowed,
+        kAlreadyShadowed,
+        kKeyNotFound,
+        kReadOnly,
+    };
+    ShadowResult ShadowStoredKey(std::string_view key);
+    ShadowResult ShadowStoredKey(const uint8_t *key, uint32_t key_len);
     void ShrinkInfixSize(const uint32_t new_infix_size);
     uint64_t Size() const;
     uint32_t Serialize(char *out) const;
@@ -461,19 +468,55 @@ private:
     struct InfixStore : InfixStorePayloadMetadata {
         static const uint32_t size_grade_bit_count = 12;
         static const uint32_t full_slot_count_bit_count = 48;
+        // Bits 0..59 are the serialized slot count and size grade. The next
+        // two bits are runtime-only and are masked before serialization.
+        static const uint32_t tree_key_shadowed_bit = 60;
+        // The bitmap is always allocated. This monotonic bit keeps the normal
+        // untouched query path from reading its extra 128 cache-cold bytes.
+        static const uint32_t has_infix_shadows_bit = 61;
+        static const uint32_t runtime_status_bit_count = 2;
+        static_assert(full_slot_count_bit_count + size_grade_bit_count ==
+                      tree_key_shadowed_bit);
+        static_assert(has_infix_shadows_bit < 64);
+        static constexpr uint64_t serialized_status_mask =
+            BITMASK(full_slot_count_bit_count + size_grade_bit_count);
+        static constexpr uint32_t ordinal_directory_entry_count =
+            infix_store_target_size / 64;
+        // The directory and shadow bitmap are an allocation tail, not part of
+        // the serialized quotient-filter bytes. Directory entry i is the
+        // number of logical infix keys in quotients [0, 64*i).
+        static constexpr uint32_t ordinal_directory_word_count =
+            (ordinal_directory_entry_count * sizeof(uint16_t) +
+             sizeof(uint64_t) - 1) / sizeof(uint64_t);
+        static constexpr uint32_t shadow_bitmap_word_count =
+            infix_store_target_size / 64;
+        // Exact second-hit admission state. One bit is reserved for each of
+        // the at most 1023 infix keys between adjacent 1024-key samples. Like
+        // shadow state, it follows logical ordinals rather than physical
+        // slots, so BinaryTrie continuation slots never receive bits.
+        static constexpr uint32_t admission_bitmap_word_count =
+            infix_store_target_size / 64;
+        static constexpr uint32_t runtime_metadata_word_count =
+            diva_type == DivaType::BinaryTrie &&
+                    payload_type == PayloadType::None
+                ? ordinal_directory_word_count + shadow_bitmap_word_count +
+                      admission_bitmap_word_count
+                : 0;
 
         uint64_t status = 0;
         std::atomic<lock_t> rwlock {0};
-        // Changes whenever an adaptation publishes a new logical
-        // representation. It invalidates admission tokens derived from the
-        // previous contents without having to find and erase them eagerly.
-        uint32_t mutation_epoch = 0;
+        // Number of logical keys between this tree key and the next one. A
+        // BinaryTrie group can occupy several physical slots while
+        // contributing several logical keys, so this is deliberately not the
+        // physical full-slot count.
+        uint16_t logical_infix_count = 0;
         uint64_t *ptr = nullptr;
 
         InfixStore(const uint32_t slot_count, const uint32_t slot_size,
                    const uint32_t size_grade, const uint32_t payload_size=0) {
             SetSizeGrade(size_grade);
-            const uint64_t word_count = GetPtrWordCount(slot_count, slot_size, payload_size);
+            const uint64_t word_count = GetAllocationWordCount(
+                slot_count, slot_size, payload_size);
             rwlock.store(0, std::memory_order_release);
             ptr = new uint64_t[word_count];
             memset(ptr, 0, sizeof(uint64_t) * word_count);
@@ -483,7 +526,7 @@ private:
                     InfixStorePayloadMetadata(other),
                     status(other.status),
                     rwlock(0),
-                    mutation_epoch(other.mutation_epoch),
+                    logical_infix_count(other.logical_infix_count),
                     ptr(other.ptr) {
             rwlock.store(0, std::memory_order_release);
         }
@@ -494,13 +537,23 @@ private:
 #ifdef DEBUG
             assert(ptr);
 #endif // DEBUG
-            memset(ptr, 0, GetPtrWordCount(slot_count, slot_size, payload_size) * sizeof(uint64_t));
+            memset(ptr, 0, GetAllocationWordCount(
+                       slot_count, slot_size, payload_size) * sizeof(uint64_t));
+            logical_infix_count = 0;
+            status &= serialized_status_mask;
         }
 
         static uint64_t GetPtrWordCount(const uint32_t slot_count, const uint32_t slot_size, const uint32_t payload_size=0) {
             if constexpr (payload_type == PayloadType::FixedLength)
                 return num_metadata_offset_words + (Diva::infix_store_target_size + slot_count * (slot_size + 1 + payload_size) + 63) / 64 + 1;
             return num_metadata_offset_words + (Diva::infix_store_target_size + slot_count * (slot_size + 1) + 63) / 64 + 1;
+        }
+
+        static uint64_t GetAllocationWordCount(
+                const uint32_t slot_count, const uint32_t slot_size,
+                const uint32_t payload_size=0) {
+            return GetPtrWordCount(slot_count, slot_size, payload_size) +
+                   runtime_metadata_word_count;
         }
 
         uint64_t GetFullSlotCount() const {
@@ -526,16 +579,34 @@ private:
             status &= ~(BITMASK(size_grade_bit_count) << full_slot_count_bit_count);
             status |= size_grade << full_slot_count_bit_count;
         }
+
+
+        bool TreeKeyIsShadowed() const {
+            return (status & (uint64_t{1} << tree_key_shadowed_bit)) != 0;
+        }
+
+        bool HasInfixShadows() const {
+            return (status & (uint64_t{1} << has_infix_shadows_bit)) != 0;
+        }
+
+        void SetTreeKeyShadowed() {
+            status |= uint64_t{1} << tree_key_shadowed_bit;
+        }
+
+        void SetHasInfixShadows() {
+            status |= uint64_t{1} << has_infix_shadows_bit;
+        }
+
     };
     static_assert(payload_type != PayloadType::None ||
                       sizeof(InfixStore) == 3 * sizeof(uint64_t),
-                  "The mutation epoch should occupy existing alignment padding");
+                  "Runtime shadow metadata must preserve the packed store header");
 
     struct CollisionLocation {
         InfixStore *store = nullptr;
         uint32_t group_slot = 0;
         uint32_t local_ordinal = 0;
-        uint32_t mutation_epoch = 0;
+        uint32_t logical_ordinal = 0;
         const uint8_t *prev_key = nullptr;
         uint32_t prev_key_len = 0;
         const uint8_t *next_key = nullptr;
@@ -857,7 +928,9 @@ private:
             const uint8_t *query_to_reject, uint32_t query_to_reject_len,
             const uint8_t *range_l_to_reject, uint32_t range_l_to_reject_len,
             const uint8_t *range_r_to_reject, uint32_t range_r_to_reject_len,
-            bool collision_already_located);
+            bool collision_already_located,
+            uint32_t expected_logical_ordinal =
+                std::numeric_limits<uint32_t>::max());
     bool TryAdaptFromCollisionContext(
             const CollisionContext *collision,
             const uint8_t *witness, uint32_t witness_len,
@@ -871,6 +944,28 @@ private:
                         CollisionLocation *location) const;
     void FillCollisionContext(const CollisionLocation &location,
                               CollisionContext *context) const;
+    // The caller holds the store read or write lock. Runtime status bits and
+    // allocation-tail metadata are intentionally not serialized.
+    static bool TreeKeyIsShadowed(const InfixStore *store) {
+        return store != nullptr && store->TreeKeyIsShadowed();
+    }
+    uint16_t *GetOrdinalDirectory(InfixStore &store) const;
+    const uint16_t *GetOrdinalDirectory(const InfixStore &store) const;
+    uint64_t *GetInfixShadowBitmap(InfixStore &store) const;
+    const uint64_t *GetInfixShadowBitmap(const InfixStore &store) const;
+    uint64_t *GetAdmissionBitmap(InfixStore &store) const;
+    const uint64_t *GetAdmissionBitmap(const InfixStore &store) const;
+    uint32_t GetLogicalGroupCount(const InfixStore &store, uint32_t group_slot,
+                                  uint32_t runend_pos) const;
+    void RebuildLogicalOrdinalDirectory(InfixStore &store) const;
+    uint32_t GetLogicalOrdinal(const InfixStore &store, uint32_t implicit_part,
+                               uint32_t group_slot,
+                               uint32_t local_ordinal) const;
+    bool InfixIsShadowed(const InfixStore &store,
+                         uint32_t logical_ordinal) const;
+    bool SetInfixShadowed(InfixStore &store,
+                          uint32_t logical_ordinal) const;
+    bool HasVisibleInfix(const InfixStore &store) const;
     // Assumes that `key` is a full length infix.
     void DeleteRawFromInfixStore(InfixStore &store, const uint64_t key,
                                  const uint32_t total_implicit=infix_store_target_size,
@@ -901,21 +996,24 @@ private:
                               const InfiniteByteString original_l_key={nullptr, 0},
                               const InfiniteByteString original_r_key={nullptr, 0},
                               const uint32_t original_key_start_bit=0) const;
+    bool RangeQueryInfixStoreRaw(InfixStore &store, const uint64_t l_key,
+                                 const uint64_t r_key,
+                                 const uint32_t total_implicit,
+                                 const InfiniteByteString original_l_key,
+                                 const InfiniteByteString original_r_key,
+                                 const uint32_t original_key_start_bit) const;
     // Assumes that `key` is a full length infix. Returns true if there is an
     // infix that may match `key`.
     bool PointQueryInfixStore(InfixStore &store, const uint64_t key,
                               const uint32_t total_implicit=infix_store_target_size,
                               const InfiniteByteString original_key={nullptr, 0},
                               const uint32_t original_key_start_bit=0,
-                              CollisionLocation *location=nullptr) const;
+                              CollisionLocation *location=nullptr,
+                              bool include_shadowed=false) const;
     // Shared point-probe implementation. Normal PointQuery passes nullptr;
-    // token-enabled probes request the matching representation's location so
-    // the original traversal can also derive the adaptation-admission token.
+    // context-enabled probes request the matching logical representation.
     bool PointQueryImpl(const uint8_t *input_key, uint32_t key_len,
                         CollisionLocation *location) const;
-    CollisionTokenResult BuildCollisionToken(
-        const CollisionLocation& location, CollisionToken *token) const;
-    static uint64_t MixCollisionToken(uint64_t value);
     // Resizes the infix store to the appropriate size based on its number of
     // elements.
     void ResizeInfixStore(InfixStore &store, const uint32_t total_implicit=infix_store_target_size);
@@ -1613,11 +1711,58 @@ inline bool Diva<diva_type, payload_type>::RangeQueryImpl(
         }
     }
 
-    if (prev_key == l_key || (next_key.str != nullptr && next_key <= r_key)) {
-        UnlockLeaves(leaves_to_unlock, it_write_lock);
-        return true;
+    if (prev_key == l_key) {
+        rwlock_lock_read(infix_store_ptr->rwlock);
+        const bool visible = !TreeKeyIsShadowed(infix_store_ptr);
+        rwlock_unlock_read(infix_store_ptr->rwlock);
+        if (visible) {
+            UnlockLeaves(leaves_to_unlock, it_write_lock);
+            return true;
+        }
     }
-    else if (next_key.str == nullptr) {
+    if (next_key.str != nullptr && next_key <= r_key) {
+        if constexpr (diva_type != DivaType::BinaryTrie) {
+            // Standard and Int Diva have no logical-shadow state. Preserve the
+            // original fast path: the fully stored next tree key is itself a
+            // visible witness in the inclusive range.
+            UnlockLeaves(leaves_to_unlock, it_write_lock);
+            return true;
+        }
+        InfixStore *next_store = nullptr;
+        if constexpr (diva_type == DivaType::BinaryTrie) {
+            const void *k = nullptr;
+            uint32_t klen = 0;
+            uint32_t vlen = 0;
+            if (wh_iter_valid(&it)) {
+                wh_iter_peek_ref(&it, &k, &klen,
+                                 reinterpret_cast<void **>(&next_store),
+                                 &vlen);
+            }
+        }
+        bool next_visible = false;
+        if (next_store != nullptr) {
+            rwlock_lock_read(next_store->rwlock);
+            next_visible = !TreeKeyIsShadowed(next_store);
+            rwlock_unlock_read(next_store->rwlock);
+        }
+        if (next_visible) {
+            UnlockLeaves(leaves_to_unlock, it_write_lock);
+            return true;
+        }
+        if constexpr (diva_type == DivaType::BinaryTrie &&
+                      payload_type == PayloadType::None) {
+            if (next_store != nullptr) {
+                // The immediate boundary is hidden, but a later visible tree
+                // key or infix can still lie in the range. Reuse the logical
+                // iterator, which skips both kinds of shadowed entries, rather
+                // than treating this boundary as the end of the range.
+                UnlockLeaves(leaves_to_unlock, it_write_lock);
+                auto visible = const_cast<Diva *>(this)->GetIterator(
+                    input_l, input_l_len, input_r, input_r_len);
+                return visible.IsValid();
+            }
+        }
+    } else if (next_key.str == nullptr) {
         UnlockLeaves(leaves_to_unlock, it_write_lock);
         return false;
     }
@@ -1625,6 +1770,22 @@ inline bool Diva<diva_type, payload_type>::RangeQueryImpl(
     InfixStore& infix_store = *infix_store_ptr;
     rwlock_lock_read(infix_store.rwlock);
     UnlockLeaves(leaves_to_unlock, it_write_lock);
+
+    if constexpr (diva_type == DivaType::BinaryTrie &&
+                  payload_type == PayloadType::None) {
+        if (infix_store.HasInfixShadows()) {
+            // QueryTrie is optimized to return on the first matching encoded
+            // path and does not identify every logical entry that made the
+            // range positive. Once this store has hidden infixes, use the
+            // logical iterator's range walk: it expands BinaryTrie groups,
+            // skips continuation slots, and filters each entry by its stable
+            // logical ordinal. Untouched stores retain the original fast path.
+            rwlock_unlock_read(infix_store.rwlock);
+            auto visible = const_cast<Diva *>(this)->GetIterator(
+                input_l, input_l_len, input_r, input_r_len);
+            return visible.IsValid();
+        }
+    }
 
     auto [shared, ignore, implicit_size] = GetSharedIgnoreImplicitLengths(prev_key, next_key);
     // To query the binary tries
@@ -1674,7 +1835,12 @@ inline bool Diva<diva_type, payload_type>::RangeQueryImpl(
                                               key_start_bit);
         if (res && location != nullptr) {
             location->store = &infix_store;
-            location->mutation_epoch = infix_store.mutation_epoch;
+            // The optimized range walk proves that some encoded entry matched,
+            // but it does not identify one exact logical leaf. Keep the store
+            // context for transactional adaptation while declining to invent
+            // ordinal zero as an admission identity.
+            location->logical_ordinal =
+                std::numeric_limits<uint32_t>::max();
             location->prev_key = prev_key.str;
             location->prev_key_len = prev_key.length;
             location->next_key = next_key.str;
@@ -1708,27 +1874,6 @@ inline bool Diva<diva_type, payload_type>::PointQuery(const uint8_t *input_key, 
 
 
 template <DivaType diva_type, PayloadType payload_type>
-inline bool Diva<diva_type, payload_type>::PointQueryWithCollisionToken(
-        std::string_view query, CollisionToken *token) const {
-    return PointQueryWithCollisionToken(
-        reinterpret_cast<const uint8_t *>(query.data()), query.size(), token);
-}
-
-
-template <DivaType diva_type, PayloadType payload_type>
-inline bool Diva<diva_type, payload_type>::PointQueryWithCollisionToken(
-        const uint8_t *query, const uint32_t query_len,
-        CollisionToken *token) const {
-    CollisionContext context;
-    const bool may_match =
-        PointQueryWithCollisionContext(query, query_len, &context);
-    if (token != nullptr)
-        *token = context.admission_token;
-    return may_match;
-}
-
-
-template <DivaType diva_type, PayloadType payload_type>
 inline bool Diva<diva_type, payload_type>::PointQueryWithCollisionContext(
         std::string_view query, CollisionContext *context) const {
     return PointQueryWithCollisionContext(
@@ -1744,12 +1889,9 @@ inline void Diva<diva_type, payload_type>::FillCollisionContext(
     *context = {};
     if (!location.valid || location.store == nullptr)
         return;
-    static_cast<void>(BuildCollisionToken(location, &context->admission_token));
     context->valid = true;
     context->store = location.store;
-    context->mutation_epoch = location.mutation_epoch;
-    context->group_slot = location.group_slot;
-    context->local_ordinal = location.local_ordinal;
+    context->logical_ordinal = location.logical_ordinal;
     context->prev_key = location.prev_key;
     context->prev_key_len = location.prev_key_len;
     context->next_key = location.next_key;
@@ -1812,9 +1954,11 @@ inline bool Diva<diva_type, payload_type>::PointQueryImpl(
     UnlockLeaves(leaves_to_unlock, it_write_lock);
 
     if (prev_key == key) {
-        // Previous key matches the query key
+        // Previous key matches the query key. A shadowed tree key is treated
+        // as absent; tree keys are not duplicated in the infix store.
+        const bool visible = !TreeKeyIsShadowed(&infix_store);
         rwlock_unlock_read(infix_store.rwlock);
-        return true;
+        return visible;
     }
     else if (next_key.str == nullptr) {
         rwlock_unlock_read(infix_store.rwlock);
@@ -1835,7 +1979,6 @@ inline bool Diva<diva_type, payload_type>::PointQueryImpl(
                                           key_start_bit, location);
     if (res && location != nullptr && location->valid) {
         location->store = &infix_store;
-        location->mutation_epoch = infix_store.mutation_epoch;
         location->prev_key = prev_key.str;
         location->prev_key_len = prev_key.length;
         location->next_key = next_key.str;
@@ -1848,65 +1991,372 @@ inline bool Diva<diva_type, payload_type>::PointQueryImpl(
 
 
 template <DivaType diva_type, PayloadType payload_type>
-inline uint64_t Diva<diva_type, payload_type>::MixCollisionToken(
-        uint64_t value) {
-    // SplitMix64 finalizer. Admission is a performance policy, so a vanishing
-    // hash-collision probability can only cause an unnecessary adaptation;
-    // private-candidate validation still protects filter correctness.
-    value ^= value >> 30;
-    value *= 0xbf58476d1ce4e5b9ULL;
-    value ^= value >> 27;
-    value *= 0x94d049bb133111ebULL;
-    value ^= value >> 31;
-    return value;
+inline uint16_t *Diva<diva_type, payload_type>::GetOrdinalDirectory(
+        InfixStore &store) const {
+    static_assert(diva_type == DivaType::BinaryTrie &&
+                  payload_type == PayloadType::None);
+    return reinterpret_cast<uint16_t *>(
+        store.ptr + InfixStore::GetPtrWordCount(
+                        scaled_sizes_[store.GetSizeGrade()], infix_size_,
+                        payload_size_));
 }
 
 
 template <DivaType diva_type, PayloadType payload_type>
-inline typename Diva<diva_type, payload_type>::CollisionTokenResult
-Diva<diva_type, payload_type>::BuildCollisionToken(
-        const CollisionLocation& location, CollisionToken *token) const {
-    if (token == nullptr || !location.valid || location.store == nullptr)
-        return CollisionTokenResult::kNoCollision;
-
-    uint64_t value = MixCollisionToken(
-        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(location.store)));
-    value ^= MixCollisionToken(
-        (static_cast<uint64_t>(location.mutation_epoch) << 32) |
-        location.group_slot);
-    value ^= MixCollisionToken(
-        static_cast<uint64_t>(location.local_ordinal) +
-        0x9e3779b97f4a7c15ULL);
-    value = MixCollisionToken(value);
-    if (value == 0)
-        value = 1;  // Admission policies reserve zero as an empty entry.
-    *token = value;
-    return CollisionTokenResult::kFound;
+inline const uint16_t *Diva<diva_type, payload_type>::GetOrdinalDirectory(
+        const InfixStore &store) const {
+    static_assert(diva_type == DivaType::BinaryTrie &&
+                  payload_type == PayloadType::None);
+    return reinterpret_cast<const uint16_t *>(
+        store.ptr + InfixStore::GetPtrWordCount(
+                        scaled_sizes_[store.GetSizeGrade()], infix_size_,
+                        payload_size_));
 }
 
 
 template <DivaType diva_type, PayloadType payload_type>
-inline typename Diva<diva_type, payload_type>::CollisionTokenResult
-Diva<diva_type, payload_type>::GetCollisionToken(
-        std::string_view query, CollisionToken *token) const {
-    return GetCollisionToken(reinterpret_cast<const uint8_t *>(query.data()),
-                             query.size(), token);
+inline uint64_t *Diva<diva_type, payload_type>::GetInfixShadowBitmap(
+        InfixStore &store) const {
+    static_assert(diva_type == DivaType::BinaryTrie &&
+                  payload_type == PayloadType::None);
+    return reinterpret_cast<uint64_t *>(GetOrdinalDirectory(store) +
+                                        InfixStore::ordinal_directory_entry_count);
 }
 
 
 template <DivaType diva_type, PayloadType payload_type>
-inline typename Diva<diva_type, payload_type>::CollisionTokenResult
-Diva<diva_type, payload_type>::GetCollisionToken(
-        const uint8_t *query, const uint32_t query_len,
-        CollisionToken *token) const {
+inline const uint64_t *Diva<diva_type, payload_type>::GetInfixShadowBitmap(
+        const InfixStore &store) const {
+    static_assert(diva_type == DivaType::BinaryTrie &&
+                  payload_type == PayloadType::None);
+    return reinterpret_cast<const uint64_t *>(
+        GetOrdinalDirectory(store) +
+        InfixStore::ordinal_directory_entry_count);
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline uint64_t *Diva<diva_type, payload_type>::GetAdmissionBitmap(
+        InfixStore &store) const {
+    static_assert(diva_type == DivaType::BinaryTrie &&
+                  payload_type == PayloadType::None);
+    return GetInfixShadowBitmap(store) + InfixStore::shadow_bitmap_word_count;
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline const uint64_t *Diva<diva_type, payload_type>::GetAdmissionBitmap(
+        const InfixStore &store) const {
+    static_assert(diva_type == DivaType::BinaryTrie &&
+                  payload_type == PayloadType::None);
+    return GetInfixShadowBitmap(store) + InfixStore::shadow_bitmap_word_count;
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline uint32_t Diva<diva_type, payload_type>::GetLogicalGroupCount(
+        const InfixStore &store, const uint32_t group_slot,
+        const uint32_t runend_pos) const {
+    static_assert(diva_type == DivaType::BinaryTrie);
+    if (!SlotHasTrie(store, group_slot, runend_pos))
+        return 1;
+    const Infix infix(
+        store.ptr + num_metadata_offset_words,
+        infix_store_target_size + scaled_sizes_[store.GetSizeGrade()] +
+            infix_size_ * group_slot,
+        infix_size_,
+        infix_store_target_size + scaled_sizes_[store.GetSizeGrade()] +
+            infix_size_ * (runend_pos + 1));
+    return infix.GetNumPrefixKeys() + infix.num_suffixes_;
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline void Diva<diva_type, payload_type>::RebuildLogicalOrdinalDirectory(
+        InfixStore &store) const {
     if constexpr (diva_type != DivaType::BinaryTrie ||
                   payload_type != PayloadType::None) {
-        return CollisionTokenResult::kReadOnly;
+        return;
+    } else {
+        // Rebuild the runtime logical-key prefix sums after the store's
+        // physical occupied/runend/slot layout is complete. This metadata is
+        // not serialized. For chunk c:
+        //
+        //   directory[c] = number of infix keys in quotients [0, 64*c)
+        //
+        // The owning Wormhole tree key is not an infix and is not counted.
+        // Callers either own the not-yet-published store or hold its write
+        // lock, so readers cannot observe a partially rebuilt directory.
+        uint16_t *const directory = GetOrdinalDirectory(store);
+        uint32_t logical_count = 0;
+        for (uint32_t implicit = 0; implicit < infix_store_target_size;
+             ++implicit) {
+            // Record the count before processing the first quotient in this
+            // chunk. GetLogicalOrdinal() starts here and scans only occupied
+            // quotients preceding its target within the same 64-bit word.
+            if ((implicit & 63U) == 0) {
+                directory[implicit / 64] =
+                    static_cast<uint16_t>(logical_count);
+            }
+            if (!GetOccupiedBit(store, implicit))
+                continue;
+
+            // RankOccupieds() counts occupied quotients strictly before
+            // `implicit`, so for a set bit it is the run's zero-based rank.
+            // SelectRunends(rank) therefore selects this quotient's run.
+            const uint32_t rank = RankOccupieds(store, implicit);
+            const uint32_t runend_pos = SelectRunends(store, rank);
+            // Runs can be shifted from their mapped quotient and can be
+            // adjacent. Their start is one slot after both the prior run end
+            // and the last physical hole preceding this run end. This is the
+            // same run-boundary rule used by point/range queries.
+            const uint32_t runstart_pos = static_cast<uint32_t>(
+                std::max<int32_t>(
+                    rank ? static_cast<int32_t>(SelectRunends(store, rank - 1))
+                         : -1,
+                    FindEmptySlotBefore(store, runend_pos)) +
+                1);
+            // Walk logical groups, not physical slots. A regular group is one
+            // slot and one key. A BinaryTrie escape group begins at `pos`, can
+            // span several continuation slots, and contributes one logical
+            // key for each prefix key and suffix leaf encoded in the trie.
+            // Advancing by GetNumSlots() ensures continuation slots are never
+            // counted as independent keys.
+            for (uint32_t pos = runstart_pos; pos <= runend_pos;) {
+                logical_count += GetLogicalGroupCount(store, pos, runend_pos);
+                if (SlotHasTrie(store, pos, runend_pos)) {
+                    const Infix infix(
+                        store.ptr + num_metadata_offset_words,
+                        infix_store_target_size +
+                            scaled_sizes_[store.GetSizeGrade()] +
+                            infix_size_ * pos,
+                        infix_size_,
+                        infix_store_target_size +
+                            scaled_sizes_[store.GetSizeGrade()] +
+                            infix_size_ * (runend_pos + 1));
+                    pos += infix.GetNumSlots(infix_size_);
+                } else {
+                    ++pos;
+                }
+            }
+        }
+        // RocksDB's sorted bulk loader promotes one tree key per 1024 input
+        // keys. The store owned by that tree key therefore contains at most
+        // the 1023 intervening infix keys. This proves both that uint16_t is
+        // sufficient for the total/checkpoints and that every logical ordinal
+        // fits the 1024-bit shadow and admission maps.
+        assert(logical_count < infix_store_target_size);
+        // This total is the exclusive upper bound of the store-local ordinal
+        // space. It also avoids rescanning the final [960, 1024) chunk when a
+        // caller only needs to know whether every infix has been shadowed.
+        store.logical_infix_count = static_cast<uint16_t>(logical_count);
     }
-    CollisionLocation location;
-    if (!PointQueryImpl(query, query_len, &location))
-        return CollisionTokenResult::kNoCollision;
-    return BuildCollisionToken(location, token);
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline uint32_t Diva<diva_type, payload_type>::GetLogicalOrdinal(
+        const InfixStore &store, const uint32_t implicit_part,
+        const uint32_t group_slot, const uint32_t local_ordinal) const {
+    static_assert(diva_type == DivaType::BinaryTrie &&
+                  payload_type == PayloadType::None);
+    // Return the zero-based logical-key ordinal of one representation within
+    // this store (the owning Wormhole tree key is outside this coordinate):
+    //
+    //   checkpoint before this 64-quotient chunk
+    // + keys in earlier occupied quotients of the chunk
+    // + keys in earlier groups of the target quotient's run
+    // + key index within the target group.
+    //
+    // `group_slot` must name a regular slot or a BinaryTrie escape root, never
+    // one of the trie's continuation slots. `local_ordinal` is zero for a
+    // regular group and selects one prefix/suffix key for a trie group. The
+    // caller must keep the store's physical layout stable with its read or
+    // write lock while this function runs.
+    assert(implicit_part < infix_store_target_size);
+    assert(GetOccupiedBit(store, implicit_part));
+    const uint32_t chunk_start = implicit_part & ~uint32_t{63};
+    uint32_t ordinal = GetOrdinalDirectory(store)[implicit_part / 64];
+
+    // The directory checkpoint is 64-quotient aligned. Enumerate only the
+    // occupied quotients before the target instead of testing all 63 possible
+    // bit positions one by one. This preserves the exact same logical count
+    // while making collision/shadow identity proportional to the number of
+    // runs that can actually contribute keys.
+    const uint64_t *const occupieds =
+        store.ptr + num_metadata_offset_words;
+    uint64_t occupied_before_target =
+        occupieds[chunk_start / 64] &
+        BITMASK(implicit_part - chunk_start);
+    while (occupied_before_target != 0) {
+        const uint32_t implicit =
+            chunk_start + static_cast<uint32_t>(
+                              __builtin_ctzll(occupied_before_target));
+        occupied_before_target &= occupied_before_target - 1;
+        const uint32_t rank = RankOccupieds(store, implicit);
+        const uint32_t runend_pos = SelectRunends(store, rank);
+        const uint32_t runstart_pos = static_cast<uint32_t>(
+            std::max<int32_t>(
+                rank ? static_cast<int32_t>(SelectRunends(store, rank - 1))
+                     : -1,
+                FindEmptySlotBefore(store, runend_pos)) +
+            1);
+        for (uint32_t pos = runstart_pos; pos <= runend_pos;) {
+            ordinal += GetLogicalGroupCount(store, pos, runend_pos);
+            if (SlotHasTrie(store, pos, runend_pos)) {
+                const Infix infix(
+                    store.ptr + num_metadata_offset_words,
+                    infix_store_target_size +
+                        scaled_sizes_[store.GetSizeGrade()] +
+                        infix_size_ * pos,
+                    infix_size_,
+                    infix_store_target_size +
+                        scaled_sizes_[store.GetSizeGrade()] +
+                        infix_size_ * (runend_pos + 1));
+                pos += infix.GetNumSlots(infix_size_);
+            } else {
+                ++pos;
+            }
+        }
+    }
+
+    const uint32_t rank = RankOccupieds(store, implicit_part);
+    const uint32_t runend_pos = SelectRunends(store, rank);
+    const uint32_t runstart_pos = static_cast<uint32_t>(
+        std::max<int32_t>(
+            rank ? static_cast<int32_t>(SelectRunends(store, rank - 1)) : -1,
+            FindEmptySlotBefore(store, runend_pos)) +
+        1);
+    assert(group_slot >= runstart_pos && group_slot <= runend_pos);
+    uint32_t pos = runstart_pos;
+    for (; pos < group_slot;) {
+        ordinal += GetLogicalGroupCount(store, pos, runend_pos);
+        if (SlotHasTrie(store, pos, runend_pos)) {
+            const Infix infix(
+                store.ptr + num_metadata_offset_words,
+                infix_store_target_size + scaled_sizes_[store.GetSizeGrade()] +
+                    infix_size_ * pos,
+                infix_size_,
+                infix_store_target_size + scaled_sizes_[store.GetSizeGrade()] +
+                    infix_size_ * (runend_pos + 1));
+            pos += infix.GetNumSlots(infix_size_);
+        } else {
+            ++pos;
+        }
+    }
+    // If this fails, group_slot fell inside a BinaryTrie continuation range
+    // rather than naming the escape root that owns the logical keys.
+    assert(pos == group_slot);
+    assert(local_ordinal <
+           GetLogicalGroupCount(store, group_slot, runend_pos));
+    ordinal += local_ordinal;
+    assert(ordinal < store.logical_infix_count);
+    return ordinal;
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline bool Diva<diva_type, payload_type>::InfixIsShadowed(
+        const InfixStore &store, const uint32_t logical_ordinal) const {
+    if constexpr (diva_type != DivaType::BinaryTrie ||
+                  payload_type != PayloadType::None) {
+        return false;
+    } else {
+        if (!store.HasInfixShadows())
+            return false;
+        assert(logical_ordinal < store.logical_infix_count);
+        return get_bitmap_bit(GetInfixShadowBitmap(store), logical_ordinal);
+    }
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline bool Diva<diva_type, payload_type>::SetInfixShadowed(
+        InfixStore &store, const uint32_t logical_ordinal) const {
+    static_assert(diva_type == DivaType::BinaryTrie &&
+                  payload_type == PayloadType::None);
+    assert(logical_ordinal < store.logical_infix_count);
+    uint64_t *const bitmap = GetInfixShadowBitmap(store);
+    const bool already = get_bitmap_bit(bitmap, logical_ordinal);
+    if (!already) {
+        set_bitmap_bit(bitmap, logical_ordinal);
+        // A shadow is monotonic for this loaded filter generation, so pending
+        // adaptation feedback for the now-invisible representation is dead.
+        reset_bitmap_bit(GetAdmissionBitmap(store), logical_ordinal);
+        store.SetHasInfixShadows();
+    }
+    return already;
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline bool Diva<diva_type, payload_type>::HasVisibleInfix(
+        const InfixStore &store) const {
+    if constexpr (diva_type != DivaType::BinaryTrie ||
+                  payload_type != PayloadType::None) {
+        return store.GetFullSlotCount() != 0;
+    } else {
+        if (!store.HasInfixShadows())
+            return store.logical_infix_count != 0;
+        uint32_t shadowed = 0;
+        const uint64_t *const bitmap = GetInfixShadowBitmap(store);
+        for (uint32_t i = 0; i < InfixStore::shadow_bitmap_word_count; ++i)
+            shadowed += __builtin_popcountll(bitmap[i]);
+        return shadowed < store.logical_infix_count;
+    }
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline typename Diva<diva_type, payload_type>::AdmissionResult
+Diva<diva_type, payload_type>::ObserveFalsePositive(
+        const CollisionContext& context) {
+    if constexpr (diva_type != DivaType::BinaryTrie ||
+                  payload_type != PayloadType::None) {
+        return AdmissionResult::kReadOnly;
+    }
+    if (!context.valid || context.store == nullptr ||
+        context.logical_ordinal == std::numeric_limits<uint32_t>::max()) {
+        return AdmissionResult::kNoCollision;
+    }
+
+    InfixStore& store = *static_cast<InfixStore *>(context.store);
+    rwlock_lock_write(store.rwlock);
+    if (context.logical_ordinal >= store.logical_infix_count ||
+        InfixIsShadowed(store, context.logical_ordinal)) {
+        rwlock_unlock_write(store.rwlock);
+        return AdmissionResult::kNoCollision;
+    }
+
+    uint64_t *const bitmap = GetAdmissionBitmap(store);
+    const bool pending = get_bitmap_bit(bitmap, context.logical_ordinal);
+    if (pending)
+        reset_bitmap_bit(bitmap, context.logical_ordinal);
+    else
+        set_bitmap_bit(bitmap, context.logical_ordinal);
+    rwlock_unlock_write(store.rwlock);
+    return pending ? AdmissionResult::kAdmitted
+                   : AdmissionResult::kDeferred;
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline typename Diva<diva_type, payload_type>::AdmissionResult
+Diva<diva_type, payload_type>::ObserveFalsePositive(
+        std::string_view witness) {
+    return ObserveFalsePositive(
+        reinterpret_cast<const uint8_t *>(witness.data()), witness.size());
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline typename Diva<diva_type, payload_type>::AdmissionResult
+Diva<diva_type, payload_type>::ObserveFalsePositive(
+        const uint8_t *witness, const uint32_t witness_len) {
+    CollisionContext context;
+    if (!PointQueryWithCollisionContext(witness, witness_len, &context))
+        return AdmissionResult::kNoCollision;
+    return ObserveFalsePositive(context);
 }
 
 
@@ -2688,7 +3138,11 @@ template <DivaType diva_type, PayloadType payload_type>
 inline uint64_t Diva<diva_type, payload_type>::SerializeInfixStore(char *out,
                                                                    const Diva<diva_type, payload_type>::InfixStore& store) const {
     uint64_t offset = 0;
-    memcpy(out + offset, &store.status, sizeof(store.status));
+    // Runtime shadow state is deliberately ephemeral. A serialized/rebuilt
+    // filter starts with every key visible.
+    const uint64_t serialized_status =
+        store.status & InfixStore::serialized_status_mask;
+    memcpy(out + offset, &serialized_status, sizeof(serialized_status));
     offset += sizeof(store.status);
 
     if constexpr (payload_type == PayloadType::FixedLength) {
@@ -2896,6 +3350,7 @@ inline uint32_t Diva<diva_type, payload_type>::DeserializeInfixStore(const char 
                                                                      Diva<diva_type, payload_type>::InfixStore& store) const {
     uint32_t offset = 0;
     memcpy(&store.status, deser_buf, sizeof(store.status));
+    store.status &= InfixStore::serialized_status_mask;
     offset += sizeof(store.status);
 
     if constexpr (payload_type == PayloadType::FixedLength) {
@@ -2903,15 +3358,22 @@ inline uint32_t Diva<diva_type, payload_type>::DeserializeInfixStore(const char 
         offset += sizeof(store.num_sample_payloads);
     }
 
-    const uint64_t word_count = store.GetPtrWordCount(scaled_sizes_[store.GetSizeGrade()], infix_size_, payload_size_);
+    const uint64_t serialized_word_count = store.GetPtrWordCount(
+        scaled_sizes_[store.GetSizeGrade()], infix_size_, payload_size_);
+    const uint64_t allocation_word_count = store.GetAllocationWordCount(
+        scaled_sizes_[store.GetSizeGrade()], infix_size_, payload_size_);
     // Each store owns its word array after deserialization. This permits
     // same-capacity adaptation in place and lets a resized store release its
     // previous allocation independently of the serialized filter block.
-    store.ptr = new uint64_t[word_count];
-    memcpy(store.ptr, deser_buf + offset, word_count * sizeof(uint64_t));
-    offset += word_count * sizeof(uint64_t);
+    store.ptr = new uint64_t[allocation_word_count];
+    memcpy(store.ptr, deser_buf + offset,
+           serialized_word_count * sizeof(uint64_t));
+    memset(store.ptr + serialized_word_count, 0,
+           (allocation_word_count - serialized_word_count) * sizeof(uint64_t));
+    offset += serialized_word_count * sizeof(uint64_t);
     if constexpr (payload_type == PayloadType::None) {
-        owned_infix_store_bytes_.fetch_add(word_count * sizeof(uint64_t),
+        owned_infix_store_bytes_.fetch_add(
+            allocation_word_count * sizeof(uint64_t),
                                            std::memory_order_relaxed);
     } else {
 
@@ -2924,6 +3386,7 @@ inline uint32_t Diva<diva_type, payload_type>::DeserializeInfixStore(const char 
         }
     }
 
+    RebuildLogicalOrdinalDirectory(store);
     return offset;
 }
 
@@ -3713,6 +4176,83 @@ Diva<diva_type, payload_type>::AdaptFalsePositiveRange(
 
 
 template <DivaType diva_type, PayloadType payload_type>
+inline typename Diva<diva_type, payload_type>::ShadowResult
+Diva<diva_type, payload_type>::ShadowStoredKey(std::string_view key) {
+    return ShadowStoredKey(reinterpret_cast<const uint8_t *>(key.data()),
+                           static_cast<uint32_t>(key.size()));
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline typename Diva<diva_type, payload_type>::ShadowResult
+Diva<diva_type, payload_type>::ShadowStoredKey(const uint8_t *key,
+                                               const uint32_t key_len) {
+    if constexpr (diva_type != DivaType::BinaryTrie ||
+                  payload_type != PayloadType::None) {
+        return ShadowResult::kReadOnly;
+    }
+    if (key == nullptr || key_len == 0)
+        return ShadowResult::kKeyNotFound;
+
+    const bool it_write_lock = false;
+    const InfiniteByteString query{key, key_len};
+    InfixStore *infix_store_ptr = nullptr;
+    void *leaves_to_unlock[3] = {};
+    InfiniteByteString next_key {};
+    InfiniteByteString prev_key {};
+    wormhole_int_iter it_int;
+    wormhole_iter it;
+    GetLowerUpperBounds(query, it_write_lock, leaves_to_unlock, it, it_int,
+                        prev_key, next_key, infix_store_ptr);
+    if (infix_store_ptr == nullptr) {
+        UnlockLeaves(leaves_to_unlock, it_write_lock);
+        return ShadowResult::kKeyNotFound;
+    }
+
+    rwlock_lock_write(infix_store_ptr->rwlock);
+    UnlockLeaves(leaves_to_unlock, it_write_lock);
+    InfixStore &store = *infix_store_ptr;
+    if (prev_key == query) {
+        const bool already = store.TreeKeyIsShadowed();
+        store.SetTreeKeyShadowed();
+        rwlock_unlock_write(store.rwlock);
+        return already ? ShadowResult::kAlreadyShadowed
+                       : ShadowResult::kShadowed;
+    }
+    if (next_key.str == nullptr) {
+        rwlock_unlock_write(store.rwlock);
+        return ShadowResult::kKeyNotFound;
+    }
+
+    auto [shared, ignore, implicit_size] =
+        GetSharedIgnoreImplicitLengths(prev_key, next_key);
+    const uint32_t key_start_bit = shared + ignore + implicit_size;
+    const uint64_t extraction = ExtractPartialKey(
+        query, shared, ignore, implicit_size, query.GetBit(shared));
+    const uint64_t prev_implicit = ExtractPartialKey(
+        prev_key, shared, ignore, implicit_size, 0) >> infix_size_;
+    const uint64_t next_implicit = ExtractPartialKey(
+        next_key, shared, ignore, implicit_size, 1) >> infix_size_;
+    const uint32_t total_implicit =
+        static_cast<uint32_t>(next_implicit - prev_implicit + 1);
+    const uint64_t query_key =
+        extraction - (prev_implicit << infix_size_);
+    CollisionLocation location;
+    if (!PointQueryInfixStore(store, query_key, total_implicit,
+                              {query.str, 8 * query.length}, key_start_bit,
+                              &location, /*include_shadowed=*/true) ||
+        !location.valid) {
+        rwlock_unlock_write(store.rwlock);
+        return ShadowResult::kKeyNotFound;
+    }
+    const bool already = SetInfixShadowed(store, location.logical_ordinal);
+    rwlock_unlock_write(store.rwlock);
+    return already ? ShadowResult::kAlreadyShadowed
+                   : ShadowResult::kShadowed;
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
 inline typename Diva<diva_type, payload_type>::AdaptResult
 Diva<diva_type, payload_type>::AdaptImpl(
         const uint8_t *input_key, const uint32_t input_key_len,
@@ -3834,7 +4374,7 @@ inline bool Diva<diva_type, payload_type>::TryAdaptFromCollisionContext(
     *result = AdaptInLocatedStore(
         *store, prev_key, next_key, witness, witness_len, new_prefix_len,
         query, query_len, range_l, range_l_len, range_r, range_r_len,
-        /*collision_already_located=*/true);
+        /*collision_already_located=*/true, collision->logical_ordinal);
     return true;
 }
 
@@ -3850,7 +4390,8 @@ Diva<diva_type, payload_type>::AdaptInLocatedStore(
         const uint8_t *query_to_reject, const uint32_t query_to_reject_len,
         const uint8_t *range_l_to_reject, const uint32_t range_l_to_reject_len,
         const uint8_t *range_r_to_reject, const uint32_t range_r_to_reject_len,
-        const bool collision_already_located) {
+        const bool collision_already_located,
+        const uint32_t expected_logical_ordinal) {
     const bool validate_point_rejection = query_to_reject != nullptr;
     const bool validate_range_rejection = range_l_to_reject != nullptr;
     const bool validate_rejection =
@@ -3913,6 +4454,20 @@ Diva<diva_type, payload_type>::AdaptInLocatedStore(
     const uint32_t total_implicit = next_implicit - prev_implicit + 1;
     const uint64_t adaptee = ((extraction | 1ULL) - (prev_implicit << infix_size_));
 
+    if (collision_already_located && validate_point_rejection &&
+        expected_logical_ordinal != std::numeric_limits<uint32_t>::max()) {
+        CollisionLocation current_witness;
+        if (!PointQueryInfixStore(
+                infix_store, adaptee, total_implicit,
+                {key.str, 8 * key.length}, key_start_bit, &current_witness,
+                /*include_shadowed=*/true) ||
+            !current_witness.valid ||
+            current_witness.logical_ordinal != expected_logical_ordinal) {
+            rwlock_unlock_write(infix_store.rwlock);
+            return AdaptResult::kWitnessNotFound;
+        }
+    }
+
     uint64_t query_key = 0;
     if (validate_point_rejection) {
         const uint64_t query_extraction = ExtractPartialKey(
@@ -3952,11 +4507,27 @@ Diva<diva_type, payload_type>::AdaptInLocatedStore(
 
     // Adapt a private candidate so false-positive feedback can verify that
     // this exact witness removes the query before changing the live store.
-    const uint64_t word_count = infix_store.GetPtrWordCount(
+    const uint64_t physical_word_count = infix_store.GetPtrWordCount(
+        scaled_sizes_[infix_store.GetSizeGrade()], infix_size_, payload_size_);
+    const uint64_t word_count = infix_store.GetAllocationWordCount(
         scaled_sizes_[infix_store.GetSizeGrade()], infix_size_, payload_size_);
     InfixStore candidate(infix_store);
     candidate.ptr = new uint64_t[word_count];
-    memcpy(candidate.ptr, infix_store.ptr, word_count * sizeof(uint64_t));
+    memcpy(candidate.ptr, infix_store.ptr,
+           physical_word_count * sizeof(uint64_t));
+    // Logical-ordinal, shadow, and admission metadata are unchanged by
+    // adaptation. Most candidates never need their private copy: validation
+    // does not inspect it when the live store has no infix shadows, and an
+    // in-place publish deliberately preserves the live metadata tail.
+    bool candidate_has_runtime_metadata = false;
+    if constexpr (InfixStore::runtime_metadata_word_count != 0) {
+        if (infix_store.HasInfixShadows()) {
+            memcpy(candidate.ptr + physical_word_count,
+                   infix_store.ptr + physical_word_count,
+                   InfixStore::runtime_metadata_word_count * sizeof(uint64_t));
+            candidate_has_runtime_metadata = true;
+        }
+    }
 
     AdaptResult result = AdaptRawInInfixStore(
         candidate, adaptee, {key.str, 8 * key.length}, key_start_bit,
@@ -3966,6 +4537,18 @@ Diva<diva_type, payload_type>::AdaptInLocatedStore(
         // slot required by the quotient-filter layout. Grow the private
         // candidate and retry there; the published store remains untouched if
         // resizing or the retry cannot complete the adaptation.
+        if constexpr (InfixStore::runtime_metadata_word_count != 0) {
+            // ResizeInfixStore preserves the logical metadata while replacing
+            // the physical allocation, so initialize the candidate's tail
+            // before asking it to do that work.
+            if (!candidate_has_runtime_metadata) {
+                memcpy(candidate.ptr + physical_word_count,
+                       infix_store.ptr + physical_word_count,
+                       InfixStore::runtime_metadata_word_count *
+                           sizeof(uint64_t));
+                candidate_has_runtime_metadata = true;
+            }
+        }
         ResizeInfixStore(candidate, total_implicit);
         result = AdaptRawInInfixStore(
             candidate, adaptee, {key.str, 8 * key.length}, key_start_bit,
@@ -3990,7 +4573,7 @@ Diva<diva_type, payload_type>::AdaptInLocatedStore(
     }
 
     if (result == AdaptResult::kAdapted) {
-        const uint64_t candidate_word_count = candidate.GetPtrWordCount(
+        const uint64_t candidate_word_count = candidate.GetAllocationWordCount(
             scaled_sizes_[candidate.GetSizeGrade()], infix_size_, payload_size_);
         if (candidate_word_count == word_count) {
             // The live store already has sufficient capacity. Publish the
@@ -4000,8 +4583,12 @@ Diva<diva_type, payload_type>::AdaptInLocatedStore(
             if constexpr (payload_type == PayloadType::FixedLength) {
                 infix_store.num_sample_payloads = candidate.num_sample_payloads;
             }
+            // Adaptation changes only the serialized quotient-filter bytes.
+            // Keep the live logical-ordinal, shadow, and admission tail in
+            // place instead of copying it into and back out of every private
+            // candidate.
             memcpy(infix_store.ptr, candidate.ptr,
-                   candidate_word_count * sizeof(uint64_t));
+                   physical_word_count * sizeof(uint64_t));
             delete[] candidate.ptr;
             in_place_adaptation_count_.fetch_add(1,
                                                   std::memory_order_relaxed);
@@ -4029,9 +4616,9 @@ Diva<diva_type, payload_type>::AdaptInLocatedStore(
                 }
             }
         }
-        // Any pending admission token for the previous representation now
-        // carries a stale generation and cannot trigger another adaptation.
-        ++infix_store.mutation_epoch;
+        // Adaptation changes only the physical encoding. Logical ordinals and
+        // their shadow bits remain stable, so admission identities do not need
+        // a representation epoch.
     } else {
         delete[] candidate.ptr;
     }
@@ -5646,8 +6233,9 @@ Diva<diva_type, payload_type>::AdaptRawInInfixStore(InfixStore &store, const uin
                                        infix_size_, infix_store_target_size + scaled_sizes_[size_grade]
                                            + infix_size_ * (runend_pos + 1));
                 const uint32_t key_start_bit = original_key_start_bit + infix_size_ - mask_size;
-                adapt_pos = infix_to_adapt.GetLongestMatch(original_key, key_start_bit, infix_size_) >= 0 ? current_pos
-                          : adapt_pos;
+                const int32_t match = infix_to_adapt.GetLongestMatch(
+                    original_key, key_start_bit, infix_size_);
+                adapt_pos = match >= 0 ? current_pos : adapt_pos;
                 current_pos += infix_to_adapt.GetNumSlots(infix_size_);
                 break;
             }
@@ -6425,6 +7013,25 @@ inline bool Diva<diva_type, payload_type>::RangeQueryInfixStore(InfixStore &stor
                                                                 const InfiniteByteString original_l_key,
                                                                 const InfiniteByteString original_r_key,
                                                                 const uint32_t original_key_start_bit) const {
+    if (!RangeQueryInfixStoreRaw(store, l_key, r_key, total_implicit,
+                                 original_l_key, original_r_key,
+                                 original_key_start_bit)) {
+        return false;
+    }
+    // Shadowing may remove the representation that produced the positive.
+    // Until the range probe reports its exact logical witness, conservatively
+    // retain a positive whenever any visible infix remains in this store. If
+    // every infix is shadowed, the store cannot contribute a visible key.
+    return HasVisibleInfix(store);
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline bool Diva<diva_type, payload_type>::RangeQueryInfixStoreRaw(InfixStore &store, const uint64_t l_key, const uint64_t r_key,
+                                                                const uint32_t total_implicit,
+                                                                const InfiniteByteString original_l_key,
+                                                                const InfiniteByteString original_r_key,
+                                                                const uint32_t original_key_start_bit) const {
     const uint32_t store_size = scaled_sizes_[store.GetSizeGrade()];
     const uint64_t l_implicit_part = l_key >> infix_size_;
     const uint64_t l_explicit_part = l_key & BITMASK(infix_size_);
@@ -6456,7 +7063,7 @@ inline bool Diva<diva_type, payload_type>::RangeQueryInfixStore(InfixStore &stor
                                     infix_size_))
                             return true;
                     }
-                    else 
+                    else
                         return true;
                 }
             }
@@ -6563,7 +7170,8 @@ inline bool Diva<diva_type, payload_type>::RangeQueryInfixStore(InfixStore &stor
                 }
                 i += infix.GetNumSlots(infix_size_) - 1;
             }
-            else if (current_slot_r >= l_explicit_part && current_slot_l <= r_explicit_part - 1)
+            else if (current_slot_r >= l_explicit_part &&
+                     current_slot_l <= r_explicit_part - 1)
                 return true;
         }
         else {
@@ -6582,7 +7190,8 @@ inline bool Diva<diva_type, payload_type>::PointQueryInfixStore(InfixStore &stor
                                                                 const uint32_t total_implicit,
                                                                 const InfiniteByteString original_key,
                                                                 const uint32_t original_key_start_bit,
-                                                                CollisionLocation *location) const {
+                                                                CollisionLocation *location,
+                                                                const bool include_shadowed) const {
     const uint64_t implicit_part = key >> infix_size_;
     const uint64_t explicit_part = key & BITMASK(infix_size_);
     const uint32_t size_grade = store.GetSizeGrade();
@@ -6608,15 +7217,36 @@ inline bool Diva<diva_type, payload_type>::PointQueryInfixStore(InfixStore &stor
                     const uint32_t key_start_bit = original_key_start_bit + infix_size_ - mask_size;
                     if (infix_to_query.QueryTrie(original_key, original_key,
                                                  key_start_bit, infix_size_)) {
+                        // Preserve the old Diva membership-query fast path.
+                        // The comparison mode never creates shadows or asks
+                        // for collision context, so it should not pay to
+                        // reconstruct a logical ordinal. DivaFilterPlus asks
+                        // for context on its adaptable point-Get path and uses
+                        // that exact ordinal for shadowing and admission.
+                        if (location == nullptr && !store.HasInfixShadows())
+                            return true;
+                        uint32_t local_ordinal = 0;
+                        const int32_t match = infix_to_query.GetLongestMatch(
+                            original_key, key_start_bit, infix_size_,
+                            &local_ordinal);
+                        // QueryTrie is the authoritative conservative
+                        // membership check. If its witness cannot be mapped to
+                        // a logical trie entry, keep the positive answer rather
+                        // than risking a false negative.
+                        if (match < 0)
+                            return true;
+                        const uint32_t logical_ordinal = GetLogicalOrdinal(
+                            store, static_cast<uint32_t>(implicit_part),
+                            static_cast<uint32_t>(i), local_ordinal);
+                        if (!include_shadowed &&
+                            InfixIsShadowed(store, logical_ordinal)) {
+                            i += infix_to_query.GetNumSlots(infix_size_) - 1;
+                            continue;
+                        }
                         if (location != nullptr) {
-                            uint32_t local_ordinal = 0;
-                            const int32_t match = infix_to_query.GetLongestMatch(
-                                original_key, key_start_bit, infix_size_,
-                                &local_ordinal);
-                            if (match < 0)
-                                return true;
                             location->group_slot = static_cast<uint32_t>(i);
                             location->local_ordinal = local_ordinal;
+                            location->logical_ordinal = logical_ordinal;
                             location->valid = true;
                         }
                         return true;
@@ -6625,9 +7255,20 @@ inline bool Diva<diva_type, payload_type>::PointQueryInfixStore(InfixStore &stor
                 i += infix_to_query.GetNumSlots(infix_size_) - 1;
             }
             else if ((explicit_part | mask) == (slot_value | mask)) {
+                // As above, a shadow-free store does not need the stable
+                // logical identity of the matching representation.
+                if (location == nullptr && !store.HasInfixShadows())
+                    return true;
+                const uint32_t logical_ordinal = GetLogicalOrdinal(
+                    store, static_cast<uint32_t>(implicit_part),
+                    static_cast<uint32_t>(i), 0);
+                if (!include_shadowed &&
+                    InfixIsShadowed(store, logical_ordinal))
+                    continue;
                 if (location != nullptr) {
                     location->group_slot = static_cast<uint32_t>(i);
                     location->local_ordinal = 0;
+                    location->logical_ordinal = logical_ordinal;
                     location->valid = true;
                 }
                 return true;
@@ -6681,6 +7322,24 @@ inline void Diva<diva_type, payload_type>::ResizeInfixStore(InfixStore &store, c
     }
     std::vector<Infix> infix_vec;
 
+    uint64_t saved_shadow_bitmap[
+        InfixStore::shadow_bitmap_word_count == 0
+            ? 1
+            : InfixStore::shadow_bitmap_word_count] = {};
+    uint64_t saved_admission_bitmap[
+        InfixStore::admission_bitmap_word_count == 0
+            ? 1
+            : InfixStore::admission_bitmap_word_count] = {};
+    const bool tree_key_shadowed = store.TreeKeyIsShadowed();
+    const bool has_infix_shadows = store.HasInfixShadows();
+    if constexpr (diva_type == DivaType::BinaryTrie &&
+                  payload_type == PayloadType::None) {
+        memcpy(saved_shadow_bitmap, GetInfixShadowBitmap(store),
+               sizeof(uint64_t) * InfixStore::shadow_bitmap_word_count);
+        memcpy(saved_admission_bitmap, GetAdmissionBitmap(store),
+               sizeof(uint64_t) * InfixStore::admission_bitmap_word_count);
+    }
+
     if constexpr (diva_type == DivaType::BinaryTrie)
         infix_vec = GetInfixVector(store, payload_list);
     else {
@@ -6708,7 +7367,7 @@ inline void Diva<diva_type, payload_type>::ResizeInfixStore(InfixStore &store, c
 
     store.SetSizeGrade(size_grade);
     const uint32_t next_size = scaled_sizes_[size_grade];
-    const uint64_t word_count = InfixStore::GetPtrWordCount(next_size,
+    const uint64_t word_count = InfixStore::GetAllocationWordCount(next_size,
             infix_size_, payload_size_);
     store.ptr = new uint64_t[word_count];
     if constexpr (diva_type == DivaType::BinaryTrie)
@@ -6717,6 +7376,18 @@ inline void Diva<diva_type, payload_type>::ResizeInfixStore(InfixStore &store, c
         LoadListToInfixStore(store, infix_list, full_slot_count, total_implicit, true, payload_list);
     if constexpr (payload_type == PayloadType::FixedLength)
         store.ptr[1] = reinterpret_cast<uint64_t>(sample_payload_list);
+    if (tree_key_shadowed)
+        store.SetTreeKeyShadowed();
+    if constexpr (diva_type == DivaType::BinaryTrie &&
+                  payload_type == PayloadType::None) {
+        if (has_infix_shadows) {
+            memcpy(GetInfixShadowBitmap(store), saved_shadow_bitmap,
+                   sizeof(uint64_t) * InfixStore::shadow_bitmap_word_count);
+            store.SetHasInfixShadows();
+        }
+        memcpy(GetAdmissionBitmap(store), saved_admission_bitmap,
+               sizeof(uint64_t) * InfixStore::admission_bitmap_word_count);
+    }
 
     if (should_allocate_on_heap) {
         if constexpr (diva_type == DivaType::Standard)
@@ -6765,8 +7436,10 @@ inline void Diva<diva_type, payload_type>::LoadListToInfixStore(InfixStore &stor
     if (zero_out)
         store.Reset(total_size, infix_size_, payload_size_);
     store.SetFullSlotCount(list_len);
-    if (list_len == 0)
+    if (list_len == 0) {
+        RebuildLogicalOrdinalDirectory(store);
         return;
+    }
 
     int32_t l[infix_store_target_size + 1], r[infix_store_target_size + 1], ind = 0;
     // Make sure everything is in increasing order
@@ -6832,6 +7505,7 @@ inline void Diva<diva_type, payload_type>::LoadListToInfixStore(InfixStore &stor
             popcnts[1] += __builtin_popcountll(runends[i] & mask);
         }
     }
+    RebuildLogicalOrdinalDirectory(store);
 
 #ifdef DEBUG
     {
@@ -6864,8 +7538,10 @@ inline void Diva<diva_type, payload_type>::LoadVectorToInfixStore(InfixStore &st
     const uint64_t implicit_scalar = implicit_scalars_[total_implicit - infix_store_target_size / 2];
     if (zero_out)
         store.Reset(total_size, infix_size_, payload_size_);
-    if (vec.empty())
+    if (vec.empty()) {
+        RebuildLogicalOrdinalDirectory(store);
         return;
+    }
 
     // Make sure everything is in increasing order
 #ifdef DEBUG
@@ -6929,6 +7605,7 @@ inline void Diva<diva_type, payload_type>::LoadVectorToInfixStore(InfixStore &st
         set_bitmap_bit(runends, r[i] - 1);
     }
     UpdatePopcnts(store);
+    RebuildLogicalOrdinalDirectory(store);
 
 #ifdef DEBUG
     {
@@ -7445,15 +8122,17 @@ IteratorRefetchLowerUpperBounds:
             rwlock_unlock_read(infix_store.rwlock);
             return;
         }
-        if constexpr (payload_type == PayloadType::FixedLength) {
-            for (uint32_t i = 0; i < infix_store.num_sample_payloads; i++) {
-                append_prev_key_entry();
-                payloads_.resize((filter_->payload_size_ * infixes_.size() + 63) / 64 + 1);
-                filter_->GetSamplePayload(infix_store, i, payloads_.data(), filter_->payload_size_ * (infixes_.size() - 1));
+        if (!TreeKeyIsShadowed(&infix_store)) {
+            if constexpr (payload_type == PayloadType::FixedLength) {
+                for (uint32_t i = 0; i < infix_store.num_sample_payloads; i++) {
+                    append_prev_key_entry();
+                    payloads_.resize((filter_->payload_size_ * infixes_.size() + 63) / 64 + 1);
+                    filter_->GetSamplePayload(infix_store, i, payloads_.data(), filter_->payload_size_ * (infixes_.size() - 1));
+                }
             }
-        }
-        else {
-            append_prev_key_entry();
+            else {
+                append_prev_key_entry();
+            }
         }
     }
 
@@ -7514,7 +8193,11 @@ IteratorRefetchLowerUpperBounds:
         }
     };
 
-    auto append_reconstructed_entry = [&](std::string key, uint32_t bit_count, int32_t pos) {
+    auto append_reconstructed_entry = [&](std::string key, uint32_t bit_count,
+                                          int32_t pos,
+                                          uint32_t logical_ordinal) {
+        if (filter_->InfixIsShadowed(infix_store, logical_ordinal))
+            return;
         infixes_.push_back(0);
         bit_counts_.push_back(bit_count);
         reconstructed_keys_.push_back(std::move(key));
@@ -7647,18 +8330,44 @@ IteratorRefetchLowerUpperBounds:
                             auto [trie_keys, trie_key_contents] = infix.GetStrings(filter_->infix_size_);
                             const uint64_t extraction =
                                 (recovered_implicit << filter_->infix_size_) | slot_value;
-                            std::vector<std::pair<std::string, uint32_t>> expanded_keys;
+                            struct ExpandedKey {
+                                std::string key;
+                                uint32_t bit_count;
+                                uint32_t logical_ordinal;
+                            };
+                            std::vector<ExpandedKey> expanded_keys;
                             expanded_keys.reserve(trie_keys.size());
-                            for (const InfiniteByteString& trie_key : trie_keys) {
+                            for (uint32_t local_ordinal = 0;
+                                 local_ordinal < trie_keys.size();
+                                 ++local_ordinal) {
+                                const InfiniteByteString &trie_key =
+                                    trie_keys[local_ordinal];
                                 const uint32_t bit_count =
                                     shared + ignore + implicit_size + explicit_part_length + trie_key.length;
-                                expanded_keys.emplace_back(
-                                    reconstruct_binary_trie_key(extraction, explicit_part_length, trie_key),
-                                    bit_count);
+                                expanded_keys.push_back({
+                                    reconstruct_binary_trie_key(
+                                        extraction, explicit_part_length,
+                                        trie_key),
+                                    bit_count,
+                                    filter_->GetLogicalOrdinal(
+                                        infix_store,
+                                        static_cast<uint32_t>(
+                                            current_implicit_part),
+                                        static_cast<uint32_t>(pos),
+                                        local_ordinal)});
                             }
-                            std::sort(expanded_keys.begin(), expanded_keys.end(), reconstructed_key_less);
-                            for (auto& [key, bit_count] : expanded_keys) {
-                                append_reconstructed_entry(std::move(key), bit_count, pos);
+                            std::sort(expanded_keys.begin(), expanded_keys.end(),
+                                      [&](const ExpandedKey &lhs,
+                                          const ExpandedKey &rhs) {
+                                          return reconstructed_key_less(
+                                              {lhs.key, lhs.bit_count},
+                                              {rhs.key, rhs.bit_count});
+                                      });
+                            for (auto& expanded : expanded_keys) {
+                                append_reconstructed_entry(
+                                    std::move(expanded.key),
+                                    expanded.bit_count, pos,
+                                    expanded.logical_ordinal);
                             }
                         }
                         pos += infix.GetNumSlots(filter_->infix_size_) - 1;
@@ -7670,7 +8379,11 @@ IteratorRefetchLowerUpperBounds:
                     append_reconstructed_entry(
                         reconstruct_binary_trie_key(extraction, explicit_part_length, InfiniteByteString(nullptr, 0)),
                         shared + ignore + implicit_size + explicit_part_length,
-                        pos);
+                        pos,
+                        filter_->GetLogicalOrdinal(
+                            infix_store,
+                            static_cast<uint32_t>(current_implicit_part),
+                            static_cast<uint32_t>(pos), 0));
                 }
             }
             else {
@@ -9194,17 +9907,19 @@ GetLongestMatchAfterLoop:
     GetSuffixString(suffix_bit_pos, slot_size,
                     suffix_contents, 0,
                     actual_suffix_len_backup);
+    const uint32_t suffix_start_depth = depth;
     for (uint32_t i = 0; i < suffix_len; i += 56) {
         const uint32_t bits_to_compare = std::min(56U, suffix_len - i);
-        const uint64_t read_key = key.BitsAtBitLength(key_start_bit + depth + i,
+        const uint64_t read_key = key.BitsAtBitLength(
+                                                      key_start_bit +
+                                                          suffix_start_depth + i,
                                                       bits_to_compare);
         const uint64_t read_suffix = suffix.BitsAtBitLength(i, bits_to_compare);
         const uint64_t diff = read_key ^ read_suffix;
         if (diff)
             return res;
-        depth += bits_to_compare;
     }
-    res = depth;
+    res = suffix_start_depth + suffix_len;
     if (local_ordinal != nullptr) {
         // The current leaf has not yet been advanced, so both counters cover
         // exactly the logical entries preceding it.

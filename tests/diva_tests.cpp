@@ -4514,34 +4514,73 @@ public:
         REQUIRE(s.PointQuery(query));
         REQUIRE(s.PointQuery(witness));
 
-        SUBCASE("return a stable opaque token for one collision generation") {
-            BinaryTrieDiva::CollisionToken first = 0;
-            BinaryTrieDiva::CollisionToken second = 0;
-            CHECK(s.GetCollisionToken(query, &first) ==
-                  BinaryTrieDiva::CollisionTokenResult::kFound);
-            CHECK(s.GetCollisionToken(query, &second) ==
-                  BinaryTrieDiva::CollisionTokenResult::kFound);
-            CHECK(first != 0);
-            CHECK(first == second);
+        SUBCASE("exact bitmap admits the second collision") {
+            BinaryTrieDiva::CollisionContext context;
+            REQUIRE(s.PointQueryWithCollisionContext(query, &context));
+            REQUIRE(context.valid);
+            CHECK(s.ObserveFalsePositive(context) ==
+                  BinaryTrieDiva::AdmissionResult::kDeferred);
+            CHECK(s.ObserveFalsePositive(context) ==
+                  BinaryTrieDiva::AdmissionResult::kAdmitted);
+            CHECK(s.ObserveFalsePositive(context) ==
+                  BinaryTrieDiva::AdmissionResult::kDeferred);
+        }
 
-            BinaryTrieDiva::CollisionToken from_initial_probe = 0;
-            CHECK(s.PointQueryWithCollisionToken(
-                query, &from_initial_probe));
-            CHECK(from_initial_probe == first);
+        SUBCASE("concurrent observations consume exactly one second hit") {
+            BinaryTrieDiva::CollisionContext context;
+            REQUIRE(s.PointQueryWithCollisionContext(query, &context));
+            REQUIRE(context.valid);
+            std::atomic<uint32_t> deferred{0};
+            std::atomic<uint32_t> admitted{0};
+            auto observe = [&]() {
+                const auto result = s.ObserveFalsePositive(context);
+                if (result == BinaryTrieDiva::AdmissionResult::kDeferred)
+                    deferred.fetch_add(1, std::memory_order_relaxed);
+                if (result == BinaryTrieDiva::AdmissionResult::kAdmitted)
+                    admitted.fetch_add(1, std::memory_order_relaxed);
+            };
+            std::thread first(observe);
+            std::thread second(observe);
+            first.join();
+            second.join();
+            CHECK(deferred.load(std::memory_order_relaxed) == 1);
+            CHECK(admitted.load(std::memory_order_relaxed) == 1);
+        }
+
+        SUBCASE("admission learning is reset by serialization and rebuild") {
+            BinaryTrieDiva::CollisionContext context;
+            REQUIRE(s.PointQueryWithCollisionContext(query, &context));
+            REQUIRE(s.ObserveFalsePositive(context) ==
+                    BinaryTrieDiva::AdmissionResult::kDeferred);
+
+            std::vector<char> serialized(s.Size());
+            REQUIRE(s.Serialize(serialized.data()) == serialized.size());
+            BinaryTrieDiva rebuilt(serialized.data());
+            BinaryTrieDiva::CollisionContext rebuilt_context;
+            REQUIRE(rebuilt.PointQueryWithCollisionContext(query,
+                                                            &rebuilt_context));
+            CHECK(rebuilt.ObserveFalsePositive(rebuilt_context) ==
+                  BinaryTrieDiva::AdmissionResult::kDeferred);
+        }
+
+        SUBCASE("shadowing discards pending adaptation for that infix") {
+            BinaryTrieDiva::CollisionContext context;
+            REQUIRE(s.PointQueryWithCollisionContext(query, &context));
+            REQUIRE(s.ObserveFalsePositive(context) ==
+                    BinaryTrieDiva::AdmissionResult::kDeferred);
+            REQUIRE(s.ShadowStoredKey(witness) ==
+                    BinaryTrieDiva::ShadowResult::kShadowed);
+            CHECK(s.ObserveFalsePositive(context) ==
+                  BinaryTrieDiva::AdmissionResult::kNoCollision);
         }
 
         SUBCASE("capture a reusable collision location from the original probe") {
             BinaryTrieDiva::CollisionContext context;
             CHECK(s.PointQueryWithCollisionContext(query, &context));
             CHECK(context.valid);
-            CHECK(context.admission_token != 0);
             CHECK(context.store != nullptr);
             CHECK(context.prev_key != nullptr);
             CHECK(context.next_key != nullptr);
-
-            BinaryTrieDiva::CollisionToken token = 0;
-            CHECK(s.PointQueryWithCollisionToken(query, &token));
-            CHECK(token == context.admission_token);
 
             CHECK(s.AdaptFalsePositive(query, witness, &context) ==
                   BinaryTrieDiva::AdaptResult::kAdapted);
@@ -4552,12 +4591,12 @@ public:
                   BinaryTrieDiva::AdaptResult::kAlreadySufficient);
         }
 
-        SUBCASE("a collision context with a mismatched recorded epoch still adapts in the captured store") {
+        SUBCASE("a copied logical collision context still adapts in the captured store") {
             BinaryTrieDiva::CollisionContext context;
             REQUIRE(s.PointQueryWithCollisionContext(query, &context));
             REQUIRE(context.valid);
-            ++context.mutation_epoch;
-            CHECK(s.AdaptFalsePositive(query, witness, &context) ==
+            const BinaryTrieDiva::CollisionContext copied = context;
+            CHECK(s.AdaptFalsePositive(query, witness, &copied) ==
                   BinaryTrieDiva::AdaptResult::kAdapted);
             CHECK_FALSE(s.PointQuery(query));
             for (const std::string& key : keys)
@@ -4611,45 +4650,69 @@ public:
         SUBCASE("different queries identify the same stored representation") {
             const std::string same_collision_query("\x01\x3f", 2);  // 319.
             REQUIRE(s.PointQuery(same_collision_query));
-            BinaryTrieDiva::CollisionToken first = 0;
-            BinaryTrieDiva::CollisionToken second = 0;
-            CHECK(s.GetCollisionToken(query, &first) ==
-                  BinaryTrieDiva::CollisionTokenResult::kFound);
-            CHECK(s.GetCollisionToken(same_collision_query, &second) ==
-                  BinaryTrieDiva::CollisionTokenResult::kFound);
-            CHECK(first == second);
+            BinaryTrieDiva::CollisionContext first;
+            BinaryTrieDiva::CollisionContext second;
+            CHECK(s.PointQueryWithCollisionContext(query, &first));
+            CHECK(s.PointQueryWithCollisionContext(same_collision_query,
+                                                   &second));
+            CHECK(first.store == second.store);
+            CHECK(first.logical_ordinal == second.logical_ordinal);
+            CHECK(s.ObserveFalsePositive(first) ==
+                  BinaryTrieDiva::AdmissionResult::kDeferred);
+            CHECK(s.ObserveFalsePositive(second) ==
+                  BinaryTrieDiva::AdmissionResult::kAdmitted);
         }
 
-        SUBCASE("a new store generation has a different token") {
-            typename BinaryTrieDiva::InfiniteByteString witness_key{
-                reinterpret_cast<const uint8_t *>(witness.data()),
-                static_cast<uint32_t>(witness.size())};
-            typename BinaryTrieDiva::InfiniteByteString prev_key, next_key;
-            typename BinaryTrieDiva::InfixStore *store = nullptr;
-            void *leaves_to_unlock[3] = {};
-            wormhole_iter it;
-            wormhole_int_iter it_int;
-            s.GetLowerUpperBounds(witness_key, false, leaves_to_unlock, it,
-                                  it_int, prev_key, next_key, store);
-            s.UnlockLeaves(leaves_to_unlock, false);
-            REQUIRE(store != nullptr);
+        SUBCASE("different logical representations have independent bits") {
+            BinaryTrieDiva::CollisionContext first;
+            REQUIRE(s.PointQueryWithCollisionContext(query, &first));
+            BinaryTrieDiva::CollisionContext other;
+            bool found_other = false;
+            for (uint32_t value = 257; value < 65535 && !found_other; ++value) {
+                std::string candidate(2, '\0');
+                candidate[0] = static_cast<char>(value >> 8);
+                candidate[1] = static_cast<char>(value);
+                if (std::binary_search(keys.begin(), keys.end(), candidate))
+                    continue;
+                BinaryTrieDiva::CollisionContext candidate_context;
+                if (!s.PointQueryWithCollisionContext(candidate,
+                                                       &candidate_context) ||
+                    !candidate_context.valid) {
+                    continue;
+                }
+                if (candidate_context.store != first.store ||
+                    candidate_context.logical_ordinal !=
+                        first.logical_ordinal) {
+                    other = candidate_context;
+                    found_other = true;
+                }
+            }
+            REQUIRE(found_other);
+            CHECK(s.ObserveFalsePositive(first) ==
+                  BinaryTrieDiva::AdmissionResult::kDeferred);
+            CHECK(s.ObserveFalsePositive(other) ==
+                  BinaryTrieDiva::AdmissionResult::kDeferred);
+            CHECK(s.ObserveFalsePositive(first) ==
+                  BinaryTrieDiva::AdmissionResult::kAdmitted);
+        }
 
-            typename BinaryTrieDiva::CollisionLocation old_generation;
-            old_generation.store = store;
-            old_generation.group_slot = 7;
-            old_generation.local_ordinal = 11;
-            old_generation.mutation_epoch = store->mutation_epoch;
-            old_generation.valid = true;
-            BinaryTrieDiva::CollisionToken old_token = 0;
-            CHECK(s.BuildCollisionToken(old_generation, &old_token) ==
-                  BinaryTrieDiva::CollisionTokenResult::kFound);
-
-            auto new_generation = old_generation;
-            ++new_generation.mutation_epoch;
-            BinaryTrieDiva::CollisionToken new_token = 0;
-            CHECK(s.BuildCollisionToken(new_generation, &new_token) ==
-                  BinaryTrieDiva::CollisionTokenResult::kFound);
-            CHECK(old_token != new_token);
+        SUBCASE("pending admission survives physical adaptation") {
+            BinaryTrieDiva::CollisionContext context;
+            REQUIRE(s.PointQueryWithCollisionContext(query, &context));
+            REQUIRE(context.valid);
+            REQUIRE(s.ObserveFalsePositive(context) ==
+                    BinaryTrieDiva::AdmissionResult::kDeferred);
+            bool adapted = false;
+            for (const std::string& key : keys) {
+                if (s.Adapt(key, 8 * key.size()) ==
+                        BinaryTrieDiva::AdaptResult::kAdapted) {
+                    adapted = true;
+                    break;
+                }
+            }
+            REQUIRE(adapted);
+            CHECK(s.ObserveFalsePositive(context) ==
+                  BinaryTrieDiva::AdmissionResult::kAdmitted);
         }
 
         SUBCASE("eliminate a confirmed false positive") {
@@ -4698,7 +4761,11 @@ public:
             CHECK(context.store != nullptr);
             CHECK(context.prev_key != nullptr);
             CHECK(context.next_key != nullptr);
-            CHECK(context.admission_token != 0);
+            // The range walk identifies the store but not one exact matching
+            // leaf. Admission later uses the decoded strict successor instead
+            // of fabricating ordinal zero here.
+            CHECK(context.logical_ordinal ==
+                  std::numeric_limits<uint32_t>::max());
 
             CHECK(s.AdaptFalsePositiveRange(range_l, range_r, witness,
                                             &context) ==
@@ -4711,16 +4778,16 @@ public:
                   BinaryTrieDiva::AdaptResult::kAlreadySufficient);
         }
 
-        SUBCASE("a range collision context with a mismatched recorded epoch still adapts in the captured store") {
+        SUBCASE("a copied range collision context still adapts in the captured store") {
             const std::string range_l("\x01\x3b", 2);
             const std::string range_r("\x01\x3c", 2);
             BinaryTrieDiva::CollisionContext context;
             REQUIRE(s.RangeQueryWithCollisionContext(range_l, range_r,
                                                      &context));
             REQUIRE(context.valid);
-            ++context.mutation_epoch;
+            const BinaryTrieDiva::CollisionContext copied = context;
             CHECK(s.AdaptFalsePositiveRange(range_l, range_r, witness,
-                                            &context) ==
+                                            &copied) ==
                   BinaryTrieDiva::AdaptResult::kAdapted);
             CHECK_FALSE(s.RangeQuery(range_l, range_r));
             for (const std::string& key : keys)
@@ -5006,6 +5073,97 @@ public:
                 CHECK(deserialized.PointQuery(key));
             CHECK(serialized == original_bytes);
         }
+    }
+
+
+    static void BinaryTrieLogicalShadowing() {
+        const uint32_t infix_size = 5;
+        const uint32_t seed = 1;
+        const float load_factor = 0.95;
+        const uint32_t n_keys = 2600;
+        std::mt19937_64 rng(2);
+        std::string alphabet;
+        for (char c = 'A'; c <= 'Z'; c++)
+            alphabet += c;
+        for (char c = 'a'; c <= 'z'; c++)
+            alphabet += c;
+        for (char c = '0'; c <= '9'; c++)
+            alphabet += c;
+
+        std::vector<std::string> keys;
+        keys.reserve(n_keys);
+        for (uint32_t i = 0; i < n_keys; ++i) {
+            std::string key;
+            const uint32_t key_length = 6 + rng() % 3;
+            key.reserve(key_length);
+            for (uint32_t j = 0; j < key_length; ++j)
+                key += alphabet[rng() % alphabet.size()];
+            keys.push_back(std::move(key));
+        }
+        std::sort(keys.begin(), keys.end());
+        REQUIRE(std::adjacent_find(keys.begin(), keys.end()) == keys.end());
+
+        BinaryTrieDiva s(infix_size, keys.begin(), keys.end(), seed,
+                         load_factor);
+        REQUIRE(keys.size() >= 3);
+        // This test must exercise logical keys expanded from real multi-slot
+        // BinaryTrie groups, not only ordinary one-slot infixes. Shadowing all
+        // source keys below then proves that continuation slots are never
+        // mistaken for independent logical keys.
+        REQUIRE(CountBinaryTrieSlots(s) > 0);
+        for (const std::string& key : keys)
+            REQUIRE(s.PointQuery(key));
+
+        const std::string& shadow = keys[keys.size() / 2];
+        const std::string& neighbor = keys[keys.size() / 2 + 1];
+        CHECK(s.ShadowStoredKey(shadow) ==
+              BinaryTrieDiva::ShadowResult::kShadowed);
+        CHECK(s.ShadowStoredKey(shadow) ==
+              BinaryTrieDiva::ShadowResult::kAlreadyShadowed);
+        CHECK_FALSE(s.PointQuery(shadow));
+        CHECK(s.PointQuery(neighbor));
+        CHECK_FALSE(s.RangeQuery(shadow, shadow));
+        CHECK(s.RangeQuery(neighbor, neighbor));
+
+        // Logical ordinals, unlike physical slots, must survive adaptation.
+        // Force some other infix to grow after `shadow` has been marked and
+        // verify that the existing bit still names the same sorted key. This
+        // also covers the resize path when the streamed store has no room.
+        bool adapted_an_infix = false;
+        for (const std::string& key : keys) {
+            if (key == shadow)
+                continue;
+            if (s.Adapt(key, 8 * key.size()) ==
+                    BinaryTrieDiva::AdaptResult::kAdapted) {
+                adapted_an_infix = true;
+                break;
+            }
+        }
+        REQUIRE(adapted_an_infix);
+        CHECK_FALSE(s.PointQuery(shadow));
+        CHECK(s.PointQuery(neighbor));
+
+        for (const std::string& key : keys) {
+            if (key == shadow)
+                continue;
+            CHECK(s.ShadowStoredKey(key) ==
+                  BinaryTrieDiva::ShadowResult::kShadowed);
+            CHECK_FALSE(s.PointQuery(key));
+        }
+        CHECK_FALSE(s.RangeQuery(keys.front(), keys.back()));
+        CHECK_FALSE(s.RangeQuery(
+            reinterpret_cast<const uint8_t *>(keys.front().data()),
+            static_cast<uint32_t>(keys.front().size()), nullptr, 0));
+        CHECK(s.GetNumKeys() == keys.size());
+
+        // Shadows are runtime learning, not SST state. Serialization masks the
+        // runtime status bits and excludes the appended bitmap, so a rebuilt
+        // filter starts clean just as a compaction output should.
+        std::vector<char> serialized(s.Size());
+        REQUIRE(s.Serialize(serialized.data()) == serialized.size());
+        BinaryTrieDiva rebuilt(serialized.data());
+        for (const std::string& key : keys)
+            CHECK(rebuilt.PointQuery(key));
     }
 
 
@@ -5525,6 +5683,10 @@ TEST_SUITE("binary trie") {
 
     TEST_CASE("false positive adaptation") {
         DivaTests::BinaryTrieFalsePositiveAdaptation();
+    }
+
+    TEST_CASE("logical shadowing") {
+        DivaTests::BinaryTrieLogicalShadowing();
     }
 }
 

@@ -1528,6 +1528,27 @@ public:
                 }
             }
         }
+
+        SUBCASE("full suffix longer than one comparison word") {
+            const uint32_t long_key_start_bit = 0;
+            const uint32_t long_slot_size = 9;
+            uint8_t key_contents[16] = {
+                0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
+                0x0f, 0xed, 0xcb, 0xa9, 0x87, 0x65, 0x43, 0x21};
+            Diva<>::InfiniteByteString key{key_contents,
+                                           8 * sizeof(key_contents)};
+            Diva<>::Infix infix(1);
+            infix.BuildTrieAndSuffixes(&key, 1, long_key_start_bit,
+                                       long_slot_size,
+                                       /*force_prefix_keys=*/false,
+                                       /*store_full_keys=*/true);
+
+            uint32_t local_ordinal = std::numeric_limits<uint32_t>::max();
+            CHECK_EQ(infix.GetLongestMatch(key, long_key_start_bit,
+                                           long_slot_size, &local_ordinal),
+                     static_cast<int32_t>(8 * sizeof(key_contents)));
+            CHECK_EQ(local_ordinal, 0);
+        }
     }
 
 
