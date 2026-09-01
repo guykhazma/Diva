@@ -482,12 +482,19 @@ private:
             BITMASK(full_slot_count_bit_count + size_grade_bit_count);
         static constexpr uint32_t ordinal_directory_entry_count =
             infix_store_target_size / 64;
-        // The directory and shadow bitmap are an allocation tail, not part of
-        // the serialized quotient-filter bytes. Directory entry i is the
-        // number of logical infix keys in quotients [0, 64*i).
+        // The directory and shadow bitmap share an allocation tail. The
+        // immutable directory is serialized separately after the physical
+        // quotient-filter bytes; runtime shadow/admission state is not.
+        // Directory entry i counts logical keys in quotients [0, 64*i).
         static constexpr uint32_t ordinal_directory_word_count =
             (ordinal_directory_entry_count * sizeof(uint16_t) +
              sizeof(uint64_t) - 1) / sizeof(uint64_t);
+        static constexpr uint32_t serialized_logical_metadata_byte_count =
+            diva_type == DivaType::BinaryTrie &&
+                    payload_type == PayloadType::None
+                ? sizeof(uint16_t) +
+                      ordinal_directory_entry_count * sizeof(uint16_t)
+                : 0;
         static constexpr uint32_t shadow_bitmap_word_count =
             infix_store_target_size / 64;
         // Exact second-hit admission state. One bit is reserved for each of
@@ -612,6 +619,11 @@ private:
         const uint8_t *next_key = nullptr;
         uint32_t next_key_len = 0;
         bool valid = false;
+    };
+
+    struct LogicalGroupInfo {
+        uint32_t logical_key_count = 0;
+        uint32_t physical_slot_count = 0;
     };
 
     class Infix {
@@ -945,7 +957,7 @@ private:
     void FillCollisionContext(const CollisionLocation &location,
                               CollisionContext *context) const;
     // The caller holds the store read or write lock. Runtime status bits and
-    // allocation-tail metadata are intentionally not serialized.
+    // mutable shadow/admission tail metadata are intentionally not serialized.
     static bool TreeKeyIsShadowed(const InfixStore *store) {
         return store != nullptr && store->TreeKeyIsShadowed();
     }
@@ -955,8 +967,9 @@ private:
     const uint64_t *GetInfixShadowBitmap(const InfixStore &store) const;
     uint64_t *GetAdmissionBitmap(InfixStore &store) const;
     const uint64_t *GetAdmissionBitmap(const InfixStore &store) const;
-    uint32_t GetLogicalGroupCount(const InfixStore &store, uint32_t group_slot,
-                                  uint32_t runend_pos) const;
+    LogicalGroupInfo ReadLogicalGroupInfo(const InfixStore &store,
+                                          uint32_t group_slot,
+                                          uint32_t runend_pos) const;
     void RebuildLogicalOrdinalDirectory(InfixStore &store) const;
     uint32_t GetLogicalOrdinal(const InfixStore &store, uint32_t implicit_part,
                                uint32_t group_slot,
@@ -2054,12 +2067,13 @@ inline const uint64_t *Diva<diva_type, payload_type>::GetAdmissionBitmap(
 
 
 template <DivaType diva_type, PayloadType payload_type>
-inline uint32_t Diva<diva_type, payload_type>::GetLogicalGroupCount(
+inline typename Diva<diva_type, payload_type>::LogicalGroupInfo
+Diva<diva_type, payload_type>::ReadLogicalGroupInfo(
         const InfixStore &store, const uint32_t group_slot,
         const uint32_t runend_pos) const {
     static_assert(diva_type == DivaType::BinaryTrie);
     if (!SlotHasTrie(store, group_slot, runend_pos))
-        return 1;
+        return {1, 1};
     const Infix infix(
         store.ptr + num_metadata_offset_words,
         infix_store_target_size + scaled_sizes_[store.GetSizeGrade()] +
@@ -2067,7 +2081,8 @@ inline uint32_t Diva<diva_type, payload_type>::GetLogicalGroupCount(
         infix_size_,
         infix_store_target_size + scaled_sizes_[store.GetSizeGrade()] +
             infix_size_ * (runend_pos + 1));
-    return infix.GetNumPrefixKeys() + infix.num_suffixes_;
+    return {infix.GetNumPrefixKeys() + infix.num_suffixes_,
+            infix.GetNumSlots(infix_size_)};
 }
 
 
@@ -2120,24 +2135,13 @@ inline void Diva<diva_type, payload_type>::RebuildLogicalOrdinalDirectory(
             // slot and one key. A BinaryTrie escape group begins at `pos`, can
             // span several continuation slots, and contributes one logical
             // key for each prefix key and suffix leaf encoded in the trie.
-            // Advancing by GetNumSlots() ensures continuation slots are never
-            // counted as independent keys.
+            // Reading both counts together avoids decoding the same packed
+            // BinaryTrie once for its logical keys and again for its span.
             for (uint32_t pos = runstart_pos; pos <= runend_pos;) {
-                logical_count += GetLogicalGroupCount(store, pos, runend_pos);
-                if (SlotHasTrie(store, pos, runend_pos)) {
-                    const Infix infix(
-                        store.ptr + num_metadata_offset_words,
-                        infix_store_target_size +
-                            scaled_sizes_[store.GetSizeGrade()] +
-                            infix_size_ * pos,
-                        infix_size_,
-                        infix_store_target_size +
-                            scaled_sizes_[store.GetSizeGrade()] +
-                            infix_size_ * (runend_pos + 1));
-                    pos += infix.GetNumSlots(infix_size_);
-                } else {
-                    ++pos;
-                }
+                const LogicalGroupInfo info =
+                    ReadLogicalGroupInfo(store, pos, runend_pos);
+                logical_count += info.logical_key_count;
+                pos += info.physical_slot_count;
             }
         }
         // RocksDB's sorted bulk loader promotes one tree key per 1024 input
@@ -2188,67 +2192,65 @@ inline uint32_t Diva<diva_type, payload_type>::GetLogicalOrdinal(
     uint64_t occupied_before_target =
         occupieds[chunk_start / 64] &
         BITMASK(implicit_part - chunk_start);
+    // Runs are ordered by occupied-quotient rank. Map the first run in this
+    // chunk once, then retain its end while advancing both boundaries. Starting
+    // at the slot after the previous run end and skipping holes is equivalent
+    // to FindEmptySlotBefore(), without repeatedly walking the same runends
+    // backward.
+    const uint32_t chunk_rank = RankOccupieds(store, chunk_start);
+    int32_t previous_runend_pos =
+        chunk_rank ? static_cast<int32_t>(
+                         SelectRunends(store, chunk_rank - 1))
+                   : -1;
+    int32_t current_runend_pos =
+        static_cast<int32_t>(SelectRunends(store, chunk_rank));
+    int32_t current_runstart_pos = previous_runend_pos + 1;
+    while (current_runstart_pos < current_runend_pos &&
+           GetSlot(store, current_runstart_pos) == 0) {
+        ++current_runstart_pos;
+    }
     while (occupied_before_target != 0) {
-        const uint32_t implicit =
-            chunk_start + static_cast<uint32_t>(
-                              __builtin_ctzll(occupied_before_target));
         occupied_before_target &= occupied_before_target - 1;
-        const uint32_t rank = RankOccupieds(store, implicit);
-        const uint32_t runend_pos = SelectRunends(store, rank);
-        const uint32_t runstart_pos = static_cast<uint32_t>(
-            std::max<int32_t>(
-                rank ? static_cast<int32_t>(SelectRunends(store, rank - 1))
-                     : -1,
-                FindEmptySlotBefore(store, runend_pos)) +
-            1);
-        for (uint32_t pos = runstart_pos; pos <= runend_pos;) {
-            ordinal += GetLogicalGroupCount(store, pos, runend_pos);
-            if (SlotHasTrie(store, pos, runend_pos)) {
-                const Infix infix(
-                    store.ptr + num_metadata_offset_words,
-                    infix_store_target_size +
-                        scaled_sizes_[store.GetSizeGrade()] +
-                        infix_size_ * pos,
-                    infix_size_,
-                    infix_store_target_size +
-                        scaled_sizes_[store.GetSizeGrade()] +
-                        infix_size_ * (runend_pos + 1));
-                pos += infix.GetNumSlots(infix_size_);
-            } else {
-                ++pos;
-            }
+        for (uint32_t pos = static_cast<uint32_t>(current_runstart_pos);
+             pos <= static_cast<uint32_t>(current_runend_pos);) {
+            const LogicalGroupInfo info =
+                ReadLogicalGroupInfo(store, pos, current_runend_pos);
+            ordinal += info.logical_key_count;
+            pos += info.physical_slot_count;
+        }
+        previous_runend_pos = current_runend_pos;
+        current_runend_pos = NextRunend(store, current_runend_pos);
+        current_runstart_pos = previous_runend_pos + 1;
+        while (current_runstart_pos < current_runend_pos &&
+               GetSlot(store, current_runstart_pos) == 0) {
+            ++current_runstart_pos;
         }
     }
 
-    const uint32_t rank = RankOccupieds(store, implicit_part);
-    const uint32_t runend_pos = SelectRunends(store, rank);
-    const uint32_t runstart_pos = static_cast<uint32_t>(
-        std::max<int32_t>(
-            rank ? static_cast<int32_t>(SelectRunends(store, rank - 1)) : -1,
-            FindEmptySlotBefore(store, runend_pos)) +
-        1);
-    assert(group_slot >= runstart_pos && group_slot <= runend_pos);
-    uint32_t pos = runstart_pos;
+    assert(group_slot >= static_cast<uint32_t>(current_runstart_pos) &&
+           group_slot <= static_cast<uint32_t>(current_runend_pos));
+    // `current_run*` now identifies the target quotient's physical run.
+    // `group_slot` identifies one logical group within that run: either one
+    // regular slot or the escape-root slot of a multi-slot BinaryTrie. Count
+    // only groups physically preceding it. ReadLogicalGroupInfo() supplies
+    // both the number of logical keys represented by a group and the number
+    // of physical slots to skip, so continuation slots are never counted as
+    // separate groups.
+    uint32_t pos = static_cast<uint32_t>(current_runstart_pos);
     for (; pos < group_slot;) {
-        ordinal += GetLogicalGroupCount(store, pos, runend_pos);
-        if (SlotHasTrie(store, pos, runend_pos)) {
-            const Infix infix(
-                store.ptr + num_metadata_offset_words,
-                infix_store_target_size + scaled_sizes_[store.GetSizeGrade()] +
-                    infix_size_ * pos,
-                infix_size_,
-                infix_store_target_size + scaled_sizes_[store.GetSizeGrade()] +
-                    infix_size_ * (runend_pos + 1));
-            pos += infix.GetNumSlots(infix_size_);
-        } else {
-            ++pos;
-        }
+        const LogicalGroupInfo info =
+            ReadLogicalGroupInfo(store, pos, current_runend_pos);
+        ordinal += info.logical_key_count;
+        pos += info.physical_slot_count;
     }
     // If this fails, group_slot fell inside a BinaryTrie continuation range
     // rather than naming the escape root that owns the logical keys.
     assert(pos == group_slot);
+    // Earlier groups contributed their complete logical-key counts above.
+    // Add only the selected key's zero-based position within the target group.
     assert(local_ordinal <
-           GetLogicalGroupCount(store, group_slot, runend_pos));
+           ReadLogicalGroupInfo(store, group_slot, current_runend_pos)
+               .logical_key_count);
     ordinal += local_ordinal;
     assert(ordinal < store.logical_infix_count);
     return ordinal;
@@ -2954,7 +2956,7 @@ Diva<diva_type, payload_type>::GetSharedIgnoreImplicitLengths(const InfiniteByte
 
 template <DivaType diva_type, PayloadType payload_type>
 inline uint64_t Diva<diva_type, payload_type>::Size() const {
-    uint64_t res = sizeof(bool) + sizeof(infix_store_target_size) 
+    uint64_t res = sizeof(bool) + sizeof(infix_store_target_size)
                  + sizeof(base_implicit_size) + sizeof(scale_shift)
                  + sizeof(scale_implicit_shift) + sizeof(size_scalar_count)
                  + sizeof(size_scalar_shrink_grow_sep) + sizeof(load_factor_)
@@ -2982,6 +2984,7 @@ inline uint64_t Diva<diva_type, payload_type>::Size() const {
                                           reinterpret_cast<void **>(&store), &dummy);
             res += sizeof(tree_key_len) + tree_key_len;
             res += sizeof(store->status);
+            res += InfixStore::serialized_logical_metadata_byte_count;
             if constexpr (payload_type == PayloadType::FixedLength) {
                 res += sizeof(store->num_sample_payloads);
                 res += (store->num_sample_payloads * payload_size_ + 7) / 8;
@@ -3005,6 +3008,7 @@ inline uint64_t Diva<diva_type, payload_type>::Size() const {
                                   reinterpret_cast<void **>(&store), &dummy);
             res += sizeof(tree_key_len) + tree_key_len;
             res += sizeof(store->status); // + sizeof(store->ptr);
+            res += InfixStore::serialized_logical_metadata_byte_count;
             if constexpr (payload_type == PayloadType::FixedLength) {
                 res += sizeof(store->num_sample_payloads);
                 res += (store->num_sample_payloads * payload_size_ + 7) / 8;
@@ -3153,6 +3157,17 @@ inline uint64_t Diva<diva_type, payload_type>::SerializeInfixStore(char *out,
     const uint64_t word_count = store.GetPtrWordCount(scaled_sizes_[store.GetSizeGrade()], infix_size_, payload_size_);
     memcpy(out + offset, store.ptr, word_count * sizeof(uint64_t));
     offset += word_count * sizeof(uint64_t);
+
+    if constexpr (diva_type == DivaType::BinaryTrie &&
+                  payload_type == PayloadType::None) {
+        memcpy(out + offset, &store.logical_infix_count,
+               sizeof(store.logical_infix_count));
+        offset += sizeof(store.logical_infix_count);
+        constexpr uint32_t directory_bytes =
+            InfixStore::ordinal_directory_entry_count * sizeof(uint16_t);
+        memcpy(out + offset, GetOrdinalDirectory(store), directory_bytes);
+        offset += directory_bytes;
+    }
 
     if constexpr (payload_type == PayloadType::FixedLength) {
         if (store.num_sample_payloads > 0) {
@@ -3371,6 +3386,27 @@ inline uint32_t Diva<diva_type, payload_type>::DeserializeInfixStore(const char 
     memset(store.ptr + serialized_word_count, 0,
            (allocation_word_count - serialized_word_count) * sizeof(uint64_t));
     offset += serialized_word_count * sizeof(uint64_t);
+    if constexpr (diva_type == DivaType::BinaryTrie &&
+                  payload_type == PayloadType::None) {
+        memcpy(&store.logical_infix_count, deser_buf + offset,
+               sizeof(store.logical_infix_count));
+        offset += sizeof(store.logical_infix_count);
+        constexpr uint32_t directory_bytes =
+            InfixStore::ordinal_directory_entry_count * sizeof(uint16_t);
+        memcpy(GetOrdinalDirectory(store), deser_buf + offset,
+               directory_bytes);
+        offset += directory_bytes;
+#ifdef DEBUG
+        const uint16_t *const directory = GetOrdinalDirectory(store);
+        assert(directory[0] == 0);
+        for (uint32_t i = 1;
+             i < InfixStore::ordinal_directory_entry_count; ++i) {
+            assert(directory[i - 1] <= directory[i]);
+            assert(directory[i] <= store.logical_infix_count);
+        }
+        assert(store.logical_infix_count < infix_store_target_size);
+#endif
+    }
     if constexpr (payload_type == PayloadType::None) {
         owned_infix_store_bytes_.fetch_add(
             allocation_word_count * sizeof(uint64_t),
@@ -3386,7 +3422,6 @@ inline uint32_t Diva<diva_type, payload_type>::DeserializeInfixStore(const char 
         }
     }
 
-    RebuildLogicalOrdinalDirectory(store);
     return offset;
 }
 
@@ -8364,6 +8399,16 @@ IteratorRefetchLowerUpperBounds:
                             };
                             std::vector<ExpandedKey> expanded_keys;
                             expanded_keys.reserve(trie_keys.size());
+                            // All keys reconstructed from this BinaryTrie share
+                            // one group base in the store-wide ordinal space.
+                            // Compute that base once; the trie's local ordinal
+                            // is already the zero-based offset from it.
+                            const uint32_t group_logical_ordinal =
+                                filter_->GetLogicalOrdinal(
+                                    infix_store,
+                                    static_cast<uint32_t>(
+                                        current_implicit_part),
+                                    static_cast<uint32_t>(pos), 0);
                             for (uint32_t local_ordinal = 0;
                                  local_ordinal < trie_keys.size();
                                  ++local_ordinal) {
@@ -8376,12 +8421,7 @@ IteratorRefetchLowerUpperBounds:
                                         extraction, explicit_part_length,
                                         trie_key),
                                     bit_count,
-                                    filter_->GetLogicalOrdinal(
-                                        infix_store,
-                                        static_cast<uint32_t>(
-                                            current_implicit_part),
-                                        static_cast<uint32_t>(pos),
-                                        local_ordinal)});
+                                    group_logical_ordinal + local_ordinal});
                             }
                             std::sort(expanded_keys.begin(), expanded_keys.end(),
                                       [&](const ExpandedKey &lhs,

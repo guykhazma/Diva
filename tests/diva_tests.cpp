@@ -4590,6 +4590,22 @@ public:
                                                             &rebuilt_context));
             CHECK(rebuilt.ObserveFalsePositive(rebuilt_context) ==
                   BinaryTrieDiva::AdmissionResult::kDeferred);
+
+            const auto* const source_store =
+                static_cast<const BinaryTrieDiva::InfixStore*>(context.store);
+            const auto* const rebuilt_store =
+                static_cast<const BinaryTrieDiva::InfixStore*>(
+                    rebuilt_context.store);
+            REQUIRE(source_store != nullptr);
+            REQUIRE(rebuilt_store != nullptr);
+            CHECK(source_store->logical_infix_count ==
+                  rebuilt_store->logical_infix_count);
+            CHECK(memcmp(
+                      s.GetOrdinalDirectory(*source_store),
+                      rebuilt.GetOrdinalDirectory(*rebuilt_store),
+                      BinaryTrieDiva::InfixStore::
+                              ordinal_directory_entry_count *
+                          sizeof(uint16_t)) == 0);
         }
 
         SUBCASE("shadowing discards pending adaptation for that infix") {
@@ -5358,6 +5374,23 @@ private:
         typename Diva<diva_type, payload_type>::InfixStore *store_a, *store_b;
         const bool check_it_write = false;
         const bool check_it_unlock = true;
+        const auto assert_logical_metadata =
+            [&](const typename Diva<diva_type, payload_type>::InfixStore& lhs,
+                const typename Diva<diva_type, payload_type>::InfixStore& rhs) {
+                if constexpr (diva_type == DivaType::BinaryTrie &&
+                              payload_type == PayloadType::None) {
+                    REQUIRE_EQ(lhs.logical_infix_count,
+                               rhs.logical_infix_count);
+                    REQUIRE_EQ(
+                        memcmp(
+                            a.GetOrdinalDirectory(lhs),
+                            b.GetOrdinalDirectory(rhs),
+                            Diva<diva_type, payload_type>::InfixStore::
+                                    ordinal_directory_entry_count *
+                                sizeof(uint16_t)),
+                        0);
+                }
+            };
         if constexpr (diva_type == DivaType::Int) {
             wormhole_int_iter it_a, it_b;
             it_a.ref = a.better_tree_int_;
@@ -5385,6 +5418,7 @@ private:
                                        store_b->ptr + Diva<diva_type, payload_type>::num_metadata_offset_words,
                                        (word_count - Diva<diva_type, payload_type>::num_metadata_offset_words) * sizeof(uint64_t)),
                            0);
+                assert_logical_metadata(*store_a, *store_b);
                 if constexpr (payload_type == PayloadType::FixedLength) {
                     REQUIRE_EQ(store_a->num_sample_payloads, store_b->num_sample_payloads);
                     const uint64_t *store_a_sample_payloads_ptr = reinterpret_cast<const uint64_t *>(store_a->ptr[1]);
@@ -5428,6 +5462,7 @@ private:
                                        store_b->ptr + Diva<diva_type, payload_type>::num_metadata_offset_words,
                                        (word_count - Diva<diva_type, payload_type>::num_metadata_offset_words) * sizeof(uint64_t)),
                            0);
+                assert_logical_metadata(*store_a, *store_b);
                 if constexpr (payload_type == PayloadType::FixedLength) {
                     REQUIRE_EQ(store_a->num_sample_payloads, store_b->num_sample_payloads);
                     const uint64_t *store_a_sample_payloads_ptr = reinterpret_cast<const uint64_t *>(store_a->ptr[1]);

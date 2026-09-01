@@ -2490,6 +2490,74 @@ public:
     }
 
 
+    static void AssertLogicalGroupInfo(BinaryTrieDiva& s,
+                                       const BinaryTrieDiva::InfixStore& store) {
+        bool saw_regular_group = false;
+        bool saw_prefix_key = false;
+        bool saw_suffix_leaf = false;
+        bool saw_continuation_slot = false;
+        uint32_t logical_key_count = 0;
+        for (uint32_t implicit = 0;
+             implicit < BinaryTrieDiva::infix_store_target_size; ++implicit) {
+            if (!s.GetOccupiedBit(store, implicit))
+                continue;
+
+            const uint32_t rank = s.RankOccupieds(store, implicit);
+            const uint32_t runend_pos = s.SelectRunends(store, rank);
+            const uint32_t runstart_pos = static_cast<uint32_t>(
+                std::max<int32_t>(
+                    rank ? static_cast<int32_t>(
+                               s.SelectRunends(store, rank - 1))
+                         : -1,
+                    s.FindEmptySlotBefore(store, runend_pos)) +
+                1);
+            uint32_t pos = runstart_pos;
+            while (pos <= runend_pos) {
+                const auto info =
+                    s.ReadLogicalGroupInfo(store, pos, runend_pos);
+                REQUIRE(info.logical_key_count > 0);
+                REQUIRE(info.physical_slot_count > 0);
+                if (s.SlotHasTrie(store, pos, runend_pos)) {
+                    const BinaryTrieDiva::Infix infix(
+                        store.ptr + BinaryTrieDiva::num_metadata_offset_words,
+                        BinaryTrieDiva::infix_store_target_size +
+                            s.scaled_sizes_[store.GetSizeGrade()] +
+                            s.infix_size_ * pos,
+                        s.infix_size_,
+                        BinaryTrieDiva::infix_store_target_size +
+                            s.scaled_sizes_[store.GetSizeGrade()] +
+                            s.infix_size_ * (runend_pos + 1));
+                    CHECK(info.logical_key_count ==
+                          infix.GetNumPrefixKeys() + infix.num_suffixes_);
+                    CHECK(info.physical_slot_count ==
+                          infix.GetNumSlots(s.infix_size_));
+                    saw_prefix_key |= infix.GetNumPrefixKeys() > 0;
+                    saw_suffix_leaf |= infix.num_suffixes_ > 0;
+                    saw_continuation_slot |= info.physical_slot_count > 1;
+                } else {
+                    CHECK(info.logical_key_count == 1);
+                    CHECK(info.physical_slot_count == 1);
+                    saw_regular_group = true;
+                }
+                for (uint32_t local_ordinal = 0;
+                     local_ordinal < info.logical_key_count; ++local_ordinal) {
+                    CHECK(s.GetLogicalOrdinal(store, implicit, pos,
+                                              local_ordinal) ==
+                          logical_key_count + local_ordinal);
+                }
+                logical_key_count += info.logical_key_count;
+                pos += info.physical_slot_count;
+            }
+            CHECK(pos == runend_pos + 1);
+        }
+        CHECK(logical_key_count == store.logical_infix_count);
+        CHECK(saw_regular_group);
+        CHECK(saw_prefix_key);
+        CHECK(saw_suffix_leaf);
+        CHECK(saw_continuation_slot);
+    }
+
+
     static void BinaryTrieGetLongestMatchingInfixSize() {
         const uint32_t N_bulk = 6;
         const uint32_t N_bulk_keys = 61;
@@ -2541,6 +2609,7 @@ public:
         BinaryTrieDiva::InfixStore store(total_slots, s.infix_size_,
                 s.size_scalar_shrink_grow_sep);
         s.LoadVectorToInfixStore(store, infix_vec);
+        AssertLogicalGroupInfo(s, store);
 
         // To make sure that the strings stored in the tries after the infix is aligned with the input
         key_start_bit -= infix_size - 1;
