@@ -2111,9 +2111,11 @@ inline void Diva<diva_type, payload_type>::RebuildLogicalOrdinalDirectory(
                   payload_type != PayloadType::None) {
         return;
     } else {
-        // Rebuild the runtime logical-key prefix sums after the store's
-        // physical occupied/runend/slot layout is complete. This metadata is
-        // not serialized. For chunk c:
+        // Build or refresh the logical-key prefix sums after the store's
+        // physical occupied/runend/slot layout is complete. The count and
+        // directory are serialized with the immutable store representation;
+        // deserialization restores them directly, while newly built or
+        // physically reconstructed stores compute them here. For chunk c:
         //
         //   directory[c] = number of infix keys in quotients [0, 64*c)
         //
