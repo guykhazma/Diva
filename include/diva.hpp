@@ -129,6 +129,9 @@ public:
                      std::function<bool(const uint64_t *)> should_remove=nullptr);
     bool RangeQuery(uint64_t l, uint64_t r) const;
     bool RangeQuery(std::string_view input_l, std::string_view input_r) const;
+    // `input_r == nullptr` denotes the open-ended range [input_l, +infinity)
+    // and requires `input_r_len == 0`. A non-null zero-length upper bound is
+    // still a finite empty key.
     bool RangeQuery(const uint8_t *input_l, const uint32_t input_l_len,
                     const uint8_t *input_r, const uint32_t input_r_len) const;
     bool PointQuery(uint64_t key) const;
@@ -1701,7 +1704,9 @@ inline bool Diva<diva_type, payload_type>::RangeQueryImpl(
         CollisionLocation *location) const {
     if (location != nullptr)
         *location = {};
+    assert(input_r != nullptr || input_r_len == 0);
     const bool it_write_lock = false;
+    const bool open_ended = input_r == nullptr;
     const InfiniteByteString l_key {input_l, static_cast<uint32_t>(input_l_len)};
     const InfiniteByteString r_key {input_r, static_cast<uint32_t>(input_r_len)};
 
@@ -1733,7 +1738,7 @@ inline bool Diva<diva_type, payload_type>::RangeQueryImpl(
             return true;
         }
     }
-    if (next_key.str != nullptr && next_key <= r_key) {
+    if (next_key.str != nullptr && (open_ended || next_key <= r_key)) {
         if constexpr (diva_type != DivaType::BinaryTrie) {
             // Standard and Int Diva have no logical-shadow state. Preserve the
             // original fast path: the fully stored next tree key is itself a
@@ -1776,8 +1781,21 @@ inline bool Diva<diva_type, payload_type>::RangeQueryImpl(
             }
         }
     } else if (next_key.str == nullptr) {
+        if (!open_ended) {
+            UnlockLeaves(leaves_to_unlock, it_write_lock);
+            return false;
+        }
+
+        // There is no later tree key to witness [l, +infinity), but the last
+        // tree key's store can still contain keys after l. Returning whether
+        // that store has a visible infix is conservative: some of its infixes
+        // may precede l (a permitted false positive), while returning false
+        // when any visible infix remains could be a false negative.
+        rwlock_lock_read(infix_store_ptr->rwlock);
+        const bool maybe = HasVisibleInfix(*infix_store_ptr);
+        rwlock_unlock_read(infix_store_ptr->rwlock);
         UnlockLeaves(leaves_to_unlock, it_write_lock);
-        return false;
+        return maybe;
     }
     
     InfixStore& infix_store = *infix_store_ptr;
