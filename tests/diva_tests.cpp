@@ -3851,6 +3851,35 @@ public:
     }
 
 
+    static void BinaryTrieBulkLoadStreamingBoundary() {
+        const uint32_t infix_size = 9;
+        const uint32_t seed = 1;
+        const float load_factor = 0.95;
+
+        // T is 1024. Counts N*T+1 leave the last full store's right boundary
+        // in bulk_load_left_key_ with no buffered successor. Finish must still
+        // install that boundary in the wormhole, or the preceding store is
+        // decoded against the +infinity sentinel and all its infixes become
+        // false negatives. One key is the N=0 instance of the same edge case.
+        for (const uint32_t n_keys : {1U, 1025U, 2049U}) {
+            BinaryTrieDiva s(infix_size, seed, load_factor);
+            std::vector<std::string> keys;
+            keys.reserve(n_keys);
+            for (uint64_t i = 0; i < n_keys; ++i) {
+                const uint64_t encoded = to_big_endian_order(i + 1);
+                keys.emplace_back(reinterpret_cast<const char *>(&encoded),
+                                  sizeof(encoded));
+                s.BulkLoadStreaming(keys.back());
+            }
+            s.BulkLoadStreamingFinish();
+
+            CHECK_EQ(s.GetNumKeys(), n_keys);
+            for (const std::string& key : keys)
+                CHECK(s.PointQuery(key));
+        }
+    }
+
+
     static int CompareKnownPrefixToKey(const std::string& prefix,
                                        const uint32_t known_bits,
                                        const std::string& key) {
@@ -5651,6 +5680,7 @@ TEST_SUITE("binary trie") {
     TEST_CASE("bulk load") {
         DivaTests::BinaryTrieBulkLoad();
         DivaTests::BinaryTrieBulkLoadStreaming();
+        DivaTests::BinaryTrieBulkLoadStreamingBoundary();
     }
 
     TEST_CASE("iterator") {

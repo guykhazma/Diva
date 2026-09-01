@@ -5272,7 +5272,27 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreamingFinish() {
     if (tree_key_absent(key_copy, bulk_load_streaming_max_len_))
         AddTreeKey(key_copy, bulk_load_streaming_max_len_);
 
-    if (bulk_load_streaming_ind_ > 0) {
+    if (bulk_load_streaming_ind_ == 0 && bulk_load_left_key_.str != nullptr) {
+        // A full store is emitted only when its next (right-boundary) key
+        // arrives. That key then becomes bulk_load_left_key_. If the input
+        // ends immediately afterward (N * T + 1 keys), there is no following
+        // batch to install it in the wormhole. Without this leaf, queries
+        // pair the preceding store with the +infinity sentinel and recompute
+        // different shared/implicit fields, making every infix in that store
+        // a false negative. Install the pending boundary with an empty store.
+        // If the real key equals a sentinel, the leaf was just installed above
+        // and already has the required empty store.
+        if (tree_key_absent(bulk_load_left_key_.str,
+                            bulk_load_left_key_.length)) {
+            if constexpr (payload_type == PayloadType::FixedLength)
+                AddTreeKey(bulk_load_left_key_.str, bulk_load_left_key_.length,
+                           bulk_load_left_payload_);
+            else
+                AddTreeKey(bulk_load_left_key_.str,
+                           bulk_load_left_key_.length);
+        }
+        n_keys_.fetch_add(1, std::memory_order_release);
+    } else if (bulk_load_streaming_ind_ > 0) {
         const InfiniteByteString bulk_load_right_key = bulk_load_key_list_[bulk_load_streaming_ind_ - 1];
         bulk_load_key_list_[bulk_load_streaming_ind_ - 1] = {};
         bulk_load_streaming_ind_--;
@@ -5617,6 +5637,11 @@ inline void Diva<diva_type, payload_type>::RemoveSamplePayload(InfixStore &store
 template <DivaType diva_type, PayloadType payload_type>
 //__attribute__((always_inline))
 inline bool Diva<diva_type, payload_type>::GetOccupiedBit(const InfixStore &store, const uint32_t pos) const {
+#ifdef DEBUG
+    // Occupieds has exactly infix_store_target_size bits. Boundary-derived
+    // relative quotients must never address outside that fixed universe.
+    assert(pos < infix_store_target_size);
+#endif // DEBUG
     const uint64_t *occupieds = store.ptr + num_metadata_offset_words;
     return get_bitmap_bit(occupieds, pos);
 }
@@ -7430,6 +7455,7 @@ inline void Diva<diva_type, payload_type>::LoadListToInfixStore(InfixStore &stor
     const uint32_t total_size = scaled_sizes_[size_grade];
 #ifdef DEBUG
     assert(total_implicit >= infix_store_target_size / 2);
+    assert(total_implicit <= infix_store_target_size);
 #endif // DEBUG
     const uint64_t implicit_scalar = implicit_scalars_[total_implicit - infix_store_target_size / 2];
 
@@ -7531,6 +7557,7 @@ inline void Diva<diva_type, payload_type>::LoadVectorToInfixStore(InfixStore &st
                                                                   const uint64_t *payload_list) {
 #ifdef DEBUG
     assert(total_implicit >= infix_store_target_size / 2);
+    assert(total_implicit <= infix_store_target_size);
 #endif // DEBUG
 
     const uint32_t size_grade = store.GetSizeGrade();
