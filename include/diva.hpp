@@ -3440,6 +3440,58 @@ inline void Diva<int_optimized, payload_type>::DeleteMerge(InfiniteByteString ke
         }
     }
 
+    // Rebasing both sides onto min(ref_l, ref_r) grows the higher side's
+    // offsets by the difference. When the two bases are genuinely far apart
+    // that can exceed the FOR field, and a merge cannot decline -- its caller
+    // has emptied a store and depends on this collapsing it (declining hangs
+    // on the store being revisited forever). So widen both stores first.
+    // Checked here, before the payload lists are extracted, because the lists
+    // are packed at the store's width.
+    //
+    // Only reachable now that the double-rebase below is fixed. While offsets
+    // accumulated on every merge no width was ever enough, and widening merely
+    // postponed the abort -- which is why this looked like a width problem
+    // when it was not.
+    if constexpr (payload_type == PayloadType::FixedLength) {
+        if (file_number_offset_bits_ > 0 && !store_l->IsWidePayload()) {
+            const uint32_t merged_ref =
+                std::min(store_l->reference_file_number,
+                         store_r->reference_file_number);
+            const uint64_t dl = store_l->reference_file_number - merged_ref;
+            const uint64_t dr = store_r->reference_file_number - merged_ref;
+            if (dl > 0 || dr > 0) {
+                const uint64_t cur_max = (1ULL << StoreFORBits(*store_l)) - 1;
+                auto max_for_offset = [&](InfixStore &st) -> uint64_t {
+                    uint64_t m = 0;
+                    uint64_t probe = 0;
+                    const uint32_t slots = scaled_sizes_[st.GetSizeGrade()];
+                    for (uint32_t i = 0; i < slots; i++) {
+                        if (GetSlot(st, i) == 0) continue;
+                        GetPayload(st, i, &probe, 0);
+                        const uint64_t off = ReadFOROffsetFromPayload(
+                            &probe, 0, StorePayloadSize(st), StoreFORBits(st));
+                        if (off > m) m = off;
+                    }
+                    if (st.num_sample_payloads > 0 && st.ptr[1] != 0) {
+                        const uint64_t *sp =
+                            reinterpret_cast<const uint64_t *>(st.ptr[1]);
+                        for (uint32_t i = 0; i < st.num_sample_payloads; i++) {
+                            const uint64_t off = ReadFOROffsetFromPayload(
+                                sp, i, StorePayloadSize(st), StoreFORBits(st));
+                            if (off > m) m = off;
+                        }
+                    }
+                    return m;
+                };
+                if (max_for_offset(*store_l) + dl > cur_max ||
+                    max_for_offset(*store_r) + dr > cur_max) {
+                    WidenInfixStore(*store_l);
+                    WidenInfixStore(*store_r);
+                }
+            }
+        }
+    }
+
     auto [shared, ignore, implicit_size] = GetSharedIgnoreImplicitLengths(left_key, right_key);
 
     uint64_t total_elem_count = store_l->GetElemCount() + store_r->GetElemCount();
@@ -3633,6 +3685,15 @@ inline void Diva<int_optimized, payload_type>::DeleteMerge(InfiniteByteString ke
     store.SetPartialKey(store_l->IsPartialKey());
     store_l->status = store.status;
     store_l->ptr = store.ptr;
+    // Carry the merged FOR base across too. Without this store_l keeps its OLD
+    // reference while its contents have just been rebased onto
+    // min(ref_l, ref_r) -- so the next merge computes the same delta again and
+    // rebases already-rebased data. The offsets then grow by that delta on
+    // every merge until they overflow the FOR field, which presents as
+    // "DeleteMerge: FOR offset overflow" and looks like a width problem. It is
+    // not: widening only delays it. See
+    // DivaForEncodingTest.MergeWithDistantFORBasesRebasesOnce.
+    store_l->reference_file_number = store.reference_file_number;
     store_l->rwlock.store(store.rwlock.load(std::memory_order_acquire), std::memory_order_release);
     // store_l now holds the merged content; mark dirty so the next checkpoint
     // re-serializes it. (store_r is deleted by the wormhole below.)
