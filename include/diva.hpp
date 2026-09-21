@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cassert>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -239,6 +240,11 @@ public:
         __attribute__((always_inline))
         uint64_t BitsAt(const uint32_t bit_pos, const uint32_t res_width) const {
             assert(bit_pos % 8 + res_width <= 64);
+            // A zero-width request shifts by 8*sizeof(res) - 0 - 0 == 64 below,
+            // which is undefined. The result is masked by BITMASK(0) == 0
+            // anyway, so answer directly and never form the shift.
+            if (res_width == 0)
+                return 0;
             if (bit_pos / 8 >= length)
                 return 0;
             uint64_t res = 0;
@@ -382,8 +388,8 @@ private:
     static constexpr uint64_t max_exp_backoff = BITMASK(14);
 
     struct __attribute__((packed)) InfixStore {
-        static const uint32_t size_grade_bit_count = 12;
-        static const uint32_t elem_count_bit_count = 48;
+        static constexpr uint32_t size_grade_bit_count = 12;
+        static constexpr uint32_t elem_count_bit_count = 48;
         // Bit 47 -- the top bit of the 48-bit elem_count field -- flags a store
         // whose payloads are packed at the WIDE width (see
         // Diva::StorePayloadSize). elem_count is bounded by
@@ -399,8 +405,8 @@ private:
         // writes and DeserializeInfixStore reads, so the width is known before
         // the payload word count is computed from it. The checkpoint format is
         // therefore untouched.
-        static const uint32_t wide_payload_bit_pos = 47;
-        static const uint32_t elem_count_used_bits = wide_payload_bit_pos;
+        static constexpr uint32_t wide_payload_bit_pos = 47;
+        static constexpr uint32_t elem_count_used_bits = wide_payload_bit_pos;
 
         uint64_t status = 0;
         uint16_t num_sample_payloads = 0;
@@ -2197,7 +2203,7 @@ inline uint32_t Diva<int_optimized, payload_type>::InsertSplit(const InfiniteByt
                                                                       implicit_size,
                                                                       shamt_lt,
                                                                       left_start, left_end);
-    uint64_t left_infix_list_contents[left_list_len > heap_alloc_threshold ? 1 : left_list_len];
+    uint64_t left_infix_list_contents[left_list_len > heap_alloc_threshold || left_list_len == 0 ? 1 : left_list_len];
     const uint32_t left_payload_list_size = (left_list_len + 1) * StorePayloadSize(infix_store) / 64 + 2;
     uint64_t left_payload_list_contents[left_list_len > heap_alloc_threshold ? 1 : left_payload_list_size];
     uint64_t *left_infix_list = left_infix_list_contents;
@@ -2228,7 +2234,7 @@ inline uint32_t Diva<int_optimized, payload_type>::InsertSplit(const InfiniteByt
                                                                         implicit_size,
                                                                         shamt_gt,
                                                                         right_start, right_end);
-    uint64_t right_infix_list_contents[right_list_len > heap_alloc_threshold ? 1 : right_list_len];
+    uint64_t right_infix_list_contents[right_list_len > heap_alloc_threshold || right_list_len == 0 ? 1 : right_list_len];
     const uint32_t right_payload_list_size = (right_list_len + 1) * StorePayloadSize(infix_store) / 64 + 2;
     uint64_t right_payload_list_contents[right_list_len > heap_alloc_threshold ? 1 : right_payload_list_size];
     uint64_t *right_infix_list = right_infix_list_contents;
@@ -2408,7 +2414,7 @@ inline void Diva<int_optimized, payload_type>::UpdateInfixList(const uint64_t *l
         // bucket, so a per-key seek lands on an empty slot.
         if constexpr (payload_type == PayloadType::FixedLength) {
             const bool should_allocate_on_heap = list_len > heap_alloc_threshold;
-            std::pair<uint64_t, uint32_t> sorter_contents[should_allocate_on_heap ? 1 : list_len];
+            std::pair<uint64_t, uint32_t> sorter_contents[should_allocate_on_heap || list_len == 0 ? 1 : list_len];
             std::pair<uint64_t, uint32_t> *sorter = sorter_contents;
             if (should_allocate_on_heap)
                 sorter = new std::pair<uint64_t, uint32_t>[list_len];
@@ -2484,7 +2490,7 @@ inline void Diva<int_optimized, payload_type>::UpdateInfixList(const uint64_t *l
 #endif
     
     if constexpr (payload_type == PayloadType::FixedLength) {
-        std::pair<uint64_t, uint32_t> sorter_contents[should_allocate_on_heap ? 1 : res_len];
+        std::pair<uint64_t, uint32_t> sorter_contents[should_allocate_on_heap || res_len == 0 ? 1 : res_len];
         std::pair<uint64_t, uint32_t> *sorter = sorter_contents;
         if (should_allocate_on_heap)
             sorter = new std::pair<uint64_t, uint32_t>[res_len];
@@ -5811,7 +5817,7 @@ inline void Diva<int_optimized, payload_type>::ResizeInfixStore(InfixStore &stor
     const uint64_t infix_count = store.GetElemCount();
     const bool should_allocate_on_heap = infix_count > heap_alloc_threshold;
 
-    uint64_t infix_list_contents[should_allocate_on_heap ? 1 : infix_count];
+    uint64_t infix_list_contents[should_allocate_on_heap || infix_count == 0 ? 1 : infix_count];
     uint32_t payload_list_size = 1;
     if constexpr (payload_type == PayloadType::FixedLength)
         payload_list_size = (StorePayloadSize(store) * (infix_count + 2) + 63) / 64 + 2;
