@@ -238,7 +238,7 @@ private:
     uint64_t size_scalars_[size_scalar_count], scaled_sizes_[size_scalar_count], exception_scaled_size_;
     uint64_t implicit_scalars_[infix_store_target_size / 2 + 1];
 
-    uint32_t bulk_load_streaming_ind_, bulk_load_streaming_max_len_;
+    uint32_t bulk_load_streaming_ind_ = 0, bulk_load_streaming_max_len_ = 0;
     InfiniteByteString bulk_load_left_key_, bulk_load_key_list_[infix_store_target_size];
 
     const bool read_only_ = false;
@@ -1976,14 +1976,47 @@ inline void Diva<int_optimized>::BulkLoadStreaming(const uint8_t *key, const uin
 
 template <bool int_optimized>
 inline void Diva<int_optimized>::BulkLoadStreamingFinish() {
+    // Nothing was ever added: bulk_load_streaming_max_len_ is 0 and there is
+    // no boundary to install, so there is nothing to finish. Without this the
+    // sentinel path below allocates and memsets a zero-length buffer and adds
+    // degenerate tree keys.
+    if (bulk_load_left_key_.str == nullptr) {
+        return;
+    }
+
     uint8_t *key_copy = new uint8_t[bulk_load_streaming_max_len_];
+    // Install the min (all-zero) and max (all-0xFF) sentinel boundaries, but do
+    // NOT overwrite a real boundary that already equals one of them: AddTreeKey
+    // installs a fresh empty infix store, which would drop every key that
+    // boundary's store holds (e.g. a dataset whose first key is the all-zero
+    // encoding). Insert each sentinel only if absent.
+    const auto tree_key_absent = [&](const uint8_t *k, const uint32_t len) {
+        if constexpr (int_optimized)
+            return !wh_int_probe(better_tree_int_, k, len);
+        else
+            return !wh_probe(better_tree_, k, len);
+    };
     memset(key_copy, 0x00, bulk_load_streaming_max_len_);
-    AddTreeKey(key_copy, bulk_load_streaming_max_len_);
+    if (tree_key_absent(key_copy, bulk_load_streaming_max_len_))
+        AddTreeKey(key_copy, bulk_load_streaming_max_len_);
     memset(key_copy, 0xFF, bulk_load_streaming_max_len_);
-    AddTreeKey(key_copy, bulk_load_streaming_max_len_);
+    if (tree_key_absent(key_copy, bulk_load_streaming_max_len_))
+        AddTreeKey(key_copy, bulk_load_streaming_max_len_);
     delete[] key_copy;
 
-    if (bulk_load_streaming_ind_ > 0) {
+    if (bulk_load_streaming_ind_ == 0 && bulk_load_left_key_.str != nullptr) {
+        // A full store is emitted only when its next (right-boundary) key
+        // arrives. That key then becomes bulk_load_left_key_. If the input ends
+        // immediately afterward (N * T + 1 keys), there is no following batch
+        // to install it in the wormhole. Without this leaf, queries pair the
+        // preceding store with the +infinity sentinel and recompute different
+        // shared/implicit fields, making every infix in that store a false
+        // negative. Install the pending boundary with an empty store. If the
+        // real key equals a sentinel, the leaf was just installed above and
+        // already has the required empty store.
+        if (tree_key_absent(bulk_load_left_key_.str, bulk_load_left_key_.length))
+            AddTreeKey(bulk_load_left_key_.str, bulk_load_left_key_.length);
+    } else if (bulk_load_streaming_ind_ > 0) {
         InfiniteByteString bulk_load_right_key {bulk_load_key_list_[bulk_load_streaming_ind_ - 1].str,
                                                 bulk_load_key_list_[bulk_load_streaming_ind_ - 1].length};
         bulk_load_key_list_[bulk_load_streaming_ind_ - 1] = {};
