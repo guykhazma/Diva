@@ -581,7 +581,7 @@ private:
     uint64_t implicit_scalars_[infix_store_target_size / 2 + 1];
     std::atomic<uint64_t> n_keys_ = 0;
 
-    uint32_t bulk_load_streaming_ind_, bulk_load_streaming_max_len_;
+    uint32_t bulk_load_streaming_ind_ = 0, bulk_load_streaming_max_len_ = 0;
     InfiniteByteString bulk_load_left_key_, bulk_load_key_list_[infix_store_target_size];
     uint64_t *bulk_load_left_payload_ = nullptr, *bulk_load_payload_list_ = nullptr;
 
@@ -3096,7 +3096,7 @@ inline uint32_t Diva<int_optimized, payload_type>::DeserializeMetadata(const cha
     rng_.seed(rng_seed_);
 
     uint64_t n_keys_val;
-    memcpy(&n_keys_val, deser_buf + res, sizeof(rng_seed_));
+    memcpy(&n_keys_val, deser_buf + res, sizeof(n_keys_val));
     res += sizeof(n_keys_val);
     n_keys_.store(n_keys_val, std::memory_order_release);
 
@@ -4262,13 +4262,53 @@ inline void Diva<int_optimized, payload_type>::BulkLoadStreaming(const uint8_t *
 
 template <bool int_optimized, PayloadType payload_type>
 inline void Diva<int_optimized, payload_type>::BulkLoadStreamingFinish() {
-    uint8_t *key_copy = new uint8_t[bulk_load_streaming_max_len_];
-    memset(key_copy, 0x00, bulk_load_streaming_max_len_);
-    AddTreeKey(key_copy, bulk_load_streaming_max_len_);
-    memset(key_copy, 0xFF, bulk_load_streaming_max_len_);
-    AddTreeKey(key_copy, bulk_load_streaming_max_len_);
+    // Nothing was ever added: there is no boundary to install and
+    // bulk_load_streaming_max_len_ is 0, so the sentinel path below would
+    // allocate and memset a zero-length buffer.
+    if (bulk_load_left_key_.str == nullptr) {
+        return;
+    }
 
-    if (bulk_load_streaming_ind_ > 0) {
+    uint8_t *key_copy = new uint8_t[bulk_load_streaming_max_len_];
+    // Install the min (all-zero) and max (all-0xFF) sentinel boundaries, but do
+    // NOT overwrite a real boundary that already equals one of them: AddTreeKey
+    // installs a fresh empty infix store, which would drop every key that
+    // boundary's store holds (e.g. a dataset whose first key is the all-zero
+    // encoding). Insert each sentinel only if absent.
+    const auto tree_key_absent = [&](const uint8_t *k, const uint32_t len) {
+        if constexpr (int_optimized)
+            return !wh_int_probe(better_tree_int_, k, len);
+        else
+            return !wh_probe(better_tree_, k, len);
+    };
+    memset(key_copy, 0x00, bulk_load_streaming_max_len_);
+    if (tree_key_absent(key_copy, bulk_load_streaming_max_len_))
+        AddTreeKey(key_copy, bulk_load_streaming_max_len_);
+    memset(key_copy, 0xFF, bulk_load_streaming_max_len_);
+    if (tree_key_absent(key_copy, bulk_load_streaming_max_len_))
+        AddTreeKey(key_copy, bulk_load_streaming_max_len_);
+
+    if (bulk_load_streaming_ind_ == 0) {
+        // A full store is emitted only when its next (right-boundary) key
+        // arrives; that key then becomes bulk_load_left_key_. If the input ends
+        // immediately afterward (N * T + 1 keys), no following batch installs
+        // it in the wormhole. Without this leaf, queries pair the preceding
+        // store with the +infinity sentinel and recompute different
+        // shared/implicit fields, making every infix in that store a false
+        // negative.
+        //
+        // Not reachable today (nothing bulk-loads this Diva; it is built by
+        // incremental inserts), but measured in the global_slab copy used for
+        // the SST filter: 1024 false negatives for a 65537-key filter whose
+        // keys share a prefix.
+        if (tree_key_absent(bulk_load_left_key_.str, bulk_load_left_key_.length)) {
+            if constexpr (payload_type == PayloadType::FixedLength)
+                AddTreeKey(bulk_load_left_key_.str, bulk_load_left_key_.length,
+                           bulk_load_left_payload_);
+            else
+                AddTreeKey(bulk_load_left_key_.str, bulk_load_left_key_.length);
+        }
+    } else if (bulk_load_streaming_ind_ > 0) {
         InfiniteByteString bulk_load_right_key {bulk_load_key_list_[bulk_load_streaming_ind_ - 1].str,
                                                 bulk_load_key_list_[bulk_load_streaming_ind_ - 1].length};
         bulk_load_key_list_[bulk_load_streaming_ind_ - 1] = {};
