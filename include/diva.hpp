@@ -137,15 +137,29 @@ public:
     // `target_raw_file_number` is the absolute file number of the entry
     // we're matching against (`target_payload`); Diva uses it to FOR-patch
     // the target's FOR field before byte-comparing on-disk entries.
+    // An entry a delete walk offered to its predicate, or the target
+    // InsertAfterPayload chose: its slot value (0 for a trie sample payload),
+    // how many key bits its store's window consumes before the slot's
+    // explicit bits, and whether copies of it may lie beyond its run to the
+    // left / right (see ComputeEntryHint).
+    struct EntryHint {
+        uint64_t slot = 0;
+        uint32_t window_bits = 0;
+        bool walk_left = false, walk_right = false;
+    };
+
+    // `hint`, when non-null, receives the target entry's EntryHint.
     bool InsertAfterPayload(std::string_view key, const void *new_payload,
                             const void *target_payload,
                             uint32_t raw_file_number=0,
-                            uint32_t target_raw_file_number=0);
+                            uint32_t target_raw_file_number=0,
+                            EntryHint *hint=nullptr);
     bool InsertAfterPayload(const uint8_t *key, uint32_t key_len,
                             const void *new_payload,
                             const void *target_payload,
                             uint32_t raw_file_number=0,
-                            uint32_t target_raw_file_number=0);
+                            uint32_t target_raw_file_number=0,
+                            EntryHint *hint=nullptr);
     void Delete(uint64_t key, std::function<bool(const uint64_t *)> should_remove=nullptr);
     void Delete(std::string_view input_key, std::function<bool(const uint64_t *)> should_remove=nullptr);
     void Delete(const uint8_t *input_key, const uint32_t input_key_len, std::function<bool(const uint64_t *)> should_remove=nullptr);
@@ -567,6 +581,98 @@ private:
     // must use this rather than file_number_offset_bits_, which is only the
     // NARROW configured width and reads a widened store's FOR field short.
     inline static thread_local uint32_t iterator_current_for_bits_ = 0;
+    // For delete predicates on the calling thread: the key that reached the
+    // store being walked, the store's bounds [lo, hi) (valid only while it is
+    // locked) and window, and the hint for the entry under the predicate. One
+    // struct, so each function resolves the thread-local once.
+    struct CurrentEntryState {
+        EntryHint entry;
+        InfiniteByteString probe_key{}, store_lo{}, store_hi{};
+    };
+    inline static thread_local CurrentEntryState current_entry_{};
+
+    // Leading bits two keys share, each read as zero-padded, up to `limit`.
+    static uint32_t SharedBits(const InfiniteByteString &a,
+                               const InfiniteByteString &b, uint32_t limit) {
+        uint32_t share = 0;
+        for (uint32_t byte = 0; share < limit; byte += sizeof(uint64_t)) {
+            const uint64_t diff = a.WordAt(byte) ^ b.WordAt(byte);
+            if (diff)
+                return share + __builtin_clzll(diff);
+            share += 64;
+        }
+        return share;
+    }
+
+    // Hint for the entry in `slot` (0 for a trie sample payload), reached
+    // through `key` in the store [lo, hi) whose window consumes `window` bits.
+    // Call with the store locked.
+    //
+    // Copies of one payload cover one contiguous interval between them, each
+    // confined to its own run, so an entry with copies beyond its run reaches
+    // that run's edge on their side (a copy a split spread across runs
+    // matches its whole run), or its coverage extends past the store (a split
+    // placed a copy on both sides of a new store bound, each reporting the
+    // whole coverage). The coverage is `key`'s first `window` bits followed by
+    // the slot's explicit bits; it crosses a bound exactly when the bound
+    // carries both. The explicit bits are compared first: for an entry that
+    // was never copied they almost never match, so the prefix is rarely
+    // compared at all.
+    EntryHint ComputeEntryHint(uint64_t slot, uint32_t window,
+                               const InfiniteByteString &key,
+                               const InfiniteByteString &lo,
+                               const InfiniteByteString &hi) const {
+        EntryHint h;
+        h.slot = slot;
+        h.window_bits = window;
+        if (slot == 0)
+            return h;
+        const uint32_t low = lowbit_pos(slot);
+        const uint32_t explicit_len = infix_size_ - low - 1;
+        const uint64_t explicit_bits = slot >> (low + 1);
+        auto crosses = [&](const InfiniteByteString &bound) {
+            return bound.str != nullptr &&
+                   bound.BitsAt(window, explicit_len) == explicit_bits &&
+                   SharedBits(key, bound, window) >= window;
+        };
+        h.walk_left = explicit_bits == 0 || crosses(lo);
+        h.walk_right = explicit_bits == BITMASK(explicit_len) || crosses(hi);
+        return h;
+    }
+
+    // Records the store a delete walk is working in. Call with it locked.
+    static void NoteProbe(const InfiniteByteString &key,
+                          const InfiniteByteString &lo,
+                          const InfiniteByteString &hi,
+                          uint32_t window_bits) {
+        CurrentEntryState &c = current_entry_;
+        c.probe_key = key;
+        c.store_lo = lo;
+        c.store_hi = hi;
+        c.entry.window_bits = window_bits;
+    }
+
+    // Records the entry about to be offered to a delete predicate. Call after
+    // NoteProbe, with the store still locked.
+    void NoteEntry(uint64_t slot) const {
+        CurrentEntryState &c = current_entry_;
+        c.entry = ComputeEntryHint(slot, c.entry.window_bits, c.probe_key,
+                                   c.store_lo, c.store_hi);
+    }
+
+    // While enabled on the calling thread, the bounds [lo, hi) of the store
+    // an iterator fetch last visited. Off by default so ordinary reads pay
+    // only a flag check.
+    inline static thread_local bool track_store_bounds_ = false;
+    inline static thread_local std::string current_store_lo_;
+    inline static thread_local std::string current_store_hi_;
+    static void RecordStoreBounds(const InfiniteByteString &lo,
+                                  const InfiniteByteString &hi) {
+        if (!track_store_bounds_)
+            return;
+        current_store_lo_.assign(reinterpret_cast<const char *>(lo.str), lo.length);
+        current_store_hi_.assign(reinterpret_cast<const char *>(hi.str), hi.length);
+    }
 
     wormhole *wh_;
     wormref *better_tree_;
@@ -597,8 +703,11 @@ private:
                                          const void *new_payload,
                                          const void *target_payload,
                                          uint32_t raw_file_number=0,
-                                         uint32_t target_raw_file_number=0);
+                                         uint32_t target_raw_file_number=0,
+                                         EntryHint *hint=nullptr);
     void DeleteMerge(InfiniteByteString key);
+    uint32_t DedupFoldedCopies(uint64_t *infix_list, uint64_t *payload_list,
+                               uint32_t count, uint32_t payload_bits);
     template <class t_itr>
     void BulkLoadFixedLength(t_itr begin, t_itr end, const uint32_t key_len, const uint64_t **payloads=nullptr);
     template <class t_itr>
@@ -883,6 +992,46 @@ public:
     // file_number.
     static uint32_t GetCurrentIteratorFORBitsPublic() {
         return iterator_current_for_bits_;
+    }
+
+    // Hint for the entry under the current delete predicate on this thread.
+    static EntryHint CurrentEntryHint() { return current_entry_.entry; }
+
+    // Store-bound tracking for the calling thread; see CurrentStoreBounds.
+    static void TrackStoreBounds(bool on) { track_store_bounds_ = on; }
+    static bool TrackingStoreBounds() { return track_store_bounds_; }
+    // Bounds [lo, hi) of the store most recently visited on this thread
+    // while tracking is on. Valid until the next visit.
+    static const std::string &CurrentStoreLo() { return current_store_lo_; }
+    static const std::string &CurrentStoreHi() { return current_store_hi_; }
+
+    // Coverage of an entry from CurrentEntry(), reached through `key` (a key
+    // in the same run): every key whose first `*bits` bits equal `*prefix`,
+    // as the iterator reports coverage. A trie sample payload covers exactly
+    // its key.
+    void EntryCoverage(const uint8_t *key, uint32_t key_len, uint64_t slot,
+                       uint32_t window, std::string *prefix,
+                       uint32_t *bits) const {
+        if (slot == 0) {
+            prefix->assign(reinterpret_cast<const char *>(key), key_len);
+            *bits = 8 * key_len;
+            return;
+        }
+        const uint32_t explicit_len = infix_size_ - lowbit_pos(slot) - 1;
+        *bits = window + explicit_len;
+        // The window's bits are the key's (same run); the explicit bits are
+        // the slot's, most significant first, above its terminator.
+        prefix->assign((*bits + 7) / 8, '\0');
+        for (uint32_t i = 0; i < *bits; i++) {
+            bool bit;
+            if (i < window) {
+                bit = i / 8 < key_len && ((key[i / 8] >> (7 - i % 8)) & 1);
+            } else {
+                bit = (slot >> (infix_size_ - 1 - (i - window))) & 1;
+            }
+            if (bit)
+                (*prefix)[i / 8] |= static_cast<char>(1 << (7 - i % 8));
+        }
     }
 
     Iterator GetIterator(std::string_view start="", std::string_view end="",
@@ -1522,18 +1671,20 @@ inline void Diva<int_optimized, payload_type>::Insert(const uint8_t *key, const 
 template <bool int_optimized, PayloadType payload_type>
 inline bool Diva<int_optimized, payload_type>::InsertAfterPayload(
         std::string_view key, const void *new_payload, const void *target_payload,
-        uint32_t raw_file_number, uint32_t target_raw_file_number) {
+        uint32_t raw_file_number, uint32_t target_raw_file_number,
+        EntryHint *hint) {
     return InsertAfterPayload(reinterpret_cast<const uint8_t *>(key.data()),
                               static_cast<uint32_t>(key.size()), new_payload,
                               target_payload, raw_file_number,
-                              target_raw_file_number);
+                              target_raw_file_number, hint);
 }
 
 template <bool int_optimized, PayloadType payload_type>
 inline bool Diva<int_optimized, payload_type>::InsertAfterPayload(
         const uint8_t *key, uint32_t key_len,
         const void *new_payload, const void *target_payload,
-        uint32_t raw_file_number, uint32_t target_raw_file_number) {
+        uint32_t raw_file_number, uint32_t target_raw_file_number,
+        EntryHint *hint) {
     if constexpr (payload_type != PayloadType::FixedLength) {
         // Only fixed-length-payload mode has a meaningful payload to compare.
         return false;
@@ -1567,9 +1718,13 @@ inline bool Diva<int_optimized, payload_type>::InsertAfterPayload(
         return InsertAfterPayloadInInfixStore(infix_store, prev_key, next_key,
                                               converted_key, new_payload,
                                               target_payload, raw_file_number,
-                                              target_raw_file_number);
+                                              target_raw_file_number, hint);
     }
 
+    // The target is a trie sample payload, which is stored exactly and never
+    // copied: nothing for the caller to follow.
+    if (hint != nullptr)
+        *hint = EntryHint{};
     // Trie-sample case: find the position of the existing payload that
     // matches `target_payload` byte-for-byte over the lower the store's payload width
     // bits, then insert `new_payload` immediately after it.
@@ -1659,6 +1814,11 @@ inline bool Diva<int_optimized, payload_type>::InsertAfterPayload(
 
     infix_store.num_sample_payloads++;
     infix_store.ptr[1] = reinterpret_cast<uint64_t>(payload_list);
+    // Count the new entry, as the infix-store branch does. Without this every
+    // relocation into a trie sample's list went uncounted while its later
+    // removal was subtracted, and n_keys_ drifted to 0 with entries present.
+    n_keys_.fetch_add(1, std::memory_order_release);
+    infix_store.SetDirty();
     rwlock_unlock_write(infix_store.rwlock);
     return true;
 }
@@ -1671,7 +1831,8 @@ inline bool Diva<int_optimized, payload_type>::InsertAfterPayloadInInfixStore(
         const InfiniteByteString &key,
         const void *new_payload, const void *target_payload,
         uint32_t raw_file_number,
-        uint32_t target_raw_file_number) {
+        uint32_t target_raw_file_number,
+        EntryHint *hint) {
     if constexpr (payload_type != PayloadType::FixedLength) {
         rwlock_unlock_write(infix_store.rwlock);
         return false;
@@ -1761,13 +1922,26 @@ inline bool Diva<int_optimized, payload_type>::InsertAfterPayloadInInfixStore(
     const uint64_t target_word =
         *reinterpret_cast<const uint64_t *>(target_payload) & payload_eq_mask;
 
+    // Prefer the copy of the target that covers `key`. A run can hold more
+    // than one copy of the same payload, each covering a different part of it
+    // (copies a merge brought together). The new entry takes the target's
+    // slot value, so taking a copy that does not cover `key` would leave the
+    // relocated version invisible to `key` once the target is retired. Fall
+    // back to the first payload match if none covers it.
+    const uint64_t key_explicit = insertee & BITMASK(infix_size_);
     int32_t target_pos = -1;
     for (int32_t pos = run_start; pos <= runend_pos; ++pos) {
         GetPayload(infix_store, pos, probe_buf, 0);
-        if (((probe_buf[0] ^ target_word) & payload_eq_mask) == 0) {
+        if (((probe_buf[0] ^ target_word) & payload_eq_mask) != 0)
+            continue;
+        const uint64_t value = GetSlot(infix_store, pos);
+        const uint64_t mask = ((value & -value) << 1) - 1;
+        if ((value | mask) == (key_explicit | mask)) {
             target_pos = pos;
             break;
         }
+        if (target_pos < 0)
+            target_pos = pos;
     }
     if (target_pos < 0) {
         rwlock_unlock_write(infix_store.rwlock);
@@ -1782,6 +1956,14 @@ inline bool Diva<int_optimized, payload_type>::InsertAfterPayloadInInfixStore(
     // — both stay clustered at target's sort position. The bits we'd
     // "refresh" by using fresh K bits aren't needed; reader resolves
     // by full-key disk check.
+    // Tell the caller whether the target may have copies beyond this run,
+    // computed while the store is locked and its bounds are valid. GC
+    // relocation uses it to place the new entry after every copy of the
+    // target, and skips that work entirely when the hint says there are none.
+    if (hint != nullptr)
+        *hint = ComputeEntryHint(GetSlot(infix_store, target_pos),
+                                 shared + ignore + implicit_size, key,
+                                 prev_key, next_key);
     const int32_t r = target_pos + 1;
     const int32_t next_empty = FindEmptySlotAfter(infix_store, mapped_pos);
     const uint64_t explicit_part = GetSlot(infix_store, target_pos);
@@ -3396,6 +3578,71 @@ inline bool Diva<int_optimized, payload_type>::CompareInfixes(uint64_t a, uint64
 }
 
 
+// Removes later copies of a payload within one run of a merged infix list,
+// keeping the first. Returns how many entries were removed. When a removed
+// copy covers a different part of the run than the kept one, the kept entry
+// is widened to the smallest aligned block covering both -- only if that
+// leaves its start in place, so the list stays sorted; otherwise the copy is
+// kept rather than risk a false negative or a reordering.
+template <bool int_optimized, PayloadType payload_type>
+inline uint32_t Diva<int_optimized, payload_type>::DedupFoldedCopies(
+        uint64_t *infix_list, uint64_t *payload_list, uint32_t count,
+        uint32_t payload_bits) {
+    if (count < 2)
+        return 0;
+    const uint64_t explicit_mask = BITMASK(infix_size_);
+    auto block_mask = [](uint64_t e) { return ((e & -e) << 1) - 1; };
+    // (implicit part, payload word) -> output index of the kept copy. The
+    // payload fits one word in this mode (asserted by the BlobFilter layer).
+    std::vector<std::pair<std::pair<uint64_t, uint64_t>, uint32_t>> kept;
+    uint32_t out = 0;
+    uint64_t run_implicit = infix_list[0] >> infix_size_;
+    for (uint32_t i = 0; i < count; i++) {
+        const uint64_t v = infix_list[i];
+        const uint64_t implicit = v >> infix_size_;
+        if (implicit != run_implicit) {
+            run_implicit = implicit;
+            kept.clear();
+        }
+        uint64_t word = 0;
+        copy_bitmap_to_bitmap(payload_list, i * payload_bits, &word, 0,
+                              payload_bits);
+        bool drop = false;
+        for (auto &[id, at] : kept) {
+            if (id.first != implicit || id.second != word)
+                continue;
+            const uint64_t ek = infix_list[at] & explicit_mask;
+            const uint64_t ev = v & explicit_mask;
+            if (ek == ev) {
+                drop = true;
+            } else {
+                const uint64_t mk = block_mask(ek), mv = block_mask(ev);
+                const uint64_t diff = ((ek & ~mk) ^ (ev & ~mv)) | mk | mv;
+                const uint32_t top = 63 - __builtin_clzll(diff);
+                if (top + 1 <= infix_size_) {
+                    const uint64_t m = (top + 1 == 64) ? ~0ULL : ((1ULL << (top + 1)) - 1);
+                    const uint64_t widened = (ek & ~m) | ((m + 1) >> 1);
+                    if ((widened & ~m) == (ek & ~mk)) {
+                        infix_list[at] = (implicit << infix_size_) | widened;
+                        drop = true;
+                    }
+                }
+            }
+            break;
+        }
+        if (drop)
+            continue;
+        if (out != i) {
+            infix_list[out] = v;
+            copy_bitmap_to_bitmap(payload_list, i * payload_bits, payload_list,
+                                  out * payload_bits, payload_bits);
+        }
+        kept.push_back({{implicit, word}, out});
+        out++;
+    }
+    return count - out;
+}
+
 template <bool int_optimized, PayloadType payload_type>
 inline void Diva<int_optimized, payload_type>::DeleteMerge(InfiniteByteString key) {
     const bool it_write_lock = true;
@@ -3638,6 +3885,30 @@ inline void Diva<int_optimized, payload_type>::DeleteMerge(InfiniteByteString ke
                     delete[] tmp;
             }
         }
+    }
+
+    // Drop the copies the fold brings back together. A split writes an entry
+    // that ran out of bits into every run it may belong to; merging those
+    // runs puts the copies side by side in one run, run by run. Left alone,
+    // a copy that came from a run after the key's own lands after the key's
+    // newer entries, and the newest-first reader returns the old version.
+    //
+    // Keep the FIRST copy of each payload within a run. Newer versions of the
+    // key were filed in the key's own run, after the copy there; the first
+    // copy comes from that run or an earlier one, so it stays ahead of them.
+    // (Coverage is nested oldest-widest: an entry never gains bits, and a
+    // newer one is stored with at least as many, so no newer version's copy
+    // can start before an older one's.)
+    //
+    // Payloads compare raw: both halves were rebased onto the merged
+    // reference above, so equal bits mean the same record.
+    if constexpr (payload_type == PayloadType::FixedLength) {
+        const uint32_t removed = DedupFoldedCopies(
+            infix_list, payload_list, static_cast<uint32_t>(total_elem_count),
+            StorePayloadSize(*store_l));
+        total_elem_count -= removed;
+        if (removed > 0)
+            n_keys_.fetch_sub(removed, std::memory_order_release);
     }
 
 #ifdef DEBUG
@@ -5360,6 +5631,12 @@ Diva<int_optimized, payload_type>::DeleteRawRangeFromInfixStore(InfixStore &stor
             if (should_remove && remove) {
                 uint64_t payload[(StorePayloadSize(store) + 63) / 64 + 1];
                 GetPayload(store, current_pos, payload);
+                // Publish this entry's hint (slot, window, and whether copies
+                // of it may lie beyond this run) for the predicate: a caller
+                // that removes it reads CurrentEntryHint() from inside the
+                // predicate and then removes the copies too. The store is
+                // locked here, so the bounds NoteProbe recorded are valid.
+                NoteEntry(current_slot);
                 remove &= should_remove(payload);
             }
         }
@@ -7007,6 +7284,7 @@ IteratorRefetchLowerUpperBounds:
         filter_->UnlockLeaves(leaves_to_unlock, it_write_lock);
         goto IteratorRefetchLowerUpperBounds;
     }
+    RecordStoreBounds(prev_key, next_key);
 
     uint64_t prev_key_word, next_key_word;
     if constexpr (int_optimized) {
@@ -7244,6 +7522,9 @@ inline void Diva<int_optimized, payload_type>::Iterator::FetchDelete() {
             uint64_t payload[(filter_->payload_size_wide_ + 63) / 64 + 1];
             for (int32_t i = infix_store.num_sample_payloads - 1; i >= 0; i--) {
                 filter_->GetSamplePayload(infix_store, i, payload);
+                // A trie sample payload is stored exactly, never copied: its
+                // hint says there is nothing further to remove.
+                filter_->NoteEntry(0);
                 if (should_remove_(payload))
                     filter_->RemoveSamplePayload(infix_store, i);
             }
@@ -7293,6 +7574,11 @@ inline void Diva<int_optimized, payload_type>::Iterator::FetchDelete() {
     ignore_ = ignore;
     implicit_ = implicit_size;
 
+    // Record the store this walk is in (its bounds and window) and the key
+    // that reached it, so NoteEntry can compute each offered entry's hint.
+    // The bounds point into the trie; they stay valid while the store is
+    // locked, which covers every predicate call below.
+    NoteProbe(next_to_fetch_, prev_key, next_key, shared + ignore + implicit_size);
     const auto [new_implicit, deleted_count] = filter_->DeleteRawRangeFromInfixStore(infix_store,
                                                                                      extraction_l,
                                                                                      extraction_r,
