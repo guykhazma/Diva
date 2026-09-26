@@ -3637,11 +3637,20 @@ wormhole_iter_seek_pred_strict(struct wormhole_iter * const iter, const struct k
   //wormhole_iter_fix(iter, write, true);
 }
 
+// The whsafe iterator calls park the ref before returning, as whsafe_put,
+// whsafe_del and whsafe_get do. Between calls the iterator's leaf is kept
+// alive by its leaf lock (a merge must write-lock both leaves before freeing
+// one), and moving to the next leaf is lock-coupled, so the ref only needs
+// to be active while a call looks leaves up in the hash map. A ref left
+// active between calls would make every split and merge wait in qsbr_wait
+// until this thread next touched the tree; a thread that is blocked on
+// something the writer holds would never do so.
   void
 whsafe_iter_seek(struct wormhole_iter * const iter, const struct kref * const key, bool write)
 {
   wormhole_resume(iter->ref);
   wormhole_iter_seek(iter, key, write);
+  wormhole_park(iter->ref);
 }
 
   void
@@ -3649,6 +3658,7 @@ whsafe_iter_seek_pred(struct wormhole_iter * const iter, const struct kref * con
 {
   wormhole_resume(iter->ref);
   wormhole_iter_seek_pred(iter, key, write);
+  wormhole_park(iter->ref);
 }
 
   void
@@ -3656,6 +3666,40 @@ whsafe_iter_seek_pred_strict(struct wormhole_iter * const iter, const struct kre
 {
   wormhole_resume(iter->ref);
   wormhole_iter_seek_pred_strict(iter, key, write);
+  wormhole_park(iter->ref);
+}
+
+// wormleaf_lock_read/write park the ref while they block and resume it
+// afterwards, so a skip that had to wait returns with the ref active. Park it
+// again.
+  void
+whsafe_iter_skip1(struct wormhole_iter * const iter, bool write, bool unlock)
+{
+  wormhole_iter_skip1(iter, write, unlock);
+  wormhole_park(iter->ref);
+}
+
+  void
+whsafe_iter_skip(struct wormhole_iter * const iter, const u32 nr, bool write)
+{
+  wormhole_iter_skip(iter, nr, write);
+  wormhole_park(iter->ref);
+}
+
+  bool
+whsafe_iter_skip1_rev(struct wormhole_iter * const iter, bool write, bool unlock)
+{
+  const bool r = wormhole_iter_skip1_rev(iter, write, unlock);
+  wormhole_park(iter->ref);
+  return r;
+}
+
+  struct kv *
+whsafe_iter_next(struct wormhole_iter * const iter, struct kv * const out, bool write, bool unlock)
+{
+  struct kv * const ret = wormhole_iter_next(iter, out, write, unlock);
+  wormhole_park(iter->ref);
+  return ret;
 }
 
 
@@ -4081,10 +4125,10 @@ const struct kvmap_api kvmap_api_whsafe = {
   .iter_peek = (void *)wormhole_iter_peek,
   .iter_kref = (void *)wormhole_iter_kref,
   .iter_kvref = (void *)wormhole_iter_kvref,
-  .iter_skip1 = (void *)wormhole_iter_skip1,
-  .iter_skip = (void *)wormhole_iter_skip,
-  .iter_skip1_rev = (void *)wormhole_iter_skip1_rev,
-  .iter_next = (void *)wormhole_iter_next,
+  .iter_skip1 = (void *)whsafe_iter_skip1,
+  .iter_skip = (void *)whsafe_iter_skip,
+  .iter_skip1_rev = (void *)whsafe_iter_skip1_rev,
+  .iter_next = (void *)whsafe_iter_next,
   .iter_inp = (void *)wormhole_iter_inp,
   .iter_park = (void *)whsafe_iter_park,
   .iter_destroy = (void *)whsafe_iter_destroy,

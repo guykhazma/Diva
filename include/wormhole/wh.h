@@ -195,10 +195,20 @@ whsafe_iter_peek(struct wormhole_iter * const iter, struct kv * const out);
 // use wormhole_iter_peek
 // use wormhole_iter_kref
 // use wormhole_iter_kvref
-// use wormhole_iter_skip1
-// use wormhole_iter_skip
-// use wormhole_iter_next
 // use wormhole_iter_inp
+
+// The whsafe skip calls park the ref before returning (see wh.c).
+  extern void
+whsafe_iter_skip1(struct wormhole_iter * const iter, bool write, bool unlock);
+
+  extern void
+whsafe_iter_skip(struct wormhole_iter * const iter, const u32 nr, bool write);
+
+  extern bool
+whsafe_iter_skip1_rev(struct wormhole_iter * const iter, bool write, bool unlock);
+
+  extern struct kv *
+whsafe_iter_next(struct wormhole_iter * const iter, struct kv * const out, bool write, bool unlock);
 
   extern void
 whsafe_iter_park(struct wormhole_iter * const iter, bool write);

@@ -14,6 +14,8 @@
 #include <iostream>
 #include <iterator>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <random>
 #include <string_view>
 #include <tuple>
@@ -26,6 +28,136 @@
 
 
 namespace diva {
+
+// Per-thread wormhole references.
+//
+// Wormhole frees a leaf after a merge, and edits the old hash map after a
+// split or merge, only once qsbr_wait(v) returns, i.e. once every registered
+// ref is parked or has seen version v. That is only a grace period when each
+// thread uses its own ref. With a single ref shared by all threads the
+// writer's own qsbr_update satisfies the wait, and any thread parking the ref
+// marks every thread quiescent. A leaf could then be freed while another
+// thread that had just found it in the old hash map was about to lock it.
+// The leaf lock is the first word of the leaf, the same word the slab free
+// list uses for its next pointer, so that lock corrupted the free list
+// (crash in slab_alloc_safe during a later split). The old hash map could
+// also be edited under a reader (assertion in wormhole_jump_leaf_pred_strict).
+//
+// Each thread gets its own ref, registered once per Diva and cached in a
+// thread-local slot keyed by a Diva id that is never reused. A thread hands
+// its refs back when it exits. Close() unregisters all refs before the
+// wormhole is destroyed. Refs are parked except during a wormhole call (the
+// whsafe_* calls park on return).
+class WormRefs {
+public:
+    explicit WormRefs(wormhole *wh)
+        : id_(next_id_.fetch_add(1, std::memory_order_relaxed)), shared_(std::make_shared<Shared>()) {
+        shared_->wh = wh;
+    }
+
+    ~WormRefs() { Close(); }
+
+    WormRefs(const WormRefs &) = delete;
+    WormRefs &operator=(const WormRefs &) = delete;
+
+    // This thread's ref. The fast path is a one-entry cache of plain
+    // thread-locals (no initialisation guard); thread_slots_ holds every
+    // Diva's ref for this thread and hands them back at thread exit.
+    wormref *Get() const {
+        if (cached_id_ == id_)
+            return cached_ref_;
+        return GetSlow();
+    }
+
+    // Unregisters every ref. Called before the wormhole is destroyed, when no
+    // other thread uses the Diva any more.
+    void Close() {
+        std::lock_guard<std::mutex> lock(shared_->mu);
+        if (shared_->closed)
+            return;
+        shared_->closed = true;
+        for (wormref *ref : shared_->all)
+            wh_unref(ref);
+        shared_->all.clear();
+        shared_->idle.clear();
+    }
+
+private:
+    struct Shared {
+        std::mutex mu;
+        wormhole *wh = nullptr;
+        bool closed = false;
+        std::vector<wormref *> all;   // every registered ref
+        std::vector<wormref *> idle;  // refs of threads that have exited
+    };
+
+    struct Slot {
+        uint64_t id;
+        wormref *ref;
+        std::weak_ptr<Shared> owner;
+    };
+
+    struct ThreadSlots {
+        std::vector<Slot> slots;
+        ~ThreadSlots() {
+            for (Slot &slot : slots) {
+                if (auto owner = slot.owner.lock()) {
+                    std::lock_guard<std::mutex> lock(owner->mu);
+                    if (!owner->closed)
+                        owner->idle.push_back(slot.ref);
+                }
+            }
+        }
+    };
+
+    wormref *GetSlow() const {
+        ThreadSlots &slots = thread_slots_;
+        wormref *ref = nullptr;
+        for (const Slot &slot : slots.slots)
+            if (slot.id == id_)
+                ref = slot.ref;
+        if (ref == nullptr)
+            ref = Register(slots);
+        cached_id_ = id_;
+        cached_ref_ = ref;
+        return ref;
+    }
+
+    wormref *Register(ThreadSlots &slots) const {
+        // Drop the slots of Divas that no longer exist.
+        slots.slots.erase(std::remove_if(slots.slots.begin(), slots.slots.end(),
+                                         [](const Slot &slot) { return slot.owner.expired(); }),
+                          slots.slots.end());
+        wormref *ref = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(shared_->mu);
+            if (!shared_->idle.empty()) {
+                ref = shared_->idle.back();
+                shared_->idle.pop_back();
+            }
+            else {
+                // wh_ref registers the ref with the wormhole's QSBR and parks
+                // it. Registration fails only when the ref's QSBR shard is full.
+                ref = wh_ref(shared_->wh);
+                if (ref == nullptr) {
+                    std::cerr << "diva: cannot register a wormhole ref" << std::endl;
+                    std::abort();
+                }
+                shared_->all.push_back(ref);
+            }
+        }
+        slots.slots.push_back(Slot{id_, ref, shared_});
+        return ref;
+    }
+
+    const uint64_t id_;
+    std::shared_ptr<Shared> shared_;
+    static inline std::atomic<uint64_t> next_id_{1};
+    static inline thread_local ThreadSlots thread_slots_;
+    // Ids start at 1, so 0 never matches.
+    static inline thread_local uint64_t cached_id_ = 0;
+    static inline thread_local wormref *cached_ref_ = nullptr;
+};
 
 static void print_key(const uint8_t *key, const uint32_t key_len, const bool binary=true) {
     for (int32_t i = 0; i < key_len; i++) {
@@ -675,7 +807,10 @@ private:
     }
 
     wormhole *wh_;
-    wormref *better_tree_;
+    // Per-thread wormhole refs; see WormRefs. Use TreeRef() for any wormhole
+    // call.
+    std::unique_ptr<WormRefs> tree_refs_;
+    wormref *TreeRef() const { return tree_refs_->Get(); }
     wormhole_int *wh_int_;
     wormref_int *better_tree_int_;
     std::mt19937 rng_;
@@ -1142,7 +1277,6 @@ inline Diva<int_optimized, payload_type>::Diva(const uint32_t infix_size, const 
                                                const uint32_t file_number_offset_bits,
                                                const uint32_t for_field_bit_pos):
             wh_(nullptr),
-            better_tree_(nullptr),
             wh_int_(nullptr),
             better_tree_int_(nullptr),
             infix_size_(infix_size),
@@ -1165,7 +1299,7 @@ inline Diva<int_optimized, payload_type>::Diva(const uint32_t infix_size, const 
     }
     else {
         wh_ = wh_create();
-        better_tree_ = wh_ref(wh_);
+        tree_refs_ = std::make_unique<WormRefs>(wh_);
     }
     if constexpr (payload_type == PayloadType::FixedLength) {
         payload_size_narrow_ = payload_size;
@@ -1200,7 +1334,6 @@ Diva<int_optimized, payload_type>::Diva(const uint32_t infix_size, const t_itr b
                                         const uint32_t rng_seed, const float load_factor,
                                         const uint32_t payload_size, const uint64_t **payload_list):
         wh_(nullptr),
-        better_tree_(nullptr),
         wh_int_(nullptr),
         better_tree_int_(nullptr),
         infix_size_(infix_size),
@@ -1216,7 +1349,7 @@ Diva<int_optimized, payload_type>::Diva(const uint32_t infix_size, const t_itr b
     }
     else {
         wh_ = wh_create();
-        better_tree_ = wh_ref(wh_);
+        tree_refs_ = std::make_unique<WormRefs>(wh_);
     }
     if constexpr (payload_type == PayloadType::FixedLength) {
         payload_size_narrow_ = payload_size;
@@ -1246,7 +1379,6 @@ Diva<int_optimized, payload_type>::Diva(const uint32_t infix_size, const t_itr b
                                         const uint32_t rng_seed, const float load_factor,
                                         const uint32_t payload_size, const uint64_t **payload_list):
         wh_(nullptr),
-        better_tree_(nullptr),
         wh_int_(nullptr),
         better_tree_int_(nullptr),
         infix_size_(infix_size),
@@ -1262,7 +1394,7 @@ Diva<int_optimized, payload_type>::Diva(const uint32_t infix_size, const t_itr b
     }
     else {
         wh_ = wh_create();
-        better_tree_ = wh_ref(wh_);
+        tree_refs_ = std::make_unique<WormRefs>(wh_);
     }
     if constexpr (payload_type == PayloadType::FixedLength) {
         payload_size_narrow_ = payload_size;
@@ -1392,8 +1524,8 @@ GetLowerUpperBoundsRetry:
         }
     }
     else {
-        it.ref = better_tree_;
-        it.map = better_tree_->map;
+        it.ref = TreeRef();
+        it.map = wh_;
         it.leaf = nullptr;
         it.is = 0;
         wh_iter_seek_pred(&it, key.str, key.length, write);
@@ -1507,8 +1639,8 @@ GetLowerMiddleUpperBoundsRetry:
         }
     }
     else {
-        it.ref = better_tree_;
-        it.map = better_tree_->map;
+        it.ref = TreeRef();
+        it.map = wh_;
         it.leaf = nullptr;
         it.is = 0;
         wh_iter_seek_pred_strict(&it, key.str, key.length, write);
@@ -2238,7 +2370,7 @@ inline void Diva<int_optimized, payload_type>::AddTreeKey(const uint8_t *key, co
     if constexpr (int_optimized)
         wh_int_put(better_tree_int_, key, key_len, &infix_store, sizeof(InfixStore), dummy_locked_leaf_addrs);
     else
-        wh_put(better_tree_, key, key_len, &infix_store, sizeof(InfixStore), dummy_locked_leaf_addrs);
+        wh_put(TreeRef(), key, key_len, &infix_store, sizeof(InfixStore), dummy_locked_leaf_addrs);
 }
 
 
@@ -2488,7 +2620,7 @@ inline uint32_t Diva<int_optimized, payload_type>::InsertSplit(const InfiniteByt
     if constexpr (int_optimized)
         wh_int_put(better_tree_int_, key.str, key.length, &store_gt, sizeof(InfixStore), leaves_to_unlock);
     else
-        wh_put(better_tree_, key.str, key.length, &store_gt, sizeof(InfixStore), leaves_to_unlock);
+        wh_put(TreeRef(), key.str, key.length, &store_gt, sizeof(InfixStore), leaves_to_unlock);
 
     UnlockLeaves(leaves_to_unlock, it_write_lock);
     // No memory leaks!
@@ -2770,8 +2902,8 @@ inline void Diva<int_optimized, payload_type>::ShrinkInfixSize(const uint32_t ne
     }
     else {
         wormhole_iter it;
-        it.ref = better_tree_;
-        it.map = better_tree_->map;
+        it.ref = TreeRef();
+        it.map = wh_;
         it.leaf = nullptr;
         it.is = 0;
         wh_iter_seek(&it, nullptr, 0, write);
@@ -2837,8 +2969,8 @@ inline uint64_t Diva<int_optimized, payload_type>::Size() const {
     }
     else {
         wormhole_iter it;
-        it.ref = better_tree_;
-        it.map = better_tree_->map;
+        it.ref = TreeRef();
+        it.map = wh_;
         it.leaf = nullptr;
         it.is = 0;
         for (wh_iter_seek(&it, nullptr, 0, write); wh_iter_valid(&it); wh_iter_skip1(&it, write, unlock)) {
@@ -2902,8 +3034,8 @@ inline uint32_t Diva<int_optimized, payload_type>::Serialize(char *out) const {
     }
     else {
         wormhole_iter it;
-        it.ref = better_tree_;
-        it.map = better_tree_->map;
+        it.ref = TreeRef();
+        it.map = wh_;
         it.leaf = nullptr;
         it.is = 0;
         for (wh_iter_seek(&it, nullptr, 0, write); wh_iter_valid(&it); wh_iter_skip1(&it, write, unlock)) {
@@ -2959,8 +3091,8 @@ inline void Diva<int_optimized, payload_type>::ForEachInfixStoreForCheckpoint(
             wormleaf_int_unlock_read(it_int.leaf);
     } else {
         wormhole_iter it;
-        it.ref = better_tree_;
-        it.map = better_tree_->map;
+        it.ref = TreeRef();
+        it.map = wh_;
         it.leaf = nullptr;
         it.is = 0;
         for (wh_iter_seek(&it, nullptr, 0, write); wh_iter_valid(&it);
@@ -3002,7 +3134,7 @@ inline void Diva<int_optimized, payload_type>::InjectDeserializedInfixStore(
         wh_int_put(better_tree_int_, boundary_key, boundary_key_len, &store,
                    sizeof(InfixStore), dummy_locked_leaf_addrs);
     } else {
-        wh_put(better_tree_, boundary_key, boundary_key_len, &store,
+        wh_put(TreeRef(), boundary_key, boundary_key_len, &store,
                sizeof(InfixStore), dummy_locked_leaf_addrs);
     }
 }
@@ -3140,8 +3272,8 @@ inline Diva<int_optimized, payload_type>::~Diva() {
     }
     else {
         wormhole_iter it;
-        it.ref = better_tree_;
-        it.map = better_tree_->map;
+        it.ref = TreeRef();
+        it.map = wh_;
         it.leaf = nullptr;
         it.is = 0;
         for (wh_iter_seek(&it, nullptr, 0, write); wh_iter_valid(&it); wh_iter_skip1(&it, write, unlock)) {
@@ -3153,6 +3285,7 @@ inline Diva<int_optimized, payload_type>::~Diva() {
         }
         if (it.leaf)
             wormleaf_unlock_write(it.leaf);
+        tree_refs_->Close();
         wh_destroy(wh_);
     }
 }
@@ -3168,7 +3301,7 @@ inline Diva<int_optimized, payload_type>::Diva(const char *deser_buf):
     }
     else {
         wh_ = wh_create();
-        better_tree_ = wh_ref(wh_);
+        tree_refs_ = std::make_unique<WormRefs>(wh_);
     }
     SetupScaleFactors();
 
@@ -3195,7 +3328,7 @@ inline Diva<int_optimized, payload_type>::Diva(const char *deser_buf):
             wh_int_put(better_tree_int_, key, key_length, &store, sizeof(InfixStore), dummy_locked_leaf_addrs);
         }
         else
-            wh_put(better_tree_, key, key_length, &store, sizeof(InfixStore), dummy_locked_leaf_addrs);
+            wh_put(TreeRef(), key, key_length, &store, sizeof(InfixStore), dummy_locked_leaf_addrs);
 
         memcpy(&key_length, deser_buf + ind, sizeof(key_length));
         ind += sizeof(key_length);
@@ -3989,7 +4122,7 @@ inline void Diva<int_optimized, payload_type>::DeleteMerge(InfiniteByteString ke
     if constexpr (int_optimized)
         wh_int_del(better_tree_int_, middle_key.str, middle_key.length, leaves_to_unlock);
     else
-        wh_del(better_tree_, middle_key.str, middle_key.length, leaves_to_unlock);
+        wh_del(TreeRef(), middle_key.str, middle_key.length, leaves_to_unlock);
 
     /*
 #ifdef DEBUG
@@ -4172,7 +4305,7 @@ inline void Diva<int_optimized, payload_type>::BulkLoadFixedLength(const t_itr b
             if constexpr (int_optimized)
                 wh_int_put(better_tree_int_, left_key.str, left_key.length, &store, sizeof(InfixStore), dummy_locked_leaf_addrs);
             else
-                wh_put(better_tree_, left_key.str, left_key.length, &store, sizeof(InfixStore), dummy_locked_leaf_addrs);
+                wh_put(TreeRef(), left_key.str, left_key.length, &store, sizeof(InfixStore), dummy_locked_leaf_addrs);
 
             if constexpr (int_optimized)
                 int_opt_buf[0] = int_opt_buf[1];
@@ -4249,7 +4382,7 @@ inline void Diva<int_optimized, payload_type>::BulkLoadFixedLength(const t_itr b
         if constexpr (int_optimized)
             wh_int_put(better_tree_int_, left_key.str, left_key.length, &store, sizeof(InfixStore), dummy_locked_leaf_addrs);
         else
-            wh_put(better_tree_, left_key.str, left_key.length, &store, sizeof(InfixStore), dummy_locked_leaf_addrs);
+            wh_put(TreeRef(), left_key.str, left_key.length, &store, sizeof(InfixStore), dummy_locked_leaf_addrs);
 
         if constexpr (payload_type == PayloadType::FixedLength)
             AddTreeKey(right_key.str, right_key.length, right_payload);
@@ -4336,7 +4469,7 @@ inline void Diva<int_optimized, payload_type>::BulkLoad(const t_itr begin, const
             if constexpr (int_optimized)
                 wh_int_put(better_tree_int_, left_key.str, left_key.length, &store, sizeof(InfixStore), dummy_locked_leaf_addrs);
             else
-                wh_put(better_tree_, left_key.str, left_key.length, &store, sizeof(InfixStore), dummy_locked_leaf_addrs);
+                wh_put(TreeRef(), left_key.str, left_key.length, &store, sizeof(InfixStore), dummy_locked_leaf_addrs);
 
             /*
 #ifdef DEBUG
@@ -4440,7 +4573,7 @@ inline void Diva<int_optimized, payload_type>::BulkLoad(const t_itr begin, const
         if constexpr (int_optimized)
             wh_int_put(better_tree_int_, left_key.str, left_key.length, &store, sizeof(InfixStore), dummy_locked_leaf_addrs);
         else
-            wh_put(better_tree_, left_key.str, left_key.length, &store, sizeof(InfixStore), dummy_locked_leaf_addrs);
+            wh_put(TreeRef(), left_key.str, left_key.length, &store, sizeof(InfixStore), dummy_locked_leaf_addrs);
 
         if constexpr (payload_type == PayloadType::FixedLength)
             AddTreeKey(right_key.str, right_key.length, right_payload);
@@ -4519,7 +4652,7 @@ inline void Diva<int_optimized, payload_type>::BulkLoadStreaming(const uint8_t *
     if constexpr (int_optimized)
         wh_int_put(better_tree_int_, bulk_load_left_key_.str, bulk_load_left_key_.length, &store, sizeof(InfixStore), dummy_locked_leaf_addrs);
     else
-        wh_put(better_tree_, bulk_load_left_key_.str, bulk_load_left_key_.length, &store, sizeof(InfixStore), dummy_locked_leaf_addrs);
+        wh_put(TreeRef(), bulk_load_left_key_.str, bulk_load_left_key_.length, &store, sizeof(InfixStore), dummy_locked_leaf_addrs);
 
     delete[] bulk_load_left_key_.str;
     bulk_load_left_key_ = bulk_load_right_key;
@@ -4550,7 +4683,7 @@ inline void Diva<int_optimized, payload_type>::BulkLoadStreamingFinish() {
         if constexpr (int_optimized)
             return !wh_int_probe(better_tree_int_, k, len);
         else
-            return !wh_probe(better_tree_, k, len);
+            return !wh_probe(TreeRef(), k, len);
     };
     memset(key_copy, 0x00, bulk_load_streaming_max_len_);
     if (tree_key_absent(key_copy, bulk_load_streaming_max_len_))
@@ -4608,7 +4741,7 @@ inline void Diva<int_optimized, payload_type>::BulkLoadStreamingFinish() {
         if constexpr (int_optimized)
             wh_int_put(better_tree_int_, bulk_load_left_key_.str, bulk_load_left_key_.length, &store, sizeof(InfixStore), dummy_locked_leaf_addrs);
         else
-            wh_put(better_tree_, bulk_load_left_key_.str, bulk_load_left_key_.length, &store, sizeof(InfixStore), dummy_locked_leaf_addrs);
+            wh_put(TreeRef(), bulk_load_left_key_.str, bulk_load_left_key_.length, &store, sizeof(InfixStore), dummy_locked_leaf_addrs);
         uint64_t bulk_load_right_payload_[(payload_size_wide_ + 63) / 64 + 1];
         copy_bitmap_to_bitmap(bulk_load_payload_list_, bulk_load_streaming_ind_ * payload_size_narrow_,
                               bulk_load_right_payload_, 0, payload_size_narrow_);
@@ -4648,7 +4781,6 @@ inline bool Diva<int_optimized, payload_type>::SampleKeysForSharding(
     // forward by stride for each boundary. wh_iter_skip is O(stride) per
     // call; total cost is O(total) — same order as one cleanup walk, run
     // once per cleanup. The wormhole returns keys lexicographically.
-    // `better_tree_` is already a wormref* obtained at Diva construction.
     // Sample boundary keys from the wormhole's existing split keys (each
     // wormhole entry is a Diva split — InsertSplit creates them as Diva
     // fills up an InfixStore). Wormhole entry count = ~NumKeys /
@@ -4657,7 +4789,7 @@ inline bool Diva<int_optimized, payload_type>::SampleKeysForSharding(
     //
     // wh_iter_skip iterates wormhole entries, NOT Diva payloads — the
     // distinction matters: GetNumKeys() returns payload count.
-    wormhole_iter *it = wh_iter_create(better_tree_);
+    wormhole_iter *it = wh_iter_create(TreeRef());
     if (it == nullptr) return false;
     // Pass 1: count wormhole entries. unlock=true so the iterator
     // releases per-leaf locks as it advances; without this Diva's
