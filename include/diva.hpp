@@ -107,10 +107,24 @@ private:
                         owner->idle.push_back(slot.ref);
                 }
             }
+            // The refs are back in the pools, where other threads can take
+            // them. A Diva call later in this thread's teardown (another
+            // thread-local's destructor) must not reuse one; see GetSlow.
+            cached_id_ = 0;
+            cached_ref_ = nullptr;
+            thread_slots_gone_ = true;
         }
     };
 
     wormref *GetSlow() const {
+        if (thread_slots_gone_) {
+            // This thread's slots are destroyed: register a ref of its own,
+            // unregistered by Close() and never pooled.
+            wormref *ref = RegisterNew();
+            cached_id_ = id_;
+            cached_ref_ = ref;
+            return ref;
+        }
         ThreadSlots &slots = thread_slots_;
         wormref *ref = nullptr;
         for (const Slot &slot : slots.slots)
@@ -136,17 +150,28 @@ private:
                 shared_->idle.pop_back();
             }
             else {
-                // wh_ref registers the ref with the wormhole's QSBR and parks
-                // it. Registration fails only when the ref's QSBR shard is full.
-                ref = wh_ref(shared_->wh);
-                if (ref == nullptr) {
-                    std::cerr << "diva: cannot register a wormhole ref" << std::endl;
-                    std::abort();
-                }
-                shared_->all.push_back(ref);
+                ref = RegisterNewLocked();
             }
         }
         slots.slots.push_back(Slot{id_, ref, shared_});
+        return ref;
+    }
+
+    wormref *RegisterNew() const {
+        std::lock_guard<std::mutex> lock(shared_->mu);
+        return RegisterNewLocked();
+    }
+
+    // Caller holds shared_->mu.
+    wormref *RegisterNewLocked() const {
+        // wh_ref registers the ref with the wormhole's QSBR and parks it.
+        // Registration fails only when the ref's QSBR shard is full.
+        wormref *ref = wh_ref(shared_->wh);
+        if (ref == nullptr) {
+            std::cerr << "diva: cannot register a wormhole ref" << std::endl;
+            std::abort();
+        }
+        shared_->all.push_back(ref);
         return ref;
     }
 
@@ -157,6 +182,7 @@ private:
     // Ids start at 1, so 0 never matches.
     static inline thread_local uint64_t cached_id_ = 0;
     static inline thread_local wormref *cached_ref_ = nullptr;
+    static inline thread_local bool thread_slots_gone_ = false;
 };
 
 static void print_key(const uint8_t *key, const uint32_t key_len, const bool binary=true) {
@@ -255,12 +281,11 @@ public:
 
     // InsertAfterPayload: locate an existing entry for `key` whose payload
     // bytes equal `target_payload` (compared over the lower `payload_size_narrow_`
-    // bits) and insert `new_payload` immediately after it in iteration
-    // order. Returns true on success, false if `key` is not present or
-    // `target_payload` is not found.
-    //
-    // Currently only the trie-sample case is implemented (prev_key == key
-    // in the wormhole trie); the infix-store case will follow.
+    // bits) and insert `new_payload` after it in iteration order: right
+    // after it, or with `refresh`, at its sorted position further along the
+    // run. Returns true on success, false if `key` is not present or
+    // `target_payload` is not found. Handles both a trie key's sample
+    // payloads and an infix store's slots.
     //
     // Used by GC to preserve the relative order of versions of the same
     // user_key when a moved version is re-inserted (so the consumer's
@@ -269,8 +294,8 @@ public:
     // `target_raw_file_number` is the absolute file number of the entry
     // we're matching against (`target_payload`); Diva uses it to FOR-patch
     // the target's FOR field before byte-comparing on-disk entries.
-    // An entry a delete walk offered to its predicate, or the target
-    // InsertAfterPayload chose: its slot value (0 for a trie sample payload),
+    // An entry a delete walk offered to its predicate, or the entry
+    // InsertAfterPayload inserted: its slot value (0 for a trie sample payload),
     // how many key bits its store's window consumes before the slot's
     // explicit bits, and whether copies of it may lie beyond its run to the
     // left / right (see ComputeEntryHint).
@@ -280,18 +305,50 @@ public:
         bool walk_left = false, walk_right = false;
     };
 
-    // `hint`, when non-null, receives the target entry's EntryHint.
+    // `hint`, when non-null, receives the new entry's EntryHint.
+    //
+    // `refresh`: give the new entry `key`'s own bits instead of a copy of the
+    // target's slot, which may have lost bits at earlier splits. Only for a
+    // call made with the key the target is known to belong to (GC read the
+    // target's record); never for the copy walk, which passes other keys.
+    // The bits are capped at those of every later entry in the run that
+    // matches `key`, so a newer version never has fewer bits than this one
+    // (merges keep the first copy of each payload and rely on that).
     bool InsertAfterPayload(std::string_view key, const void *new_payload,
                             const void *target_payload,
                             uint32_t raw_file_number=0,
                             uint32_t target_raw_file_number=0,
-                            EntryHint *hint=nullptr);
+                            EntryHint *hint=nullptr, bool refresh=false);
     bool InsertAfterPayload(const uint8_t *key, uint32_t key_len,
                             const void *new_payload,
                             const void *target_payload,
                             uint32_t raw_file_number=0,
                             uint32_t target_raw_file_number=0,
-                            EntryHint *hint=nullptr);
+                            EntryHint *hint=nullptr, bool refresh=false);
+
+    // Test helper: counts adjacent entries out of CompareInfixes order (runs
+    // must be sorted by primary, shorter infix first; inserts, deletes and
+    // merges binary-search on that order). 0 means every run is sorted.
+    uint64_t CountRunOrderViolations() {
+        uint64_t violations = 0;
+        std::vector<uint64_t> list, payloads;
+        ForEachInfixStoreForCheckpoint([&](const uint8_t *, uint32_t,
+                                           InfixStoreCheckpointHandle &h) {
+            InfixStore &store = *h.store_;
+            const uint64_t n = store.GetElemCount();
+            list.assign(n + 1, 0);
+            payloads.assign((n + 2) * ((StorePayloadSize(store) + 63) / 64) + 2, 0);
+            const uint32_t cnt = GetInfixList(store, list.data(), payloads.data());
+            for (uint32_t i = 1; i < cnt; i++)
+                violations += CompareInfixes(list[i], list[i - 1]);
+        });
+        return violations;
+    }
+
+    // Relocations whose entry got bits back (see `refresh`).
+    uint64_t GetRefreshCount() const {
+        return refresh_count_.load(std::memory_order_relaxed);
+    }
     void Delete(uint64_t key, std::function<bool(const uint64_t *)> should_remove=nullptr);
     void Delete(std::string_view input_key, std::function<bool(const uint64_t *)> should_remove=nullptr);
     void Delete(const uint8_t *input_key, const uint32_t input_key_len, std::function<bool(const uint64_t *)> should_remove=nullptr);
@@ -465,6 +522,15 @@ public:
         // the wide width yields the same file_number.
         uint32_t GetFileNumberOffsetBits() const {
             return filter_->file_number_offset_bits_wide_;
+        }
+
+        // Explicit remainder bits of the current entry: infix_size - 1 when
+        // complete, fewer after splits. UINT32_MAX for a trie sample payload,
+        // which is stored exactly.
+        uint32_t GetExplicitBits() const {
+            assert(ind_ < infixes_.size());
+            const uint64_t e = infixes_[ind_] & BITMASK(filter_->infix_size_);
+            return e ? filter_->infix_size_ - lowbit_pos(e) - 1 : UINT32_MAX;
         }
 
     private:
@@ -821,6 +887,7 @@ private:
     uint64_t size_scalars_[size_scalar_count], scaled_sizes_[size_scalar_count], exception_scaled_size_;
     uint64_t implicit_scalars_[infix_store_target_size / 2 + 1];
     std::atomic<uint64_t> n_keys_ = 0;
+    std::atomic<uint64_t> refresh_count_ = 0;
 
     uint32_t bulk_load_streaming_ind_ = 0, bulk_load_streaming_max_len_ = 0;
     InfiniteByteString bulk_load_left_key_, bulk_load_key_list_[infix_store_target_size];
@@ -839,7 +906,8 @@ private:
                                          const void *target_payload,
                                          uint32_t raw_file_number=0,
                                          uint32_t target_raw_file_number=0,
-                                         EntryHint *hint=nullptr);
+                                         EntryHint *hint=nullptr,
+                                         bool refresh=false);
     void DeleteMerge(InfiniteByteString key);
     uint32_t DedupFoldedCopies(uint64_t *infix_list, uint64_t *payload_list,
                                uint32_t count, uint32_t payload_bits);
@@ -1132,7 +1200,7 @@ public:
     // Hint for the entry under the current delete predicate on this thread.
     static EntryHint CurrentEntryHint() { return current_entry_.entry; }
 
-    // Store-bound tracking for the calling thread; see CurrentStoreBounds.
+    // Store-bound tracking for the calling thread; see CurrentStoreLo/Hi.
     static void TrackStoreBounds(bool on) { track_store_bounds_ = on; }
     static bool TrackingStoreBounds() { return track_store_bounds_; }
     // Bounds [lo, hi) of the store most recently visited on this thread
@@ -1804,11 +1872,11 @@ template <bool int_optimized, PayloadType payload_type>
 inline bool Diva<int_optimized, payload_type>::InsertAfterPayload(
         std::string_view key, const void *new_payload, const void *target_payload,
         uint32_t raw_file_number, uint32_t target_raw_file_number,
-        EntryHint *hint) {
+        EntryHint *hint, bool refresh) {
     return InsertAfterPayload(reinterpret_cast<const uint8_t *>(key.data()),
                               static_cast<uint32_t>(key.size()), new_payload,
                               target_payload, raw_file_number,
-                              target_raw_file_number, hint);
+                              target_raw_file_number, hint, refresh);
 }
 
 template <bool int_optimized, PayloadType payload_type>
@@ -1816,7 +1884,7 @@ inline bool Diva<int_optimized, payload_type>::InsertAfterPayload(
         const uint8_t *key, uint32_t key_len,
         const void *new_payload, const void *target_payload,
         uint32_t raw_file_number, uint32_t target_raw_file_number,
-        EntryHint *hint) {
+        EntryHint *hint, bool refresh) {
     if constexpr (payload_type != PayloadType::FixedLength) {
         // Only fixed-length-payload mode has a meaningful payload to compare.
         return false;
@@ -1850,7 +1918,8 @@ inline bool Diva<int_optimized, payload_type>::InsertAfterPayload(
         return InsertAfterPayloadInInfixStore(infix_store, prev_key, next_key,
                                               converted_key, new_payload,
                                               target_payload, raw_file_number,
-                                              target_raw_file_number, hint);
+                                              target_raw_file_number, hint,
+                                              refresh);
     }
 
     // The target is a trie sample payload, which is stored exactly and never
@@ -1964,7 +2033,8 @@ inline bool Diva<int_optimized, payload_type>::InsertAfterPayloadInInfixStore(
         const void *new_payload, const void *target_payload,
         uint32_t raw_file_number,
         uint32_t target_raw_file_number,
-        EntryHint *hint) {
+        EntryHint *hint,
+        bool refresh) {
     if constexpr (payload_type != PayloadType::FixedLength) {
         rwlock_unlock_write(infix_store.rwlock);
         return false;
@@ -2057,9 +2127,10 @@ inline bool Diva<int_optimized, payload_type>::InsertAfterPayloadInInfixStore(
     // Prefer the copy of the target that covers `key`. A run can hold more
     // than one copy of the same payload, each covering a different part of it
     // (copies a merge brought together). The new entry takes the target's
-    // slot value, so taking a copy that does not cover `key` would leave the
-    // relocated version invisible to `key` once the target is retired. Fall
-    // back to the first payload match if none covers it.
+    // slot value (or, with `refresh`, `key`'s own bits, which requires a
+    // target covering `key`), so taking a copy that does not cover `key`
+    // would leave the relocated version invisible to `key` once the target
+    // is retired. Fall back to the first payload match if none covers it.
     const uint64_t key_explicit = insertee & BITMASK(infix_size_);
     int32_t target_pos = -1;
     for (int32_t pos = run_start; pos <= runend_pos; ++pos) {
@@ -2079,26 +2150,58 @@ inline bool Diva<int_optimized, payload_type>::InsertAfterPayloadInInfixStore(
         rwlock_unlock_write(infix_store.rwlock);
         return false;
     }
-    // Insert at slot `target_pos + 1` with a copy of target's slot
-    // value. Using target's encoding (rather than recomputing the
-    // fresh explicit_part for K at the current trie state) preserves
-    // the bucket's primary-sort invariant: the new slot has the same
-    // primary as target and sits adjacent to it. If target has been
-    // shifted by past splits (lb>0), the new slot inherits the same lb
-    // — both stay clustered at target's sort position. The bits we'd
-    // "refresh" by using fresh K bits aren't needed; reader resolves
-    // by full-key disk check.
-    // Tell the caller whether the target may have copies beyond this run,
+    // The new entry's slot value. By default a copy of the target's,
+    // including any bits lost at past splits: it has the target's primary and
+    // goes right after it, which keeps the run sorted. With `refresh` it gets
+    // `key`'s own bits instead, capped as below, and goes to its sorted
+    // position further down.
+    uint64_t explicit_part = GetSlot(infix_store, target_pos);
+    if (refresh) {
+        // Restore bits from `key`, but no more than any later entry in the run
+        // that matches `key` has: a later entry may be a newer version of
+        // `key`, and a newer version must not have fewer bits than this one.
+        // Only when the target covers `key` (the slot is `key`'s; the fallback
+        // target above may not be).
+        const uint64_t target_mask = ((explicit_part & -explicit_part) << 1) - 1;
+        if ((explicit_part | target_mask) == (key_explicit | target_mask)) {
+            uint32_t low = 0;  // lowest length-marker bit allowed; 0 = all bits
+            for (int32_t pos = target_pos + 1; pos <= runend_pos; ++pos) {
+                const uint64_t value = GetSlot(infix_store, pos);
+                const uint64_t mask = ((value & -value) << 1) - 1;
+                if ((value | mask) == (key_explicit | mask))
+                    low = std::max<uint32_t>(low, lowbit_pos(value));
+            }
+            if (low < lowbit_pos(explicit_part)) {
+                explicit_part = (key_explicit & ~BITMASK(low + 1)) | (1ULL << low);
+                refresh_count_.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+    // Tell the caller whether the new entry may need copies beyond this run,
     // computed while the store is locked and its bounds are valid. GC
     // relocation uses it to place the new entry after every copy of the
     // target, and skips that work entirely when the hint says there are none.
+    // It describes the new entry, so a refreshed entry whose coverage no
+    // longer reaches a store bound needs no copies.
     if (hint != nullptr)
-        *hint = ComputeEntryHint(GetSlot(infix_store, target_pos),
+        *hint = ComputeEntryHint(explicit_part,
                                  shared + ignore + implicit_size, key,
                                  prev_key, next_key);
-    const int32_t r = target_pos + 1;
+    // Runs are sorted by primary, shorter infix first (CompareInfixes), and
+    // inserts, deletes and merges binary-search on that order. A copy of the
+    // target's value belongs right after the target. A refreshed value sorts
+    // after the target's (a larger primary, or the same primary with more
+    // bits), so it goes after every entry that sorts below it: those
+    // are other keys' entries (a newer version of `key` has at least as many
+    // bits, so it sorts at or after the new entry), and the new entry stays
+    // before every newer version and after every older one.
+    int32_t r = target_pos + 1;
+    if (explicit_part != GetSlot(infix_store, target_pos)) {
+        while (r <= runend_pos &&
+               CompareInfixes(GetSlot(infix_store, r), explicit_part))
+            ++r;
+    }
     const int32_t next_empty = FindEmptySlotAfter(infix_store, mapped_pos);
-    const uint64_t explicit_part = GetSlot(infix_store, target_pos);
     const bool shift_right =
         (next_empty < static_cast<int32_t>(scaled_sizes_[size_grade]));
 
@@ -2130,6 +2233,8 @@ inline bool Diva<int_optimized, payload_type>::InsertAfterPayloadInInfixStore(
                    reinterpret_cast<const uint64_t *>(new_payload), 0);
     }
     infix_store.UpdateElemCount(1);
+    // See InsertRawIntoInfixStore: the FOR patch does not mark every insert.
+    infix_store.SetDirty();
 
     rwlock_unlock_write(infix_store.rwlock);
     n_keys_.fetch_add(1, std::memory_order_release);
@@ -5263,6 +5368,10 @@ inline void Diva<int_optimized, payload_type>::InsertRawIntoInfixStore(InfixStor
     if constexpr (payload_type == PayloadType::FixedLength) {
         assert(payload != nullptr);
     }
+    // Every insert changes the store, so an incremental checkpoint must write
+    // it again. Marked here rather than left to the FOR patch, whose fast path
+    // (payload offset already right for the store) marks nothing.
+    store.SetDirty();
     uint32_t size_grade = store.GetSizeGrade();
     const uint64_t elem_count = store.GetElemCount();
     if (elem_count >= (size_grade ? scaled_sizes_[size_grade - 1] : exception_scaled_size_)) {
@@ -5328,7 +5437,8 @@ inline void Diva<int_optimized, payload_type>::InsertRawIntoInfixStore(InfixStor
         //   - InsertRaw inserts at this BS position (sort-preserving).
         //   - InsertAfterPayload copies the target slot's value into
         //     the new entry, so the new entry has the SAME primary as
-        //     target → sort preserved at that position.
+        //     target → sort preserved at that position. A refreshed
+        //     entry (more bits) is placed at its sorted position.
         //   - UpdateInfixList stable_sorts by implicit_part (within a
         //     bucket the order from input is preserved).
         int32_t l = std::max(PreviousRunend(store, runend_pos), previous_empty);

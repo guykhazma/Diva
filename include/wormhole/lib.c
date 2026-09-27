@@ -2875,7 +2875,9 @@ strtoks_count(const char * const * const toks)
 // }}} string
 
 // qsbr {{{
-#define QSBR_STATES_NR ((23)) // shard capacity; valid values are 3*8-1 == 23; 5*8-1 == 39; 7*8-1 == 55
+// Diva registers one ref per thread that touches a filter (see diva::WormRefs),
+// so a filter with many client threads needs more than 23 per shard.
+#define QSBR_STATES_NR ((55)) // shard capacity; valid values are 3*8-1 == 23; 5*8-1 == 39; 7*8-1 == 55
 #define QSBR_SHARD_BITS  ((5)) // 2^n shards
 #define QSBR_SHARD_NR    (((1u) << QSBR_SHARD_BITS))
 #define QSBR_SHARD_MASK  ((QSBR_SHARD_NR - 1))
@@ -2910,6 +2912,14 @@ qsbr_create(void)
 {
   struct qsbr * const q = yalloc(sizeof(*q));
   memset(q, 0, sizeof(*q));
+  // Every slot starts out pointing at the always-quiescent target, as an
+  // unregistered slot does. qsbr_register sets a slot's bitmap bit before it
+  // stores the slot's pointer, so a concurrent qsbr_wait can read a slot in
+  // between; with a zero pointer it would dereference null.
+  for (u32 i = 0; i < QSBR_SHARD_NR; i++)
+    for (u32 j = 0; j < QSBR_STATES_NR; j++)
+      atomic_store_explicit(&q->shards[i].ptrs[j], (u64)(&q->target),
+                            MO_RELAXED);
   return q;
 }
 
@@ -3010,7 +3020,12 @@ qsbr_resume(struct qsbr_ref * const qref)
 #ifdef QSBR_DEBUG
   ref->status = 0xf; // resumed
 #endif
-  cpu_cfence();
+  // Full fence, not just a compiler one: the store above must be visible
+  // before this thread loads the hash-map pointer. Otherwise (x86 lets a
+  // load pass an earlier store) a writer's qsbr_wait can still read this
+  // slot as parked, take the thread for quiescent, and edit the old hash map
+  // or free a leaf the thread is about to use.
+  cpu_mfence();
 }
 
 // waiters needs external synchronization
