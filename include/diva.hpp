@@ -16,6 +16,7 @@
 #include <iostream>
 #include <iterator>
 #include <limits>
+#include <mutex>
 #include <numeric>
 #include <random>
 #include <stdexcept>
@@ -272,6 +273,9 @@ public:
     uint64_t GetOwnedInfixStoreBytes() const {
         return owned_infix_store_bytes_.load(std::memory_order_relaxed);
     }
+    uint64_t GetBlockStartOrdinalBytes() const {
+        return block_start_ordinals_.capacity() * sizeof(uint16_t);
+    }
     uint64_t GetInPlaceAdaptationCount() const {
         return in_place_adaptation_count_.load(std::memory_order_relaxed);
     }
@@ -281,6 +285,69 @@ public:
     uint64_t GetAdaptationResizeBytes() const {
         return adaptation_resize_bytes_.load(std::memory_order_relaxed);
     }
+    // Bound live allocation growth caused by adaptive suffix extensions.
+    // The default is unbounded. Same-capacity (in-place) adaptations never
+    // consume the budget. Budget 0 refuses resizes (no persistent growth is
+    // possible). A positive budget that is full first CLOCK-de-adapts cold
+    // stores to free room, then publishes the new resize when it fits—
+    // replacement churn rather than publish-then-immediately-undo.
+    void SetAdaptationMemoryBudgetBytes(uint64_t bytes);
+    uint64_t GetLiveAdaptationBytes() const {
+        return live_adaptation_bytes_.load(std::memory_order_relaxed);
+    }
+    uint64_t GetDeAdaptationCount() const {
+        return de_adaptation_count_.load(std::memory_order_relaxed);
+    }
+    uint64_t GetDeAdaptationBytes() const {
+        return de_adaptation_bytes_.load(std::memory_order_relaxed);
+    }
+    // Test/maintenance hook. Canonicalizes every adapted store without
+    // consulting CLOCK reference bits and returns the number rebuilt.
+    uint64_t DeAdaptAll();
+    struct RankRoute {
+        // Safe starting rank for an arbitrary lower-bound Seek.
+        uint64_t ordinal_lo = 0;
+        // Exclusive end of the sampled-store ambiguity window.
+        uint64_t ordinal_hi = 0;
+        // Exact distinct-key rank for a stored member when GetLongestMatch
+        // stops on that member's terminal. Prefix-key terminals must win over
+        // a later zero-padded child (apple before applet). Queries whose trie
+        // window starts at or past the key end do not publish a candidate;
+        // callers should use ordinal_lo / index fallback.
+        uint64_t candidate_ordinal = 0;
+        bool candidate_valid = false;
+        // Store-local block map for the route rank (candidate if valid,
+        // otherwise ordinal_lo). The caller derives the distinct-key offset
+        // within this block by subtracting block_start_ordinal.
+        uint64_t block_id = 0;
+        uint64_t block_start_ordinal = 0;
+        bool block_route_valid = false;
+        // Last/oldest physical block beginning at candidate_ordinal. Reverse
+        // iteration starts here because RocksDB seeks with sequence zero and
+        // then walks backward toward newer snapshot-visible versions.
+        uint64_t backward_candidate_block_id = 0;
+        bool backward_candidate_block_route_valid = false;
+        // Conservative block containing ordinal_lo. Unlike block_* above,
+        // this route never depends on a filter-positive candidate identity
+        // and is therefore safe as the starting point for an arbitrary
+        // lower-bound Seek.
+        uint64_t lower_bound_block_id = 0;
+        uint64_t lower_bound_block_start_ordinal = 0;
+        bool lower_bound_block_route_valid = false;
+        // Block at or to the right of every possible predecessor in this
+        // store's ambiguity window. Backward seeks start here and retreat.
+        // Unlike the forward route, a repeated start selects its last block.
+        uint64_t upper_bound_block_id = 0;
+        bool upper_bound_block_route_valid = false;
+    };
+    RankRoute GetRankRoute(std::string_view key) const;
+    RankRoute GetRankRoute(const uint8_t *key, uint32_t key_len) const;
+    // After bulk load, stamp each InfixStore with a repeated list of local
+    // (store-relative) distinct ordinals at which data blocks begin. A version
+    // run that spans blocks repeats the same local start so first-equal and
+    // last-equal resolution can pick newest vs oldest physical block.
+    void AttachBlockStartOrdinals(
+        const uint64_t *block_start_ordinals, size_t num_blocks);
     struct InfiniteByteString {
         const uint8_t *str;
         uint32_t length;
@@ -472,12 +539,14 @@ private:
         static const uint32_t size_grade_bit_count = 12;
         static const uint32_t full_slot_count_bit_count = 48;
         // Bits 0..59 are the serialized slot count and size grade. The next
-        // two bits are runtime-only and are masked before serialization.
+        // four bits are runtime-only and are masked before serialization.
         static const uint32_t tree_key_shadowed_bit = 60;
         // The bitmap is always allocated. This monotonic bit keeps the normal
         // untouched query path from reading its extra 128 cache-cold bytes.
         static const uint32_t has_infix_shadows_bit = 61;
-        static const uint32_t runtime_status_bit_count = 2;
+        static const uint32_t adapted_bit = 62;
+        static const uint32_t clock_referenced_bit = 63;
+        static const uint32_t runtime_status_bit_count = 4;
         static_assert(full_slot_count_bit_count + size_grade_bit_count ==
                       tree_key_shadowed_bit);
         static_assert(has_infix_shadows_bit < 64);
@@ -492,10 +561,20 @@ private:
         static constexpr uint32_t ordinal_directory_word_count =
             (ordinal_directory_entry_count * sizeof(uint16_t) +
              sizeof(uint64_t) - 1) / sizeof(uint64_t);
+        static constexpr uint32_t routing_metadata_word_count =
+            diva_type == DivaType::BinaryTrie &&
+                    payload_type == PayloadType::None
+                // global_ordinal_base, blocks_before|carry_in, and the
+                // offset|count of this store's slice in the Diva-wide flat
+                // block-start list. Repeated local ordinals preserve version
+                // runs that span several physical data blocks.
+                ? 3
+                : 0;
         static constexpr uint32_t serialized_logical_metadata_byte_count =
             diva_type == DivaType::BinaryTrie &&
                     payload_type == PayloadType::None
-                ? sizeof(uint16_t) +
+                ? sizeof(uint16_t) + sizeof(uint32_t) + sizeof(uint32_t) +
+                      sizeof(uint32_t) + sizeof(uint32_t) +
                       ordinal_directory_entry_count * sizeof(uint16_t)
                 : 0;
         static constexpr uint32_t shadow_bitmap_word_count =
@@ -509,8 +588,8 @@ private:
         static constexpr uint32_t runtime_metadata_word_count =
             diva_type == DivaType::BinaryTrie &&
                     payload_type == PayloadType::None
-                ? ordinal_directory_word_count + shadow_bitmap_word_count +
-                      admission_bitmap_word_count
+                ? ordinal_directory_word_count + routing_metadata_word_count +
+                      shadow_bitmap_word_count + admission_bitmap_word_count
                 : 0;
 
         uint64_t status = 0;
@@ -567,7 +646,8 @@ private:
         }
 
         uint64_t GetFullSlotCount() const {
-            return status & BITMASK(full_slot_count_bit_count);
+            return __atomic_load_n(&status, __ATOMIC_RELAXED) &
+                   BITMASK(full_slot_count_bit_count);
         }
 
         void SetFullSlotCount(const int64_t elem_count) {
@@ -582,7 +662,8 @@ private:
         }
 
         uint32_t GetSizeGrade() const {
-            return (status >> full_slot_count_bit_count) & BITMASK(size_grade_bit_count);
+            return (__atomic_load_n(&status, __ATOMIC_RELAXED) >>
+                    full_slot_count_bit_count) & BITMASK(size_grade_bit_count);
         }
 
         void SetSizeGrade(const uint64_t size_grade) {
@@ -592,11 +673,13 @@ private:
 
 
         bool TreeKeyIsShadowed() const {
-            return (status & (uint64_t{1} << tree_key_shadowed_bit)) != 0;
+            return (__atomic_load_n(&status, __ATOMIC_RELAXED) &
+                    (uint64_t{1} << tree_key_shadowed_bit)) != 0;
         }
 
         bool HasInfixShadows() const {
-            return (status & (uint64_t{1} << has_infix_shadows_bit)) != 0;
+            return (__atomic_load_n(&status, __ATOMIC_RELAXED) &
+                    (uint64_t{1} << has_infix_shadows_bit)) != 0;
         }
 
         void SetTreeKeyShadowed() {
@@ -605,6 +688,30 @@ private:
 
         void SetHasInfixShadows() {
             status |= uint64_t{1} << has_infix_shadows_bit;
+        }
+
+        bool IsAdapted() const {
+            return (__atomic_load_n(&status, __ATOMIC_RELAXED) &
+                    (uint64_t{1} << adapted_bit)) != 0;
+        }
+
+        bool IsClockReferenced() const {
+            return (__atomic_load_n(&status, __ATOMIC_RELAXED) &
+                    (uint64_t{1} << clock_referenced_bit)) != 0;
+        }
+
+        void MarkAdaptedAndReferenced() {
+            status |= (uint64_t{1} << adapted_bit) |
+                      (uint64_t{1} << clock_referenced_bit);
+        }
+
+        void ClearClockReferenced() {
+            status &= ~(uint64_t{1} << clock_referenced_bit);
+        }
+
+        void ClearAdaptedAndReferenced() {
+            status &= ~((uint64_t{1} << adapted_bit) |
+                        (uint64_t{1} << clock_referenced_bit));
         }
 
     };
@@ -812,6 +919,24 @@ private:
     std::atomic<uint64_t> in_place_adaptation_count_ = 0;
     std::atomic<uint64_t> resize_adaptation_count_ = 0;
     std::atomic<uint64_t> adaptation_resize_bytes_ = 0;
+    std::atomic<uint64_t> live_adaptation_bytes_ = 0;
+    std::atomic<uint64_t> de_adaptation_count_ = 0;
+    std::atomic<uint64_t> de_adaptation_bytes_ = 0;
+    std::atomic<uint64_t> adaptation_memory_budget_bytes_ =
+        std::numeric_limits<uint64_t>::max();
+    // Concatenated store-local block-start ordinals. Repetitions preserve
+    // physical block multiplicity when several blocks start at the same
+    // distinct user-key ordinal (a split version run).
+    std::vector<uint16_t> block_start_ordinals_;
+    struct AdaptedStoreClockEntry {
+        InfixStore *store = nullptr;
+        uint32_t total_implicit = 0;
+        uint64_t extra_bytes = 0;
+    };
+    std::mutex adapted_store_clock_mutex_;
+    std::mutex adapted_store_sweep_mutex_;
+    std::vector<AdaptedStoreClockEntry> adapted_store_clock_;
+    size_t adapted_store_clock_hand_ = 0;
     uint32_t bulk_load_streaming_ind_, bulk_load_streaming_max_len_;
     InfiniteByteString bulk_load_left_key_, bulk_load_key_list_[infix_store_target_size];
     uint64_t *bulk_load_left_payload_ = nullptr, *bulk_load_payload_list_ = nullptr;
@@ -820,7 +945,10 @@ private:
     // payloads still alias the serialized buffer.
     bool deserialized_ = false;
 
-    void AddTreeKey(const uint8_t *key, const uint32_t key_len, const uint64_t *payload=nullptr);
+    void AddTreeKey(
+        const uint8_t *key, const uint32_t key_len,
+        const uint64_t *payload=nullptr,
+        uint32_t global_ordinal_base=std::numeric_limits<uint32_t>::max());
     void InsertSimple(const InfiniteByteString key, const void *payload=nullptr);
     uint32_t InsertSplit(const InfiniteByteString key, const void *payload=nullptr);
     void DeleteMerge(InfiniteByteString key);
@@ -970,6 +1098,22 @@ private:
     const uint64_t *GetInfixShadowBitmap(const InfixStore &store) const;
     uint64_t *GetAdmissionBitmap(InfixStore &store) const;
     const uint64_t *GetAdmissionBitmap(const InfixStore &store) const;
+    uint32_t GetGlobalOrdinalBase(const InfixStore &store) const;
+    void SetGlobalOrdinalBase(InfixStore &store, uint32_t ordinal) const;
+    uint64_t *GetRoutingMetadataWords(InfixStore &store) const;
+    const uint64_t *GetRoutingMetadataWords(const InfixStore &store) const;
+    const uint16_t *GetBlockStartOrdinals(const InfixStore &store) const;
+    uint32_t GetBlockStartOrdinalCount(const InfixStore &store) const;
+    void SetBlockStartOrdinalRange(InfixStore &store, uint32_t offset,
+                                   uint32_t count) const;
+    uint32_t GetBlocksBeforeStore(const InfixStore &store) const;
+    uint32_t GetCarryInKeysBeforeBase(const InfixStore &store) const;
+    void SetBlockRoutingHeader(InfixStore &store, uint32_t blocks_before,
+                               uint32_t carry_in_keys_before_base) const;
+    void ResolveBlockRoute(const InfixStore &store, uint32_t base,
+                           uint64_t candidate_ordinal,
+                           RankRoute *route,
+                           bool prefer_last_equal = false) const;
     LogicalGroupInfo ReadLogicalGroupInfo(const InfixStore &store,
                                           uint32_t group_slot,
                                           uint32_t runend_pos) const;
@@ -982,6 +1126,29 @@ private:
     bool SetInfixShadowed(InfixStore &store,
                           uint32_t logical_ordinal) const;
     bool HasVisibleInfix(const InfixStore &store) const;
+    void ReferenceAdaptedStore(InfixStore &store) const;
+    void RegisterAdaptedStore(InfixStore &store, uint32_t total_implicit,
+                              uint64_t added_bytes);
+    // True when added_bytes can be charged to live adaptation growth under the
+    // current budget. Unbounded budgets always fit.
+    bool AdaptationResizeFitsBudget(uint64_t added_bytes) const;
+    bool AdaptationBudgetIsZero() const {
+        return adaptation_memory_budget_bytes_.load(
+                   std::memory_order_relaxed) == 0;
+    }
+    bool CanonicalizeAdaptedStore(InfixStore &store,
+                                  uint32_t total_implicit,
+                                  bool honor_reference_bit);
+    // CLOCK-reclaim until live_adaptation_bytes_ <= max_live_bytes. Skips
+    // except_store so a caller holding that store's write lock can free other
+    // victims without self-deadlock. nullptr except reclaims any victim.
+    void ReclaimAdaptationBytesUntil(uint64_t max_live_bytes,
+                                     InfixStore *except_store);
+    void EnforceAdaptationMemoryBudget();
+    // Free cold adapted growth until added_bytes fits (or no victim remains).
+    // Must not be called while holding except_store's write lock.
+    void MakeAdaptationBudgetRoom(uint64_t added_bytes,
+                                  InfixStore *except_store);
     // Assumes that `key` is a full length infix.
     void DeleteRawFromInfixStore(InfixStore &store, const uint64_t key,
                                  const uint32_t total_implicit=infix_store_target_size,
@@ -1074,7 +1241,7 @@ private:
     uint32_t SerializeMetadata(char *out) const;
     uint64_t SerializeInfixStore(char *out, const InfixStore& store) const;
     uint32_t DeserializeMetadata(const char *deser_buf);
-    uint32_t DeserializeInfixStore(const char *deser_buf, InfixStore& store) const;
+    uint32_t DeserializeInfixStore(const char *deser_buf, InfixStore& store);
 
 public:
     Iterator GetIterator(std::string_view start="", std::string_view end="",
@@ -1818,6 +1985,8 @@ inline bool Diva<diva_type, payload_type>::RangeQueryImpl(
         }
     }
 
+    ReferenceAdaptedStore(infix_store);
+
     auto [shared, ignore, implicit_size] = GetSharedIgnoreImplicitLengths(prev_key, next_key);
     // To query the binary tries
     const uint32_t key_start_bit = shared + ignore + implicit_size;
@@ -1996,6 +2165,8 @@ inline bool Diva<diva_type, payload_type>::PointQueryImpl(
         return false;
     }
 
+    ReferenceAdaptedStore(infix_store);
+
     auto [shared, ignore, implicit_size] = GetSharedIgnoreImplicitLengths(prev_key, next_key);
     // To query the binary tries
     const uint32_t key_start_bit = shared + ignore + implicit_size;
@@ -2018,6 +2189,136 @@ inline bool Diva<diva_type, payload_type>::PointQueryImpl(
 
     rwlock_unlock_read(infix_store.rwlock);
     return res;
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline typename Diva<diva_type, payload_type>::RankRoute
+Diva<diva_type, payload_type>::GetRankRoute(std::string_view key) const {
+    return GetRankRoute(reinterpret_cast<const uint8_t *>(key.data()),
+                        static_cast<uint32_t>(key.size()));
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline typename Diva<diva_type, payload_type>::RankRoute
+Diva<diva_type, payload_type>::GetRankRoute(
+        const uint8_t *input_key, const uint32_t key_len) const {
+    RankRoute route;
+    route.ordinal_hi = n_keys_.load(std::memory_order_acquire);
+    if constexpr (diva_type != DivaType::BinaryTrie ||
+                  payload_type != PayloadType::None) {
+        return route;
+    }
+    if (input_key == nullptr || key_len == 0)
+        return route;
+
+    const InfiniteByteString key{input_key, key_len};
+    InfixStore *store_ptr = nullptr;
+    void *leaves_to_unlock[3] = {};
+    InfiniteByteString prev_key;
+    InfiniteByteString next_key;
+    wormhole_iter it;
+    wormhole_int_iter it_int;
+    GetLowerUpperBounds(key, /*write=*/false, leaves_to_unlock, it, it_int,
+                        prev_key, next_key, store_ptr);
+    if (store_ptr == nullptr) {
+        UnlockLeaves(leaves_to_unlock, /*write=*/false);
+        return route;
+    }
+
+    InfixStore& store = *store_ptr;
+    rwlock_lock_read(store.rwlock);
+    UnlockLeaves(leaves_to_unlock, /*write=*/false);
+    const uint32_t base = GetGlobalOrdinalBase(store);
+    if (base == std::numeric_limits<uint32_t>::max()) {
+        // Only the synthetic lower sentinel owns a store without a real
+        // ordinal base. A query in that store precedes the first real sampled
+        // tree key, so rank zero is the only safe lower-bound route. Queries
+        // beyond the final real key remain owned by that final key's store.
+        route.ordinal_lo = 0;
+        route.ordinal_hi = 0;
+        rwlock_unlock_read(store.rwlock);
+        return route;
+    }
+
+    route.ordinal_lo = base;
+    route.ordinal_hi = std::min<uint64_t>(
+        route.ordinal_hi,
+        static_cast<uint64_t>(base) + 1 + store.logical_infix_count);
+    ResolveBlockRoute(store, base, route.ordinal_lo, &route);
+    if (route.block_route_valid) {
+        route.lower_bound_block_id = route.block_id;
+        route.lower_bound_block_start_ordinal = route.block_start_ordinal;
+        route.lower_bound_block_route_valid = true;
+    }
+    if (route.ordinal_hi > base) {
+        RankRoute upper;
+        ResolveBlockRoute(store, base, route.ordinal_hi - 1, &upper,
+                          /*prefer_last_equal=*/true);
+        if (upper.block_route_valid) {
+            route.upper_bound_block_id = upper.block_id;
+            route.upper_bound_block_route_valid = true;
+        }
+    }
+    const auto set_backward_candidate_route = [&]() {
+        RankRoute backward;
+        ResolveBlockRoute(store, base, route.candidate_ordinal, &backward,
+                          /*prefer_last_equal=*/true);
+        if (backward.block_route_valid) {
+            route.backward_candidate_block_id = backward.block_id;
+            route.backward_candidate_block_route_valid = true;
+        }
+    };
+    if (prev_key == key) {
+        route.candidate_ordinal = base;
+        route.candidate_valid = true;
+        ResolveBlockRoute(store, base, route.candidate_ordinal, &route);
+        set_backward_candidate_route();
+        rwlock_unlock_read(store.rwlock);
+        return route;
+    }
+    if (next_key.str == nullptr) {
+        ResolveBlockRoute(store, base, route.ordinal_lo, &route);
+        rwlock_unlock_read(store.rwlock);
+        return route;
+    }
+
+    auto [shared, ignore, implicit_size] =
+        GetSharedIgnoreImplicitLengths(prev_key, next_key);
+    const uint32_t key_start_bit = shared + ignore + implicit_size;
+    const uint64_t extraction = ExtractPartialKey(
+        key, shared, ignore, implicit_size, key.GetBit(shared));
+    const uint64_t prev_implicit =
+        ExtractPartialKey(prev_key, shared, ignore, implicit_size, 0) >>
+        infix_size_;
+    const uint64_t next_implicit =
+        ExtractPartialKey(next_key, shared, ignore, implicit_size, 1) >>
+        infix_size_;
+    const uint32_t total_implicit =
+        static_cast<uint32_t>(next_implicit - prev_implicit + 1);
+    const uint64_t query_key =
+        extraction - (prev_implicit << infix_size_);
+    CollisionLocation location;
+    if (PointQueryInfixStore(store, query_key, total_implicit,
+                             {key.str, 8 * key.length}, key_start_bit,
+                             &location, /*include_shadowed=*/true) &&
+        location.valid) {
+        route.candidate_ordinal =
+            static_cast<uint64_t>(base) + 1 + location.logical_ordinal;
+        route.candidate_valid = route.candidate_ordinal < route.ordinal_hi;
+        if (route.candidate_valid) {
+            ResolveBlockRoute(store, base, route.candidate_ordinal, &route);
+            set_backward_candidate_route();
+            rwlock_unlock_read(store.rwlock);
+            return route;
+        }
+    }
+    // Non-member / no exact candidate: still route to the ordinal_lo block so
+    // Get/Seek can prove absence or land without the block index.
+    ResolveBlockRoute(store, base, route.ordinal_lo, &route);
+    rwlock_unlock_read(store.rwlock);
+    return route;
 }
 
 
@@ -2051,7 +2352,8 @@ inline uint64_t *Diva<diva_type, payload_type>::GetInfixShadowBitmap(
     static_assert(diva_type == DivaType::BinaryTrie &&
                   payload_type == PayloadType::None);
     return reinterpret_cast<uint64_t *>(GetOrdinalDirectory(store) +
-                                        InfixStore::ordinal_directory_entry_count);
+                                        InfixStore::ordinal_directory_entry_count) +
+           InfixStore::routing_metadata_word_count;
 }
 
 
@@ -2062,7 +2364,243 @@ inline const uint64_t *Diva<diva_type, payload_type>::GetInfixShadowBitmap(
                   payload_type == PayloadType::None);
     return reinterpret_cast<const uint64_t *>(
         GetOrdinalDirectory(store) +
+        InfixStore::ordinal_directory_entry_count) +
+        InfixStore::routing_metadata_word_count;
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline uint32_t Diva<diva_type, payload_type>::GetGlobalOrdinalBase(
+        const InfixStore &store) const {
+    static_assert(diva_type == DivaType::BinaryTrie &&
+                  payload_type == PayloadType::None);
+    return static_cast<uint32_t>(GetRoutingMetadataWords(store)[0]);
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline void Diva<diva_type, payload_type>::SetGlobalOrdinalBase(
+        InfixStore &store, const uint32_t ordinal) const {
+    static_assert(diva_type == DivaType::BinaryTrie &&
+                  payload_type == PayloadType::None);
+    GetRoutingMetadataWords(store)[0] = ordinal;
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline uint64_t *Diva<diva_type, payload_type>::GetRoutingMetadataWords(
+        InfixStore &store) const {
+    static_assert(diva_type == DivaType::BinaryTrie &&
+                  payload_type == PayloadType::None);
+    return reinterpret_cast<uint64_t *>(
+        GetOrdinalDirectory(store) +
         InfixStore::ordinal_directory_entry_count);
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline const uint64_t *Diva<diva_type, payload_type>::GetRoutingMetadataWords(
+        const InfixStore &store) const {
+    static_assert(diva_type == DivaType::BinaryTrie &&
+                  payload_type == PayloadType::None);
+    return reinterpret_cast<const uint64_t *>(
+        GetOrdinalDirectory(store) +
+        InfixStore::ordinal_directory_entry_count);
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline const uint16_t *Diva<diva_type, payload_type>::GetBlockStartOrdinals(
+        const InfixStore &store) const {
+    const uint32_t offset =
+        static_cast<uint32_t>(GetRoutingMetadataWords(store)[2]);
+    assert(offset <= block_start_ordinals_.size());
+    return block_start_ordinals_.data() + offset;
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline uint32_t Diva<diva_type, payload_type>::GetBlockStartOrdinalCount(
+        const InfixStore &store) const {
+    return static_cast<uint32_t>(GetRoutingMetadataWords(store)[2] >> 32);
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline void Diva<diva_type, payload_type>::SetBlockStartOrdinalRange(
+        InfixStore &store, const uint32_t offset, const uint32_t count) const {
+    GetRoutingMetadataWords(store)[2] =
+        static_cast<uint64_t>(offset) |
+        (static_cast<uint64_t>(count) << 32);
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline uint32_t Diva<diva_type, payload_type>::GetBlocksBeforeStore(
+        const InfixStore &store) const {
+    return static_cast<uint32_t>(GetRoutingMetadataWords(store)[1]);
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline uint32_t Diva<diva_type, payload_type>::GetCarryInKeysBeforeBase(
+        const InfixStore &store) const {
+    return static_cast<uint32_t>(GetRoutingMetadataWords(store)[1] >> 32);
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline void Diva<diva_type, payload_type>::SetBlockRoutingHeader(
+        InfixStore &store, const uint32_t blocks_before,
+        const uint32_t carry_in_keys_before_base) const {
+    GetRoutingMetadataWords(store)[1] =
+        static_cast<uint64_t>(blocks_before) |
+        (static_cast<uint64_t>(carry_in_keys_before_base) << 32);
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline void Diva<diva_type, payload_type>::ResolveBlockRoute(
+        const InfixStore &store, const uint32_t base,
+        const uint64_t candidate_ordinal, RankRoute *route,
+        const bool prefer_last_equal) const {
+    assert(route != nullptr);
+    if (candidate_ordinal < base) {
+        return;
+    }
+    const uint64_t local = candidate_ordinal - base;
+    const uint64_t window =
+        static_cast<uint64_t>(1) + store.logical_infix_count;
+    if (local >= window || local >= infix_store_target_size) {
+        return;
+    }
+    const uint32_t count = GetBlockStartOrdinalCount(store);
+    const uint32_t list_offset =
+        static_cast<uint32_t>(GetRoutingMetadataWords(store)[2]);
+    assert(static_cast<uint64_t>(list_offset) + count <=
+           block_start_ordinals_.size());
+    const uint32_t blocks_before = GetBlocksBeforeStore(store);
+    const uint32_t carry_in = GetCarryInKeysBeforeBase(store);
+    const uint32_t local_u = static_cast<uint32_t>(local);
+    const uint16_t *starts_begin = nullptr;
+    const uint16_t *selected_start = nullptr;
+    uint32_t selected_start_index = 0;
+    if (count != 0) {
+        starts_begin = GetBlockStartOrdinals(store);
+        const uint16_t *const first_not_less = std::lower_bound(
+            starts_begin, starts_begin + count,
+            static_cast<uint16_t>(local_u));
+        if (first_not_less != starts_begin + count &&
+            *first_not_less == local_u) {
+            // A version run can begin several consecutive blocks at this
+            // distinct ordinal. Forward routing uses its first/newest block;
+            // an upper-safe backward route deliberately uses its last block.
+            selected_start = prefer_last_equal
+                                 ? std::upper_bound(
+                                       first_not_less, starts_begin + count,
+                                       static_cast<uint16_t>(local_u)) - 1
+                                 : first_not_less;
+        } else if (first_not_less != starts_begin) {
+            selected_start = first_not_less - 1;
+        }
+        if (selected_start != nullptr) {
+            selected_start_index =
+                static_cast<uint32_t>(selected_start - starts_begin);
+        }
+    }
+    if (selected_start == nullptr) {
+        if (blocks_before == 0) {
+            return;
+        }
+        route->block_id = blocks_before - 1;
+        route->block_start_ordinal = static_cast<uint64_t>(base) - carry_in;
+    } else {
+        route->block_id =
+            static_cast<uint64_t>(blocks_before) + selected_start_index;
+        const uint32_t last_start_local = *selected_start;
+        route->block_start_ordinal =
+            static_cast<uint64_t>(base) +
+            last_start_local;
+    }
+    route->block_route_valid = true;
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline void Diva<diva_type, payload_type>::AttachBlockStartOrdinals(
+        const uint64_t *block_start_ordinals, const size_t num_blocks) {
+    if constexpr (diva_type != DivaType::BinaryTrie ||
+                  payload_type != PayloadType::None) {
+        return;
+    }
+    if (block_start_ordinals == nullptr || num_blocks == 0) {
+        return;
+    }
+
+    block_start_ordinals_.clear();
+    block_start_ordinals_.reserve(num_blocks);
+
+    const bool write = false;
+    const bool unlock = true;
+    const uint8_t *tree_key;
+    uint32_t tree_key_len, dummy;
+    InfixStore *store;
+    wormhole_iter it;
+    it.ref = better_tree_;
+    it.map = better_tree_->map;
+    it.leaf = nullptr;
+    it.is = 0;
+    size_t start_scan = 0;
+    for (wh_iter_seek(&it, nullptr, 0, write); wh_iter_valid(&it);
+         wh_iter_skip1(&it, write, unlock)) {
+        wh_iter_peek_ref(&it, reinterpret_cast<const void **>(&tree_key),
+                         &tree_key_len, reinterpret_cast<void **>(&store),
+                         &dummy);
+        if (store == nullptr || store->ptr == nullptr) {
+            continue;
+        }
+        const uint32_t base = GetGlobalOrdinalBase(*store);
+        if (base == std::numeric_limits<uint32_t>::max()) {
+            continue;
+        }
+        const uint64_t window_end =
+            static_cast<uint64_t>(base) + 1 + store->logical_infix_count;
+
+        while (start_scan < num_blocks &&
+               block_start_ordinals[start_scan] < base) {
+            ++start_scan;
+        }
+        const uint32_t blocks_before = static_cast<uint32_t>(start_scan);
+        uint32_t carry_in = 0;
+        if (blocks_before > 0) {
+            const uint64_t prev_start =
+                block_start_ordinals[blocks_before - 1];
+            const bool starts_at_base =
+                start_scan < num_blocks &&
+                block_start_ordinals[start_scan] == base;
+            if (!starts_at_base && prev_start < base) {
+                carry_in = static_cast<uint32_t>(base - prev_start);
+            }
+        }
+
+        rwlock_lock_write(store->rwlock);
+        SetBlockRoutingHeader(*store, blocks_before, carry_in);
+        const uint32_t list_offset =
+            static_cast<uint32_t>(block_start_ordinals_.size());
+        for (size_t i = start_scan; i < num_blocks; ++i) {
+            const uint64_t s = block_start_ordinals[i];
+            if (s >= window_end) {
+                break;
+            }
+            const uint32_t local = static_cast<uint32_t>(s - base);
+            assert(local < infix_store_target_size);
+            block_start_ordinals_.push_back(static_cast<uint16_t>(local));
+        }
+        SetBlockStartOrdinalRange(
+            *store, list_offset,
+            static_cast<uint32_t>(block_start_ordinals_.size()) - list_offset);
+        rwlock_unlock_write(store->rwlock);
+    }
 }
 
 
@@ -2330,6 +2868,315 @@ inline bool Diva<diva_type, payload_type>::HasVisibleInfix(
 
 
 template <DivaType diva_type, PayloadType payload_type>
+inline void Diva<diva_type, payload_type>::ReferenceAdaptedStore(
+        InfixStore &store) const {
+    if constexpr (diva_type == DivaType::BinaryTrie &&
+                  payload_type == PayloadType::None) {
+        const uint64_t adapted = uint64_t{1} << InfixStore::adapted_bit;
+        const uint64_t referenced =
+            uint64_t{1} << InfixStore::clock_referenced_bit;
+        // Multiple readers can share the store read lock. Only the CLOCK
+        // reference bit is changed here, so use one atomic OR rather than
+        // upgrading to the exclusive store lock on the query path.
+        if ((__atomic_load_n(&store.status, __ATOMIC_RELAXED) & adapted) != 0) {
+            __atomic_fetch_or(&store.status, referenced, __ATOMIC_RELAXED);
+        }
+    }
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline void Diva<diva_type, payload_type>::RegisterAdaptedStore(
+        InfixStore &store, const uint32_t total_implicit,
+        const uint64_t added_bytes) {
+    if constexpr (diva_type != DivaType::BinaryTrie ||
+                  payload_type != PayloadType::None) {
+        return;
+    } else {
+        const bool newly_adapted = !store.IsAdapted();
+        store.MarkAdaptedAndReferenced();
+        // Once registered, a same-capacity adaptation changes neither this
+        // store's immutable quotient span nor its tracked allocation growth.
+        // Avoid an O(number of adapted stores) ring scan on that common path.
+        if (!newly_adapted && added_bytes == 0)
+            return;
+        std::lock_guard<std::mutex> guard(adapted_store_clock_mutex_);
+        AdaptedStoreClockEntry *entry = nullptr;
+        for (auto& candidate : adapted_store_clock_) {
+            if (candidate.store == &store) {
+                entry = &candidate;
+                break;
+            }
+        }
+        if (entry == nullptr && newly_adapted) {
+            for (auto& candidate : adapted_store_clock_) {
+                if (candidate.store == nullptr) {
+                    entry = &candidate;
+                    break;
+                }
+            }
+            if (entry == nullptr) {
+                adapted_store_clock_.push_back({});
+                entry = &adapted_store_clock_.back();
+            }
+            entry->store = &store;
+            entry->total_implicit = total_implicit;
+            entry->extra_bytes = 0;
+        }
+        assert(entry != nullptr);
+        entry->total_implicit = total_implicit;
+        entry->extra_bytes += added_bytes;
+        live_adaptation_bytes_.fetch_add(added_bytes,
+                                         std::memory_order_relaxed);
+    }
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline bool Diva<diva_type, payload_type>::CanonicalizeAdaptedStore(
+        InfixStore &store, const uint32_t total_implicit,
+        const bool honor_reference_bit) {
+    if constexpr (diva_type != DivaType::BinaryTrie ||
+                  payload_type != PayloadType::None) {
+        return false;
+    } else {
+        rwlock_lock_write(store.rwlock);
+        if (!store.IsAdapted()) {
+            rwlock_unlock_write(store.rwlock);
+            return false;
+        }
+        if (honor_reference_bit && store.IsClockReferenced()) {
+            store.ClearClockReferenced();
+            rwlock_unlock_write(store.rwlock);
+            return false;
+        }
+
+        const uint16_t old_logical_count = store.logical_infix_count;
+        const uint32_t global_ordinal_base = GetGlobalOrdinalBase(store);
+        const uint32_t blocks_before = GetBlocksBeforeStore(store);
+        const uint32_t carry_in = GetCarryInKeysBeforeBase(store);
+        const uint32_t block_start_offset =
+            static_cast<uint32_t>(GetRoutingMetadataWords(store)[2]);
+        const uint32_t block_start_count =
+            GetBlockStartOrdinalCount(store);
+        const bool tree_key_shadowed = store.TreeKeyIsShadowed();
+        const bool has_infix_shadows = store.HasInfixShadows();
+        uint64_t saved_shadow_bitmap[InfixStore::shadow_bitmap_word_count] = {};
+        if (has_infix_shadows) {
+            memcpy(saved_shadow_bitmap, GetInfixShadowBitmap(store),
+                   sizeof(saved_shadow_bitmap));
+        }
+
+        std::vector<Infix> canonical = GetInfixVector(store);
+        for (Infix& encoded : canonical) {
+            if (encoded.num_trie_bits_ == 0)
+                continue;
+            auto strings_and_storage = encoded.GetStrings(infix_size_);
+            auto& strings = strings_and_storage.first;
+            if (strings.size() <= 1) {
+                // Bulk loading creates a trie only for a collision group.
+                // A one-key trie is therefore an adaptive extension of an
+                // ordinary infix and canonicalizes back to that infix.
+                encoded = Infix(encoded.infix_);
+            } else {
+                Infix minimal(encoded.infix_);
+                minimal.BuildTrieAndSuffixes(strings.data(), strings.size(),
+                                             /*key_start_bit=*/0, infix_size_,
+                                             /*force_prefix_keys=*/false,
+                                             /*store_full_keys=*/false,
+                                             /*pad_short_keys=*/true);
+                encoded = minimal;
+            }
+        }
+
+        uint64_t canonical_slots = 0;
+        for (const Infix& encoded : canonical)
+            canonical_slots += encoded.GetNumSlots(infix_size_);
+        const uint32_t canonical_grade = static_cast<uint32_t>(
+            std::upper_bound(scaled_sizes_,
+                             scaled_sizes_ + size_scalar_count,
+                             canonical_slots) - scaled_sizes_);
+        assert(canonical_grade < size_scalar_count);
+        InfixStore rebuilt(scaled_sizes_[canonical_grade], infix_size_,
+                           canonical_grade, payload_size_);
+        LoadVectorToInfixStore(rebuilt, canonical, total_implicit,
+                               /*zero_out=*/true);
+        assert(rebuilt.logical_infix_count == old_logical_count);
+        SetGlobalOrdinalBase(rebuilt, global_ordinal_base);
+        SetBlockRoutingHeader(rebuilt, blocks_before, carry_in);
+        SetBlockStartOrdinalRange(rebuilt, block_start_offset,
+                                  block_start_count);
+        if (tree_key_shadowed)
+            rebuilt.SetTreeKeyShadowed();
+        if (has_infix_shadows) {
+            memcpy(GetInfixShadowBitmap(rebuilt), saved_shadow_bitmap,
+                   sizeof(saved_shadow_bitmap));
+            rebuilt.SetHasInfixShadows();
+        }
+        // Admission is deliberately cleared: after forgetting learned bits,
+        // a future collision must again demonstrate recurrence.
+
+        const uint64_t old_word_count = InfixStore::GetAllocationWordCount(
+            scaled_sizes_[store.GetSizeGrade()], infix_size_, payload_size_);
+        const uint64_t new_word_count = InfixStore::GetAllocationWordCount(
+            scaled_sizes_[rebuilt.GetSizeGrade()], infix_size_, payload_size_);
+        uint64_t *const old_ptr = store.ptr;
+        store.status = rebuilt.status;
+        store.logical_infix_count = rebuilt.logical_infix_count;
+        store.ptr = rebuilt.ptr;
+        rebuilt.ptr = nullptr;
+        delete[] old_ptr;
+
+        uint64_t tracked_extra = 0;
+        {
+            std::lock_guard<std::mutex> guard(adapted_store_clock_mutex_);
+            for (auto& entry : adapted_store_clock_) {
+                if (entry.store == &store) {
+                    tracked_extra += entry.extra_bytes;
+                    entry = {};
+                }
+            }
+        }
+        store.ClearAdaptedAndReferenced();
+        if (tracked_extra != 0) {
+            live_adaptation_bytes_.fetch_sub(tracked_extra,
+                                             std::memory_order_relaxed);
+        }
+        if (deserialized_ && old_word_count > new_word_count) {
+            de_adaptation_bytes_.fetch_add(
+                (old_word_count - new_word_count) * sizeof(uint64_t),
+                std::memory_order_relaxed);
+            owned_infix_store_bytes_.fetch_sub(
+                (old_word_count - new_word_count) * sizeof(uint64_t),
+                std::memory_order_relaxed);
+        }
+        de_adaptation_count_.fetch_add(1, std::memory_order_relaxed);
+        rwlock_unlock_write(store.rwlock);
+        return true;
+    }
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline void Diva<diva_type, payload_type>::ReclaimAdaptationBytesUntil(
+        const uint64_t max_live_bytes, InfixStore *except_store) {
+    if constexpr (diva_type != DivaType::BinaryTrie ||
+                  payload_type != PayloadType::None) {
+        return;
+    } else {
+        if (live_adaptation_bytes_.load(std::memory_order_relaxed) <=
+            max_live_bytes)
+            return;
+
+        std::lock_guard<std::mutex> sweep(adapted_store_sweep_mutex_);
+        size_t attempts_without_victim = 0;
+        while (live_adaptation_bytes_.load(std::memory_order_relaxed) >
+               max_live_bytes) {
+            AdaptedStoreClockEntry selected;
+            size_t ring_size = 0;
+            {
+                std::lock_guard<std::mutex> guard(adapted_store_clock_mutex_);
+                ring_size = adapted_store_clock_.size();
+                if (ring_size == 0)
+                    break;
+                if (adapted_store_clock_hand_ >= ring_size)
+                    adapted_store_clock_hand_ = 0;
+                selected = adapted_store_clock_[adapted_store_clock_hand_++];
+            }
+            if (selected.store == nullptr) {
+                if (++attempts_without_victim > 2 * ring_size + 1)
+                    break;
+                continue;
+            }
+            if (selected.store == except_store) {
+                // Leave the store being adapted alone; try another victim.
+                if (++attempts_without_victim > 2 * ring_size + 1)
+                    break;
+                continue;
+            }
+            if (CanonicalizeAdaptedStore(*selected.store,
+                                         selected.total_implicit,
+                                         /*honor_reference_bit=*/true)) {
+                attempts_without_victim = 0;
+            } else if (++attempts_without_victim > 2 * ring_size + 1) {
+                // Every live entry was skipped, concurrently removed, or
+                // already consumed its second chance.
+                break;
+            }
+        }
+    }
+}
+
+template <DivaType diva_type, PayloadType payload_type>
+inline void Diva<diva_type, payload_type>::EnforceAdaptationMemoryBudget() {
+    const uint64_t budget =
+        adaptation_memory_budget_bytes_.load(std::memory_order_relaxed);
+    ReclaimAdaptationBytesUntil(budget, /*except_store=*/nullptr);
+}
+
+template <DivaType diva_type, PayloadType payload_type>
+inline void Diva<diva_type, payload_type>::MakeAdaptationBudgetRoom(
+        const uint64_t added_bytes, InfixStore *except_store) {
+    if (added_bytes == 0)
+        return;
+    const uint64_t budget =
+        adaptation_memory_budget_bytes_.load(std::memory_order_relaxed);
+    if (budget == std::numeric_limits<uint64_t>::max())
+        return;
+    if (added_bytes > budget)
+        return;
+    ReclaimAdaptationBytesUntil(budget - added_bytes, except_store);
+}
+
+template <DivaType diva_type, PayloadType payload_type>
+inline void Diva<diva_type, payload_type>::SetAdaptationMemoryBudgetBytes(
+        const uint64_t bytes) {
+    adaptation_memory_budget_bytes_.store(bytes, std::memory_order_relaxed);
+    EnforceAdaptationMemoryBudget();
+}
+
+template <DivaType diva_type, PayloadType payload_type>
+inline bool Diva<diva_type, payload_type>::AdaptationResizeFitsBudget(
+        const uint64_t added_bytes) const {
+    if (added_bytes == 0)
+        return true;
+    const uint64_t budget =
+        adaptation_memory_budget_bytes_.load(std::memory_order_relaxed);
+    if (budget == std::numeric_limits<uint64_t>::max())
+        return true;
+    const uint64_t live =
+        live_adaptation_bytes_.load(std::memory_order_relaxed);
+    return live <= budget && added_bytes <= (budget - live);
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline uint64_t Diva<diva_type, payload_type>::DeAdaptAll() {
+    if constexpr (diva_type != DivaType::BinaryTrie ||
+                  payload_type != PayloadType::None) {
+        return 0;
+    } else {
+        std::lock_guard<std::mutex> sweep(adapted_store_sweep_mutex_);
+        std::vector<AdaptedStoreClockEntry> snapshot;
+        {
+            std::lock_guard<std::mutex> guard(adapted_store_clock_mutex_);
+            snapshot = adapted_store_clock_;
+        }
+        uint64_t rebuilt = 0;
+        for (const auto& entry : snapshot) {
+            if (entry.store != nullptr &&
+                CanonicalizeAdaptedStore(*entry.store,
+                                         entry.total_implicit,
+                                         /*honor_reference_bit=*/false)) {
+                ++rebuilt;
+            }
+        }
+        return rebuilt;
+    }
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
 inline typename Diva<diva_type, payload_type>::AdmissionResult
 Diva<diva_type, payload_type>::ObserveFalsePositive(
         const CollisionContext& context) {
@@ -2383,9 +3230,15 @@ Diva<diva_type, payload_type>::ObserveFalsePositive(
 
 
 template <DivaType diva_type, PayloadType payload_type>
-inline void Diva<diva_type, payload_type>::AddTreeKey(const uint8_t *key, const uint32_t key_len, const uint64_t *payload) {
+inline void Diva<diva_type, payload_type>::AddTreeKey(
+        const uint8_t *key, const uint32_t key_len, const uint64_t *payload,
+        const uint32_t global_ordinal_base) {
     InfixStore infix_store(scaled_sizes_[size_scalar_shrink_grow_sep], infix_size_,
                            size_scalar_shrink_grow_sep, payload_size_);
+    if constexpr (diva_type == DivaType::BinaryTrie &&
+                  payload_type == PayloadType::None) {
+        SetGlobalOrdinalBase(infix_store, global_ordinal_base);
+    }
     if constexpr (payload_type == PayloadType::FixedLength) {
         if (payload)
             AddSamplePayload(infix_store, payload);
@@ -3005,6 +3858,12 @@ inline uint64_t Diva<diva_type, payload_type>::Size() const {
             res += sizeof(tree_key_len) + tree_key_len;
             res += sizeof(store->status);
             res += InfixStore::serialized_logical_metadata_byte_count;
+            if constexpr (diva_type == DivaType::BinaryTrie &&
+                          payload_type == PayloadType::None) {
+                res += static_cast<uint64_t>(
+                           GetBlockStartOrdinalCount(*store)) *
+                       sizeof(uint16_t);
+            }
             if constexpr (payload_type == PayloadType::FixedLength) {
                 res += sizeof(store->num_sample_payloads);
                 res += (store->num_sample_payloads * payload_size_ + 7) / 8;
@@ -3029,6 +3888,12 @@ inline uint64_t Diva<diva_type, payload_type>::Size() const {
             res += sizeof(tree_key_len) + tree_key_len;
             res += sizeof(store->status); // + sizeof(store->ptr);
             res += InfixStore::serialized_logical_metadata_byte_count;
+            if constexpr (diva_type == DivaType::BinaryTrie &&
+                          payload_type == PayloadType::None) {
+                res += static_cast<uint64_t>(
+                           GetBlockStartOrdinalCount(*store)) *
+                       sizeof(uint16_t);
+            }
             if constexpr (payload_type == PayloadType::FixedLength) {
                 res += sizeof(store->num_sample_payloads);
                 res += (store->num_sample_payloads * payload_size_ + 7) / 8;
@@ -3183,10 +4048,32 @@ inline uint64_t Diva<diva_type, payload_type>::SerializeInfixStore(char *out,
         memcpy(out + offset, &store.logical_infix_count,
                sizeof(store.logical_infix_count));
         offset += sizeof(store.logical_infix_count);
+        const uint32_t global_ordinal_base = GetGlobalOrdinalBase(store);
+        memcpy(out + offset, &global_ordinal_base,
+               sizeof(global_ordinal_base));
+        offset += sizeof(global_ordinal_base);
+        const uint32_t blocks_before = GetBlocksBeforeStore(store);
+        memcpy(out + offset, &blocks_before, sizeof(blocks_before));
+        offset += sizeof(blocks_before);
+        const uint32_t carry_in = GetCarryInKeysBeforeBase(store);
+        memcpy(out + offset, &carry_in, sizeof(carry_in));
+        offset += sizeof(carry_in);
+        const uint32_t block_start_count =
+            GetBlockStartOrdinalCount(store);
+        memcpy(out + offset, &block_start_count,
+               sizeof(block_start_count));
+        offset += sizeof(block_start_count);
         constexpr uint32_t directory_bytes =
             InfixStore::ordinal_directory_entry_count * sizeof(uint16_t);
         memcpy(out + offset, GetOrdinalDirectory(store), directory_bytes);
         offset += directory_bytes;
+        const uint32_t block_start_bytes =
+            block_start_count * sizeof(uint16_t);
+        if (block_start_bytes != 0) {
+            memcpy(out + offset, GetBlockStartOrdinals(store),
+                   block_start_bytes);
+            offset += block_start_bytes;
+        }
     }
 
     if constexpr (payload_type == PayloadType::FixedLength) {
@@ -3303,6 +4190,10 @@ inline Diva<diva_type, payload_type>::Diva(const char *deser_buf):
         memcpy(&key_length, deser_buf + ind, sizeof(key_length));
         ind += sizeof(key_length);
     }
+    // Deserialization appends each store's repeated block starts without
+    // knowing the final count up front. Drop geometric vector slack so the
+    // reader's charged routing memory reflects the succinct representation.
+    block_start_ordinals_.shrink_to_fit();
 }
 
 
@@ -3382,7 +4273,7 @@ inline uint32_t Diva<diva_type, payload_type>::DeserializeMetadata(const char *d
 
 template <DivaType diva_type, PayloadType payload_type>
 inline uint32_t Diva<diva_type, payload_type>::DeserializeInfixStore(const char *deser_buf,
-                                                                     Diva<diva_type, payload_type>::InfixStore& store) const {
+                                                                     Diva<diva_type, payload_type>::InfixStore& store) {
     uint32_t offset = 0;
     memcpy(&store.status, deser_buf, sizeof(store.status));
     store.status &= InfixStore::serialized_status_mask;
@@ -3411,11 +4302,39 @@ inline uint32_t Diva<diva_type, payload_type>::DeserializeInfixStore(const char 
         memcpy(&store.logical_infix_count, deser_buf + offset,
                sizeof(store.logical_infix_count));
         offset += sizeof(store.logical_infix_count);
+        uint32_t global_ordinal_base = 0;
+        memcpy(&global_ordinal_base, deser_buf + offset,
+               sizeof(global_ordinal_base));
+        offset += sizeof(global_ordinal_base);
+        SetGlobalOrdinalBase(store, global_ordinal_base);
+        uint32_t blocks_before = 0;
+        memcpy(&blocks_before, deser_buf + offset, sizeof(blocks_before));
+        offset += sizeof(blocks_before);
+        uint32_t carry_in = 0;
+        memcpy(&carry_in, deser_buf + offset, sizeof(carry_in));
+        offset += sizeof(carry_in);
+        SetBlockRoutingHeader(store, blocks_before, carry_in);
+        uint32_t block_start_count = 0;
+        memcpy(&block_start_count, deser_buf + offset,
+               sizeof(block_start_count));
+        offset += sizeof(block_start_count);
         constexpr uint32_t directory_bytes =
             InfixStore::ordinal_directory_entry_count * sizeof(uint16_t);
         memcpy(GetOrdinalDirectory(store), deser_buf + offset,
                directory_bytes);
         offset += directory_bytes;
+        const uint32_t block_start_offset =
+            static_cast<uint32_t>(block_start_ordinals_.size());
+        block_start_ordinals_.resize(
+            block_start_ordinals_.size() + block_start_count);
+        if (block_start_count != 0) {
+            memcpy(block_start_ordinals_.data() + block_start_offset,
+                   deser_buf + offset,
+                   block_start_count * sizeof(uint16_t));
+        }
+        SetBlockStartOrdinalRange(store, block_start_offset,
+                                  block_start_count);
+        offset += block_start_count * sizeof(uint16_t);
 #ifdef DEBUG
         const uint16_t *const directory = GetOrdinalDirectory(store);
         assert(directory[0] == 0);
@@ -4590,24 +5509,28 @@ Diva<diva_type, payload_type>::AdaptInLocatedStore(
     if (result == AdaptResult::kNoCapacity && validate_rejection) {
         // Streaming-built RocksDB stores commonly retain only the one empty
         // slot required by the quotient-filter layout. Grow the private
-        // candidate and retry there; the published store remains untouched if
-        // resizing or the retry cannot complete the adaptation.
-        if constexpr (InfixStore::runtime_metadata_word_count != 0) {
-            // ResizeInfixStore preserves the logical metadata while replacing
-            // the physical allocation, so initialize the candidate's tail
-            // before asking it to do that work.
-            if (!candidate_has_runtime_metadata) {
-                memcpy(candidate.ptr + physical_word_count,
-                       infix_store.ptr + physical_word_count,
-                       InfixStore::runtime_metadata_word_count *
-                           sizeof(uint64_t));
-                candidate_has_runtime_metadata = true;
+        // candidate and retry there when any persistent growth is allowed.
+        // Budget 0 skips this path entirely (eviction cannot create room).
+        // A positive but exhausted budget still builds the candidate; publish
+        // below asks CLOCK to evict cold growth before installing it.
+        if (!AdaptationBudgetIsZero()) {
+            if constexpr (InfixStore::runtime_metadata_word_count != 0) {
+                // ResizeInfixStore preserves the logical metadata while
+                // replacing the physical allocation, so initialize the
+                // candidate's tail before asking it to do that work.
+                if (!candidate_has_runtime_metadata) {
+                    memcpy(candidate.ptr + physical_word_count,
+                           infix_store.ptr + physical_word_count,
+                           InfixStore::runtime_metadata_word_count *
+                               sizeof(uint64_t));
+                    candidate_has_runtime_metadata = true;
+                }
             }
+            ResizeInfixStore(candidate, total_implicit);
+            result = AdaptRawInInfixStore(
+                candidate, adaptee, {key.str, 8 * key.length}, key_start_bit,
+                adapt_length, total_implicit);
         }
-        ResizeInfixStore(candidate, total_implicit);
-        result = AdaptRawInInfixStore(
-            candidate, adaptee, {key.str, 8 * key.length}, key_start_bit,
-            adapt_length, total_implicit);
     }
     if (result == AdaptResult::kAdapted && validate_point_rejection &&
         PointQueryInfixStore(candidate, query_key, total_implicit,
@@ -4627,6 +5550,7 @@ Diva<diva_type, payload_type>::AdaptInLocatedStore(
         result = AdaptResult::kWitnessNotFound;
     }
 
+    uint64_t live_added_bytes = 0;
     if (result == AdaptResult::kAdapted) {
         const uint64_t candidate_word_count = candidate.GetAllocationWordCount(
             scaled_sizes_[candidate.GetSizeGrade()], infix_size_, payload_size_);
@@ -4647,37 +5571,74 @@ Diva<diva_type, payload_type>::AdaptInLocatedStore(
             delete[] candidate.ptr;
             in_place_adaptation_count_.fetch_add(1,
                                                   std::memory_order_relaxed);
-        } else {
-            // A resized store is independently replaceable: publish the new
-            // allocation and release the old one rather than stranding its
-            // bytes in a monolithic serialized buffer.
-            uint64_t *const replaced_ptr = infix_store.ptr;
-            infix_store.status = candidate.status;
-            if constexpr (payload_type == PayloadType::FixedLength) {
-                infix_store.num_sample_payloads = candidate.num_sample_payloads;
-            }
-            infix_store.ptr = candidate.ptr;
-            delete[] replaced_ptr;
-            resize_adaptation_count_.fetch_add(1,
-                                                std::memory_order_relaxed);
-            if (candidate_word_count > word_count) {
-                const uint64_t added_bytes =
-                    (candidate_word_count - word_count) * sizeof(uint64_t);
+            // Adaptation changes only the physical encoding. Logical ordinals
+            // and their shadow bits remain stable, so admission identities do
+            // not need a representation epoch.
+            RegisterAdaptedStore(infix_store, total_implicit, live_added_bytes);
+        } else if (candidate_word_count > word_count) {
+            const uint64_t added_bytes =
+                (candidate_word_count - word_count) * sizeof(uint64_t);
+            auto publish_resize = [&]() {
+                uint64_t *const replaced_ptr = infix_store.ptr;
+                infix_store.status = candidate.status;
+                if constexpr (payload_type == PayloadType::FixedLength) {
+                    infix_store.num_sample_payloads =
+                        candidate.num_sample_payloads;
+                }
+                infix_store.ptr = candidate.ptr;
+                delete[] replaced_ptr;
+                resize_adaptation_count_.fetch_add(1,
+                                                    std::memory_order_relaxed);
+                live_added_bytes = added_bytes;
                 adaptation_resize_bytes_.fetch_add(added_bytes,
                                                     std::memory_order_relaxed);
                 if (deserialized_) {
                     owned_infix_store_bytes_.fetch_add(
                         added_bytes, std::memory_order_relaxed);
                 }
+                RegisterAdaptedStore(infix_store, total_implicit,
+                                     live_added_bytes);
+            };
+            if (AdaptationResizeFitsBudget(added_bytes)) {
+                // A resized store is independently replaceable: publish the
+                // new allocation and release the old one rather than stranding
+                // its bytes in a monolithic serialized buffer.
+                publish_resize();
+            } else if (AdaptationBudgetIsZero()) {
+                // No eviction can create room under a zero budget.
+                delete[] candidate.ptr;
+                result = AdaptResult::kNoCapacity;
+            } else {
+                // Positive budget is full: unlock, CLOCK-evict cold adapted
+                // stores to free added_bytes, then republish if room exists.
+                // Skipping this store avoids self-deadlock / undoing the
+                // candidate we are about to install.
+                uint64_t *const expected_ptr = infix_store.ptr;
+                const uint32_t expected_grade = infix_store.GetSizeGrade();
+                rwlock_unlock_write(infix_store.rwlock);
+                MakeAdaptationBudgetRoom(added_bytes, &infix_store);
+                rwlock_lock_write(infix_store.rwlock);
+                if (infix_store.ptr != expected_ptr ||
+                    infix_store.GetSizeGrade() != expected_grade ||
+                    !AdaptationResizeFitsBudget(added_bytes)) {
+                    delete[] candidate.ptr;
+                    result = AdaptResult::kNoCapacity;
+                } else {
+                    publish_resize();
+                }
             }
+        } else {
+            // Smaller candidates are unexpected for false-positive growth;
+            // treat like a failed adaptation and keep the live store.
+            delete[] candidate.ptr;
+            result = AdaptResult::kNoCapacity;
         }
-        // Adaptation changes only the physical encoding. Logical ordinals and
-        // their shadow bits remain stable, so admission identities do not need
-        // a representation epoch.
     } else {
         delete[] candidate.ptr;
     }
     rwlock_unlock_write(infix_store.rwlock);
+    if (result == AdaptResult::kAdapted)
+        EnforceAdaptationMemoryBudget();
     return result;
 }
 
@@ -5278,6 +6239,12 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreaming(const uint8_t *key,
         LoadVectorToInfixStore(store, infix_vec, total_implicit, true, bulk_load_payload_list_);
     else 
         LoadListToInfixStore(store, infix_list, bulk_load_streaming_ind_, total_implicit, true, bulk_load_payload_list_);
+    if constexpr (diva_type == DivaType::BinaryTrie &&
+                  payload_type == PayloadType::None) {
+        SetGlobalOrdinalBase(
+            store, static_cast<uint32_t>(
+                       n_keys_.load(std::memory_order_relaxed)));
+    }
     if constexpr (payload_type == PayloadType::FixedLength) {
         uint64_t *sample_payloads = reinterpret_cast<uint64_t *>(malloc(((payload_size_ + 63) / 64) * sizeof(uint64_t)));
         store.ptr[1] = reinterpret_cast<uint64_t>(sample_payloads);
@@ -5343,8 +6310,11 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreamingFinish() {
                 AddTreeKey(bulk_load_left_key_.str, bulk_load_left_key_.length,
                            bulk_load_left_payload_);
             else
-                AddTreeKey(bulk_load_left_key_.str,
-                           bulk_load_left_key_.length);
+                AddTreeKey(
+                    bulk_load_left_key_.str, bulk_load_left_key_.length,
+                    nullptr,
+                    static_cast<uint32_t>(
+                        n_keys_.load(std::memory_order_relaxed)));
         }
         n_keys_.fetch_add(1, std::memory_order_release);
     } else if (bulk_load_streaming_ind_ > 0) {
@@ -5409,6 +6379,12 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreamingFinish() {
             LoadVectorToInfixStore(store, infix_vec, total_implicit, true, bulk_load_payload_list_);
         else 
             LoadListToInfixStore(store, infix_list, bulk_load_streaming_ind_, total_implicit, true, bulk_load_payload_list_);
+        if constexpr (diva_type == DivaType::BinaryTrie &&
+                      payload_type == PayloadType::None) {
+            SetGlobalOrdinalBase(
+                store, static_cast<uint32_t>(
+                           n_keys_.load(std::memory_order_relaxed)));
+        }
         if constexpr (payload_type == PayloadType::FixedLength) {
             uint64_t *sample_payloads = reinterpret_cast<uint64_t *>(malloc(((payload_size_ + 63) / 64) * sizeof(uint64_t)));
             store.ptr[1] = reinterpret_cast<uint64_t>(sample_payloads);
@@ -5429,7 +6405,11 @@ inline void Diva<diva_type, payload_type>::BulkLoadStreamingFinish() {
         uint64_t bulk_load_right_payload_[(payload_size_ + 63) / 64 + 1];
         copy_bitmap_to_bitmap(bulk_load_payload_list_, bulk_load_streaming_ind_ * payload_size_,
                               bulk_load_right_payload_, 0, payload_size_);
-        AddTreeKey(bulk_load_right_key.str, bulk_load_right_key.length, bulk_load_right_payload_);
+        AddTreeKey(bulk_load_right_key.str, bulk_load_right_key.length,
+                   bulk_load_right_payload_,
+                   static_cast<uint32_t>(
+                       n_keys_.load(std::memory_order_relaxed) +
+                       bulk_load_streaming_ind_ + 1));
         delete[] bulk_load_right_key.str;
 
         n_keys_.fetch_add(bulk_load_streaming_ind_ + 2, std::memory_order_release);
@@ -7294,42 +8274,61 @@ inline bool Diva<diva_type, payload_type>::PointQueryInfixStore(InfixStore &stor
                         infix_size_, infix_store_target_size + scaled_sizes_[size_grade]
                             + infix_size_ * (runend_pos + 1));
                 if ((explicit_part | mask) == (slot_value | mask)) {
-                    const uint32_t key_start_bit = original_key_start_bit + infix_size_ - mask_size;
-                    if (infix_to_query.QueryTrie(original_key, original_key,
-                                                 key_start_bit, infix_size_)) {
-                        // Preserve the old Diva membership-query fast path.
-                        // The comparison mode never creates shadows or asks
-                        // for collision context, so it should not pay to
-                        // reconstruct a logical ordinal. DivaFilterPlus asks
-                        // for context on its adaptable point-Get path and uses
-                        // that exact ordinal for shadowing and admission.
-                        if (location == nullptr && !store.HasInfixShadows())
+                    const uint32_t key_start_bit =
+                        original_key_start_bit + infix_size_ - mask_size;
+                    // Preserve the Boolean membership fast path. Comparison
+                    // mode never creates shadows or asks for collision
+                    // context, so it should not pay for a second walk.
+                    // When ordinals are needed, one GetLongestMatch walk both
+                    // finds the terminal and supplies its local ordinal.
+                    // GetLongestMatch stops on an exact prefix-key terminal so
+                    // it does not overwrite apple with applet after a
+                    // zero-padded continuation.
+                    if (location == nullptr && !store.HasInfixShadows()) {
+                        if (infix_to_query.QueryTrie(original_key, original_key,
+                                                     key_start_bit,
+                                                     infix_size_)) {
                             return true;
+                        }
+                    } else {
                         uint32_t local_ordinal = 0;
                         const int32_t match = infix_to_query.GetLongestMatch(
                             original_key, key_start_bit, infix_size_,
                             &local_ordinal);
-                        // QueryTrie is the authoritative conservative
-                        // membership check. If its witness cannot be mapped to
-                        // a logical trie entry, keep the positive answer rather
-                        // than risking a false negative.
-                        if (match < 0)
+                        if (match < 0) {
+                            // GetLongestMatch is terminal-oriented.
+                            // QueryTrie remains the conservative membership
+                            // witness for rare positives that do not map to a
+                            // single logical terminal.
+                            if (infix_to_query.QueryTrie(
+                                    original_key, original_key, key_start_bit,
+                                    infix_size_)) {
+                                return true;
+                            }
+                        } else {
+                            const uint32_t logical_ordinal = GetLogicalOrdinal(
+                                store, static_cast<uint32_t>(implicit_part),
+                                static_cast<uint32_t>(i), local_ordinal);
+                            if (!include_shadowed &&
+                                InfixIsShadowed(store, logical_ordinal)) {
+                                i += infix_to_query.GetNumSlots(infix_size_) -
+                                     1;
+                                continue;
+                            }
+                            // A trie window that starts at or past the query
+                            // end can only be reached by zero-padding. Keep
+                            // the filter positive, but do not publish that
+                            // terminal as a routeable identity.
+                            if (location != nullptr &&
+                                key_start_bit < original_key.length) {
+                                location->group_slot =
+                                    static_cast<uint32_t>(i);
+                                location->local_ordinal = local_ordinal;
+                                location->logical_ordinal = logical_ordinal;
+                                location->valid = true;
+                            }
                             return true;
-                        const uint32_t logical_ordinal = GetLogicalOrdinal(
-                            store, static_cast<uint32_t>(implicit_part),
-                            static_cast<uint32_t>(i), local_ordinal);
-                        if (!include_shadowed &&
-                            InfixIsShadowed(store, logical_ordinal)) {
-                            i += infix_to_query.GetNumSlots(infix_size_) - 1;
-                            continue;
                         }
-                        if (location != nullptr) {
-                            location->group_slot = static_cast<uint32_t>(i);
-                            location->local_ordinal = local_ordinal;
-                            location->logical_ordinal = logical_ordinal;
-                            location->valid = true;
-                        }
-                        return true;
                     }
                 }
                 i += infix_to_query.GetNumSlots(infix_size_) - 1;
@@ -7412,8 +8411,19 @@ inline void Diva<diva_type, payload_type>::ResizeInfixStore(InfixStore &store, c
             : InfixStore::admission_bitmap_word_count] = {};
     const bool tree_key_shadowed = store.TreeKeyIsShadowed();
     const bool has_infix_shadows = store.HasInfixShadows();
+    uint32_t global_ordinal_base = 0;
+    uint32_t blocks_before = 0;
+    uint32_t carry_in = 0;
+    uint32_t block_start_offset = 0;
+    uint32_t block_start_count = 0;
     if constexpr (diva_type == DivaType::BinaryTrie &&
                   payload_type == PayloadType::None) {
+        global_ordinal_base = GetGlobalOrdinalBase(store);
+        blocks_before = GetBlocksBeforeStore(store);
+        carry_in = GetCarryInKeysBeforeBase(store);
+        block_start_offset =
+            static_cast<uint32_t>(GetRoutingMetadataWords(store)[2]);
+        block_start_count = GetBlockStartOrdinalCount(store);
         memcpy(saved_shadow_bitmap, GetInfixShadowBitmap(store),
                sizeof(uint64_t) * InfixStore::shadow_bitmap_word_count);
         memcpy(saved_admission_bitmap, GetAdmissionBitmap(store),
@@ -7460,6 +8470,10 @@ inline void Diva<diva_type, payload_type>::ResizeInfixStore(InfixStore &store, c
         store.SetTreeKeyShadowed();
     if constexpr (diva_type == DivaType::BinaryTrie &&
                   payload_type == PayloadType::None) {
+        SetGlobalOrdinalBase(store, global_ordinal_base);
+        SetBlockRoutingHeader(store, blocks_before, carry_in);
+        SetBlockStartOrdinalRange(store, block_start_offset,
+                                  block_start_count);
         if (has_infix_shadows) {
             memcpy(GetInfixShadowBitmap(store), saved_shadow_bitmap,
                    sizeof(uint64_t) * InfixStore::shadow_bitmap_word_count);
@@ -8177,6 +9191,7 @@ IteratorRefetchLowerUpperBounds:
     InfixStore& infix_store = *infix_store_ptr;
     rwlock_lock_read(infix_store.rwlock);
     filter_->UnlockLeaves(leaves_to_unlock, it_write_lock);
+    filter_->ReferenceAdaptedStore(infix_store);
 
     auto append_prev_key_entry = [&]() {
         infixes_.push_back(0);
@@ -9962,12 +10977,16 @@ int32_t Diva<diva_type, payload_type>::Infix::GetLongestMatch(const InfiniteByte
         if (it.AtPrefixKey(has_prefix_keys)) {
             res = depth;
             if (local_ordinal != nullptr) {
-                // Advance() has already counted this prefix key, while
-                // num_keys_read_ counts all leaf keys preceding it in the
-                // trie's in-order traversal.
-                *local_ordinal = it.num_keys_read_ +
-                                 it.num_prefix_keys_read_ - 1;
+                // AtPrefixKey() peeks at the next counter encoding; this
+                // prefix key has not been consumed by Advance() yet, so both
+                // counters still cover only preceding logical entries.
+                *local_ordinal = it.num_keys_read_ + it.num_prefix_keys_read_;
             }
+            // A prefix terminal is a real stored key ending here. Stopping
+            // prevents a second zero-padded walk from replacing apple with
+            // applet (or a\0 with a\0\0) after QueryTrie already succeeded.
+            if (key.length == key_start_bit + static_cast<uint32_t>(depth))
+                return res;
             it.Advance(has_prefix_keys);
             depth = it.depth_branch_.back().first;
             children = it.depth_branch_.back().second;

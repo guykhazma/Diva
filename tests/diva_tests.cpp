@@ -4877,6 +4877,74 @@ public:
             for (const std::string& key : keys)
                 CHECK(deserialized.PointQuery(key));
             CHECK(serialized == original_bytes);
+
+            const uint64_t grown_bytes =
+                deserialized.GetOwnedInfixStoreBytes();
+            REQUIRE(deserialized.GetLiveAdaptationBytes() > 0);
+            CHECK(deserialized.DeAdaptAll() == 1);
+            CHECK(deserialized.GetDeAdaptationCount() == 1);
+            CHECK(deserialized.GetDeAdaptationBytes() > 0);
+            CHECK(deserialized.GetLiveAdaptationBytes() == 0);
+            CHECK(deserialized.GetOwnedInfixStoreBytes() < grown_bytes);
+            // De-adaptation forgets the learned rejection but preserves the
+            // complete immutable key set.
+            CHECK(deserialized.PointQuery(query));
+            for (const std::string& key : keys)
+                CHECK(deserialized.PointQuery(key));
+        }
+
+        SUBCASE("clock budget gives one chance then canonicalizes growth") {
+            BinaryTrieDiva streaming(infix_size, seed, load_factor);
+            for (const std::string& key : keys)
+                streaming.BulkLoadStreaming(key);
+            streaming.BulkLoadStreamingFinish();
+            std::vector<char> serialized(streaming.Size());
+            REQUIRE(streaming.Serialize(serialized.data()) ==
+                    serialized.size());
+            BinaryTrieDiva deserialized(serialized.data());
+            const uint64_t baseline_bytes =
+                deserialized.GetOwnedInfixStoreBytes();
+
+            REQUIRE(deserialized.AdaptFalsePositive(query, witness) ==
+                    BinaryTrieDiva::AdaptResult::kAdapted);
+            REQUIRE(deserialized.GetLiveAdaptationBytes() > 0);
+            REQUIRE_FALSE(deserialized.PointQuery(query));
+            deserialized.SetAdaptationMemoryBudgetBytes(0);
+
+            CHECK(deserialized.GetLiveAdaptationBytes() == 0);
+            CHECK(deserialized.GetDeAdaptationCount() == 1);
+            CHECK(deserialized.GetDeAdaptationBytes() > 0);
+            CHECK(deserialized.GetOwnedInfixStoreBytes() == baseline_bytes);
+            CHECK(deserialized.PointQuery(query));
+            for (const std::string& key : keys)
+                CHECK(deserialized.PointQuery(key));
+        }
+
+        SUBCASE("zero budget refuses resize instead of publish-then-deadapt") {
+            BinaryTrieDiva streaming(infix_size, seed, load_factor);
+            for (const std::string& key : keys)
+                streaming.BulkLoadStreaming(key);
+            streaming.BulkLoadStreamingFinish();
+            std::vector<char> serialized(streaming.Size());
+            REQUIRE(streaming.Serialize(serialized.data()) ==
+                    serialized.size());
+            BinaryTrieDiva deserialized(serialized.data());
+            const uint64_t baseline_bytes =
+                deserialized.GetOwnedInfixStoreBytes();
+            deserialized.SetAdaptationMemoryBudgetBytes(0);
+
+            REQUIRE(deserialized.PointQuery(query));
+            CHECK(deserialized.AdaptFalsePositive(query, witness) ==
+                  BinaryTrieDiva::AdaptResult::kNoCapacity);
+            CHECK(deserialized.GetResizeAdaptationCount() == 0);
+            CHECK(deserialized.GetAdaptationResizeBytes() == 0);
+            CHECK(deserialized.GetDeAdaptationCount() == 0);
+            CHECK(deserialized.GetDeAdaptationBytes() == 0);
+            CHECK(deserialized.GetLiveAdaptationBytes() == 0);
+            CHECK(deserialized.GetOwnedInfixStoreBytes() == baseline_bytes);
+            CHECK(deserialized.PointQuery(query));
+            for (const std::string& key : keys)
+                CHECK(deserialized.PointQuery(key));
         }
 
         SUBCASE("discard an unrelated decoded key") {
@@ -5187,6 +5255,9 @@ public:
         REQUIRE(adapted_an_infix);
         CHECK_FALSE(s.PointQuery(shadow));
         CHECK(s.PointQuery(neighbor));
+        REQUIRE(s.DeAdaptAll() >= 1);
+        CHECK_FALSE(s.PointQuery(shadow));
+        CHECK(s.PointQuery(neighbor));
 
         for (const std::string& key : keys) {
             if (key == shadow)
@@ -5209,6 +5280,145 @@ public:
         BinaryTrieDiva rebuilt(serialized.data());
         for (const std::string& key : keys)
             CHECK(rebuilt.PointQuery(key));
+    }
+
+    static void BinaryTrieRankRoute() {
+        const uint32_t infix_size = 9;
+        const uint32_t seed = 1;
+        const float load_factor = 0.95;
+        std::vector<std::string> keys;
+        keys.reserve(2600);
+        for (uint32_t i = 0; i < 2600; ++i) {
+            char digits[16];
+            std::snprintf(digits, sizeof(digits), "%06u", i);
+            std::string key = "key/";
+            if ((i % 3) == 0)
+                key += "shared/";
+            key += digits;
+            keys.push_back(std::move(key));
+        }
+        std::sort(keys.begin(), keys.end());
+
+        BinaryTrieDiva built(infix_size, seed, load_factor);
+        for (const std::string& key : keys)
+            built.BulkLoadStreaming(key);
+        built.BulkLoadStreamingFinish();
+        // Repeated starts model one distinct user-key version run spanning
+        // consecutive physical data blocks. Exact members route to the first
+        // equal start; the repetitions still advance later block ids.
+        const std::vector<uint64_t> block_starts = {
+            0, 0, 1, 100, 100, 100, 1024, 2599};
+        built.AttachBlockStartOrdinals(block_starts.data(),
+                                       block_starts.size());
+        std::vector<char> serialized(built.Size());
+        REQUIRE(built.Serialize(serialized.data()) == serialized.size());
+        BinaryTrieDiva s(serialized.data());
+
+        for (uint64_t i = 0; i < keys.size(); ++i) {
+            const auto route = s.GetRankRoute(keys[i]);
+            REQUIRE(route.candidate_valid);
+            CHECK(route.candidate_ordinal == i);
+            CHECK(route.ordinal_lo <= i);
+            CHECK(i < route.ordinal_hi);
+        }
+        const auto check_block = [&s](const std::string& key,
+                                      uint64_t expected_block) {
+            const auto route = s.GetRankRoute(key);
+            REQUIRE(route.block_route_valid);
+            CHECK(route.block_id == expected_block);
+        };
+        check_block(keys[0], 0);
+        check_block(keys[1], 2);
+        check_block(keys[50], 2);
+        check_block(keys[100], 3);
+        check_block(keys[101], 5);
+        check_block(keys[1024], 6);
+        const auto first_route = s.GetRankRoute(keys[0]);
+        REQUIRE(first_route.backward_candidate_block_route_valid);
+        CHECK(first_route.backward_candidate_block_id == 1);
+        const auto repeated_route = s.GetRankRoute(keys[100]);
+        REQUIRE(repeated_route.backward_candidate_block_route_valid);
+        CHECK(repeated_route.backward_candidate_block_id == 5);
+
+        std::vector<std::string> absent = {
+            "a", "key/000001-extra", "key/shared/001000-extra", "z"};
+        for (const std::string& query : absent) {
+            REQUIRE_FALSE(std::binary_search(keys.begin(), keys.end(), query));
+            const uint64_t exact = static_cast<uint64_t>(
+                std::lower_bound(keys.begin(), keys.end(), query) -
+                keys.begin());
+            const auto route = s.GetRankRoute(query);
+            CHECK(route.ordinal_lo <= exact);
+            if (route.candidate_valid) {
+                CHECK(route.ordinal_lo <= route.candidate_ordinal);
+                CHECK(route.candidate_ordinal < route.ordinal_hi);
+            }
+        }
+
+        // Case A: ordinary prefix pairs whose bodies extend into the trie
+        // window. GetLongestMatch must stop on the exact prefix-key terminal.
+        std::vector<std::string> prefix_keys = {
+            "ap", "apple", "applet", "b", "ba", "z"};
+        std::sort(prefix_keys.begin(), prefix_keys.end());
+        BinaryTrieDiva prefix_built(infix_size, seed, load_factor);
+        for (const std::string& prefix_key : prefix_keys)
+            prefix_built.BulkLoadStreaming(prefix_key);
+        prefix_built.BulkLoadStreamingFinish();
+        std::vector<char> prefix_serialized(prefix_built.Size());
+        REQUIRE(prefix_built.Serialize(prefix_serialized.data()) ==
+                prefix_serialized.size());
+        BinaryTrieDiva prefix(prefix_serialized.data());
+        for (uint64_t i = 0; i < prefix_keys.size(); ++i) {
+            const auto route = prefix.GetRankRoute(prefix_keys[i]);
+            REQUIRE(route.candidate_valid);
+            CHECK(route.candidate_ordinal == i);
+        }
+
+        // Case B: zero-extension groups. Keys that end before the store's trie
+        // window can still be filter-positive via zero-padding; exact candidates
+        // are required only when published. Longer prefix pairs in the same
+        // set must remain exact.
+        std::vector<std::string> edge_keys = {
+            "a", std::string("a\0", 2), std::string("a\0\0", 3),
+            "ap", "apple", "applet", "b", "ba"};
+        std::sort(edge_keys.begin(), edge_keys.end());
+        BinaryTrieDiva edge_built(infix_size, seed, load_factor);
+        for (const std::string& edge_key : edge_keys)
+            edge_built.BulkLoadStreaming(edge_key);
+        edge_built.BulkLoadStreamingFinish();
+        std::vector<char> edge_serialized(edge_built.Size());
+        REQUIRE(edge_built.Serialize(edge_serialized.data()) ==
+                edge_serialized.size());
+        BinaryTrieDiva edge(edge_serialized.data());
+        for (uint64_t i = 0; i < edge_keys.size(); ++i) {
+            const auto route = edge.GetRankRoute(edge_keys[i]);
+            CHECK(route.ordinal_lo <= i);
+            CHECK(i < route.ordinal_hi);
+            const bool short_zero_extension =
+                edge_keys[i] == "a" ||
+                edge_keys[i].find('\0') != std::string::npos;
+            if (short_zero_extension) {
+                if (route.candidate_valid) {
+                    CHECK(route.candidate_ordinal == i);
+                }
+            } else {
+                REQUIRE(route.candidate_valid);
+                CHECK(route.candidate_ordinal == i);
+            }
+        }
+        const std::vector<std::string> edge_absent = {
+            std::string("a\0\0\0", 4), "app", "applf", "az", "bb"};
+        for (const std::string& query : edge_absent) {
+            const uint64_t exact = static_cast<uint64_t>(
+                std::lower_bound(edge_keys.begin(), edge_keys.end(), query) -
+                edge_keys.begin());
+            const auto route = edge.GetRankRoute(query);
+            CHECK(route.ordinal_lo <= exact);
+            if (route.candidate_valid) {
+                CHECK(route.ordinal_lo <= route.candidate_ordinal);
+                CHECK(route.candidate_ordinal < route.ordinal_hi);
+            }
+        }
     }
 
 
@@ -5752,6 +5962,10 @@ TEST_SUITE("binary trie") {
 
     TEST_CASE("logical shadowing") {
         DivaTests::BinaryTrieLogicalShadowing();
+    }
+
+    TEST_CASE("rank route") {
+        DivaTests::BinaryTrieRankRoute();
     }
 }
 
