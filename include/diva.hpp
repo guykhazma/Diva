@@ -239,6 +239,7 @@ private:
     uint64_t implicit_scalars_[infix_store_target_size / 2 + 1];
 
     uint32_t bulk_load_streaming_ind_ = 0, bulk_load_streaming_max_len_ = 0;
+    bool bulk_load_first_key_is_min_ = false;
     InfiniteByteString bulk_load_left_key_, bulk_load_key_list_[infix_store_target_size];
 
     const bool read_only_ = false;
@@ -571,6 +572,21 @@ inline bool Diva<int_optimized>::RangeQuery(const uint8_t *input_l, const uint32
             return true;
         }
         wh_int_iter_skip1_rev(&it_int);
+        // No predecessor, so the query key sorts below every boundary key and
+        // is absent: bulk loading always installs its first key as a boundary,
+        // and the input is sorted, so every key this filter represents is at or
+        // above some boundary key. (The all-zero minimum sentinel is not itself
+        // a lower bound -- it is max_len zero bytes, so a shorter all-zero key
+        // sorts before it -- but that first real boundary key is.)
+        // Falling through instead would not work: prev_key would stay
+        // default-constructed, an empty key, which WordAt() reads as infinitely
+        // many zero bytes, and GetSharedIgnoreImplicitLengths() would not
+        // terminate when next_key is also all zeros.
+        if (!wh_int_iter_valid(&it_int)) {
+            if (it_int.leaf)
+                wormleaf_int_unlock_read(it_int.leaf);
+            return false;
+        }
         wh_int_iter_peek_ref(&it_int, reinterpret_cast<const void **>(&prev_key.str), &prev_key.length,
                                       reinterpret_cast<void **>(&infix_store_ptr), &dummy_val);
         if (it_int.leaf)
@@ -591,6 +607,21 @@ inline bool Diva<int_optimized>::RangeQuery(const uint8_t *input_l, const uint32
             return true;
         }
         wh_iter_skip1_rev(&it);
+        // No predecessor, so the query key sorts below every boundary key and
+        // is absent: bulk loading always installs its first key as a boundary,
+        // and the input is sorted, so every key this filter represents is at or
+        // above some boundary key. (The all-zero minimum sentinel is not itself
+        // a lower bound -- it is max_len zero bytes, so a shorter all-zero key
+        // sorts before it -- but that first real boundary key is.)
+        // Falling through instead would not work: prev_key would stay
+        // default-constructed, an empty key, which WordAt() reads as infinitely
+        // many zero bytes, and GetSharedIgnoreImplicitLengths() would not
+        // terminate when next_key is also all zeros.
+        if (!wh_iter_valid(&it)) {
+            if (it.leaf)
+                wormleaf_unlock_read(it.leaf);
+            return false;
+        }
         wh_iter_peek_ref(&it, reinterpret_cast<const void **>(&prev_key.str), &prev_key.length,
                               reinterpret_cast<void **>(&infix_store_ptr), &dummy_val);
         if (it.leaf)
@@ -684,6 +715,21 @@ inline bool Diva<int_optimized>::PointQuery(const uint8_t *input_key, const uint
             return true;
         }
         wh_int_iter_skip1_rev(&it_int);
+        // No predecessor, so the query key sorts below every boundary key and
+        // is absent: bulk loading always installs its first key as a boundary,
+        // and the input is sorted, so every key this filter represents is at or
+        // above some boundary key. (The all-zero minimum sentinel is not itself
+        // a lower bound -- it is max_len zero bytes, so a shorter all-zero key
+        // sorts before it -- but that first real boundary key is.)
+        // Falling through instead would not work: prev_key would stay
+        // default-constructed, an empty key, which WordAt() reads as infinitely
+        // many zero bytes, and GetSharedIgnoreImplicitLengths() would not
+        // terminate when next_key is also all zeros.
+        if (!wh_int_iter_valid(&it_int)) {
+            if (it_int.leaf)
+                wormleaf_int_unlock_read(it_int.leaf);
+            return false;
+        }
         wh_int_iter_peek_ref(&it_int, reinterpret_cast<const void **>(&prev_key.str), &prev_key.length,
                                       reinterpret_cast<void **>(&infix_store_ptr), &dummy_val);
         if (it_int.leaf)
@@ -705,6 +751,21 @@ inline bool Diva<int_optimized>::PointQuery(const uint8_t *input_key, const uint
             return true;
         }
         wh_iter_skip1_rev(&it);
+        // No predecessor, so the query key sorts below every boundary key and
+        // is absent: bulk loading always installs its first key as a boundary,
+        // and the input is sorted, so every key this filter represents is at or
+        // above some boundary key. (The all-zero minimum sentinel is not itself
+        // a lower bound -- it is max_len zero bytes, so a shorter all-zero key
+        // sorts before it -- but that first real boundary key is.)
+        // Falling through instead would not work: prev_key would stay
+        // default-constructed, an empty key, which WordAt() reads as infinitely
+        // many zero bytes, and GetSharedIgnoreImplicitLengths() would not
+        // terminate when next_key is also all zeros.
+        if (!wh_iter_valid(&it)) {
+            if (it.leaf)
+                wormleaf_unlock_read(it.leaf);
+            return false;
+        }
         wh_iter_peek_ref(&it, reinterpret_cast<const void **>(&prev_key.str), &prev_key.length,
                               reinterpret_cast<void **>(&infix_store_ptr), &dummy_val);
         if (it.leaf)
@@ -1940,6 +2001,11 @@ inline void Diva<int_optimized>::BulkLoadStreaming(const uint8_t *key, const uin
     if (bulk_load_left_key_.str == nullptr) {
         bulk_load_left_key_ = {key_copy, key_len};
         bulk_load_streaming_max_len_ = key_len;
+        // The input is sorted, so this first key is the smallest. Remember
+        // whether it is all zeros: the min sentinel installed by
+        // BulkLoadStreamingFinish is then not below it, and must be skipped.
+        bulk_load_first_key_is_min_ = std::all_of(key, key + key_len,
+                                                 [](const uint8_t b) { return b == 0; });
         return;
     }
     bulk_load_streaming_max_len_ = std::max(bulk_load_streaming_max_len_, key_len);
@@ -1996,8 +2062,16 @@ inline void Diva<int_optimized>::BulkLoadStreamingFinish() {
         else
             return !wh_probe(better_tree_, k, len);
     };
+    // The min sentinel is max_len zero bytes, which is only a lower bound on
+    // the keys when the smallest key is not itself all zeros: an all-zero key
+    // shorter than max_len sorts before it. Installing it anyway would add a
+    // boundary ABOVE the smallest key, splitting the range of an already built
+    // store and leaving an empty store in front of its upper half -- every key
+    // there would become a false negative. tree_key_absent does not catch this,
+    // because a shorter all-zero key is not an exact collision.
     memset(key_copy, 0x00, bulk_load_streaming_max_len_);
-    if (tree_key_absent(key_copy, bulk_load_streaming_max_len_))
+    if (!bulk_load_first_key_is_min_ &&
+        tree_key_absent(key_copy, bulk_load_streaming_max_len_))
         AddTreeKey(key_copy, bulk_load_streaming_max_len_);
     memset(key_copy, 0xFF, bulk_load_streaming_max_len_);
     if (tree_key_absent(key_copy, bulk_load_streaming_max_len_))
