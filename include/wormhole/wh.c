@@ -52,7 +52,7 @@ struct wormkv64 { u64 key; void * ptr; }; // u64 keys (whu64)
 
 struct wormleaf {
   // first line
-  rwlock leaflock;
+  wh_rwlock leaflock;
   spinlock sortlock; // to protect the seemingly "read-only" iter_seek
   au64 lv; // version (dont use the first u64)
   struct wormleaf * prev; // prev leaf
@@ -105,7 +105,7 @@ struct wormhole {
   // 2 lines
   struct wormhmap hmap2[2];
   // fifth line
-  rwlock metalock;
+  wh_rwlock metalock;
   u32 padding2[15];
 };
 

@@ -1182,16 +1182,16 @@ spinlock_unlock(spinlock * const lock)
 // }}} spinlock
 
 // pthread mutex {{{
-static_assert(sizeof(pthread_mutex_t) <= sizeof(mutex), "mutexlock size");
+static_assert(sizeof(pthread_mutex_t) <= sizeof(wh_mutex), "mutexlock size");
   inline void
-mutex_init(mutex * const lock)
+mutex_init(wh_mutex * const lock)
 {
   pthread_mutex_t * const p = (typeof(p))lock;
   pthread_mutex_init(p, NULL);
 }
 
   inline void
-mutex_lock(mutex * const lock)
+mutex_lock(wh_mutex * const lock)
 {
 #if defined(CORR)
 #pragma nounroll
@@ -1204,21 +1204,21 @@ mutex_lock(mutex * const lock)
 }
 
   inline bool
-mutex_trylock(mutex * const lock)
+mutex_trylock(wh_mutex * const lock)
 {
   pthread_mutex_t * const p = (typeof(p))lock;
   return !pthread_mutex_trylock(p); // return value ignored
 }
 
   inline void
-mutex_unlock(mutex * const lock)
+mutex_unlock(wh_mutex * const lock)
 {
   pthread_mutex_t * const p = (typeof(p))lock;
   pthread_mutex_unlock(p); // return value ignored
 }
 
   inline void
-mutex_deinit(mutex * const lock)
+mutex_deinit(wh_mutex * const lock)
 {
   pthread_mutex_t * const p = (typeof(p))lock;
   pthread_mutex_destroy(p);
@@ -1232,11 +1232,11 @@ mutex_deinit(mutex * const lock)
 // cyclic dependencies can be manually identified by looking at the two lists below in gdb
 #ifdef RWDEP
 #define RWDEP_NR ((16))
-__thread const rwlock * rwdep_readers[RWDEP_NR] = {};
-__thread const rwlock * rwdep_writers[RWDEP_NR] = {};
+__thread const wh_rwlock * rwdep_readers[RWDEP_NR] = {};
+__thread const wh_rwlock * rwdep_writers[RWDEP_NR] = {};
 
   static void
-rwdep_check(const rwlock * const lock)
+rwdep_check(const wh_rwlock * const lock)
 {
   //debug_assert(lock);
   for (u64 i = 0; i < RWDEP_NR; i++) {
@@ -1249,7 +1249,7 @@ rwdep_check(const rwlock * const lock)
 #endif // RWDEP
 
   static void
-rwdep_lock_read(const rwlock * const lock)
+rwdep_lock_read(const wh_rwlock * const lock)
 {
 #ifdef RWDEP
   rwdep_check(lock);
@@ -1265,7 +1265,7 @@ rwdep_lock_read(const rwlock * const lock)
 }
 
   static void
-rwdep_unlock_read(const rwlock * const lock)
+rwdep_unlock_read(const wh_rwlock * const lock)
 {
 #ifdef RWDEP
   for (u64 i = 0; i < RWDEP_NR; i++) {
@@ -1281,7 +1281,7 @@ rwdep_unlock_read(const rwlock * const lock)
 }
 
   static void
-rwdep_lock_write(const rwlock * const lock)
+rwdep_lock_write(const wh_rwlock * const lock)
 {
 #ifdef RWDEP
   rwdep_check(lock);
@@ -1297,7 +1297,7 @@ rwdep_lock_write(const rwlock * const lock)
 }
 
   static void
-rwdep_unlock_write(const rwlock * const lock)
+rwdep_unlock_write(const wh_rwlock * const lock)
 {
 #ifdef RWDEP
   for (u64 i = 0; i < RWDEP_NR; i++) {
@@ -1317,20 +1317,20 @@ rwdep_unlock_write(const rwlock * const lock)
 typedef au32 lock_t;
 typedef u32 lock_v;
 static_assert(sizeof(lock_t) == sizeof(lock_v), "lock size");
-static_assert(sizeof(lock_t) <= sizeof(rwlock), "lock size");
+static_assert(sizeof(lock_t) <= sizeof(wh_rwlock), "lock size");
 
 #define RWLOCK_WSHIFT ((sizeof(lock_t) * 8 - 1))
 #define RWLOCK_WBIT ((((lock_v)1) << RWLOCK_WSHIFT))
 
   inline void
-rwlock_init(rwlock * const lock)
+rwlock_init(wh_rwlock * const lock)
 {
   lock_t * const pvar = (typeof(pvar))lock;
   atomic_store_explicit(pvar, 0, MO_RELEASE);
 }
 
   inline bool
-rwlock_trylock_read(rwlock * const lock)
+rwlock_trylock_read(wh_rwlock * const lock)
 {
   lock_t * const pvar = (typeof(pvar))lock;
   if ((atomic_fetch_add_explicit(pvar, 1, MO_ACQUIRE) >> RWLOCK_WSHIFT) == 0) {
@@ -1343,7 +1343,7 @@ rwlock_trylock_read(rwlock * const lock)
 }
 
   inline bool
-rwlock_trylock_read_lp(rwlock * const lock)
+rwlock_trylock_read_lp(wh_rwlock * const lock)
 {
   lock_t * const pvar = (typeof(pvar))lock;
   if (atomic_load_explicit(pvar, MO_CONSUME) >> RWLOCK_WSHIFT) {
@@ -1355,7 +1355,7 @@ rwlock_trylock_read_lp(rwlock * const lock)
 
 // actually nr + 1
   inline bool
-rwlock_trylock_read_nr(rwlock * const lock, u16 nr)
+rwlock_trylock_read_nr(wh_rwlock * const lock, u16 nr)
 {
   lock_t * const pvar = (typeof(pvar))lock;
   if ((atomic_fetch_add_explicit(pvar, 1, MO_ACQUIRE) >> RWLOCK_WSHIFT) == 0) {
@@ -1377,7 +1377,7 @@ rwlock_trylock_read_nr(rwlock * const lock, u16 nr)
 }
 
   inline void
-rwlock_lock_read(rwlock * const lock)
+rwlock_lock_read(wh_rwlock * const lock)
 {
   lock_t * const pvar = (typeof(pvar))lock;
 #pragma nounroll
@@ -1396,7 +1396,7 @@ rwlock_lock_read(rwlock * const lock)
 }
 
   inline void
-rwlock_unlock_read(rwlock * const lock)
+rwlock_unlock_read(wh_rwlock * const lock)
 {
   rwdep_unlock_read(lock);
   lock_t * const pvar = (typeof(pvar))lock;
@@ -1404,7 +1404,7 @@ rwlock_unlock_read(rwlock * const lock)
 }
 
   inline bool
-rwlock_trylock_write(rwlock * const lock)
+rwlock_trylock_write(wh_rwlock * const lock)
 {
   lock_t * const pvar = (typeof(pvar))lock;
   lock_v v0 = atomic_load_explicit(pvar, MO_CONSUME);
@@ -1417,7 +1417,7 @@ rwlock_trylock_write(rwlock * const lock)
 }
 
   inline bool
-rwlock_trylock_upgrade_write(rwlock * const lock)
+rwlock_trylock_upgrade_write(wh_rwlock * const lock)
 {
   lock_t * const pvar = (typeof(pvar))lock;
   lock_v v0 = atomic_load_explicit(pvar, MO_CONSUME);
@@ -1431,7 +1431,7 @@ rwlock_trylock_upgrade_write(rwlock * const lock)
 
 // actually nr + 1
   inline bool
-rwlock_trylock_write_nr(rwlock * const lock, u16 nr)
+rwlock_trylock_write_nr(wh_rwlock * const lock, u16 nr)
 {
 #pragma nounroll
   do {
@@ -1443,7 +1443,7 @@ rwlock_trylock_write_nr(rwlock * const lock, u16 nr)
 }
 
   inline bool
-rwlock_trylock_upgrade_write_nr(rwlock * const lock, u16 nr)
+rwlock_trylock_upgrade_write_nr(wh_rwlock * const lock, u16 nr)
 {
 #pragma nounroll
   do {
@@ -1455,7 +1455,7 @@ rwlock_trylock_upgrade_write_nr(rwlock * const lock, u16 nr)
 }
 
   inline void
-rwlock_lock_write(rwlock * const lock)
+rwlock_lock_write(wh_rwlock * const lock)
 {
   lock_t * const pvar = (typeof(pvar))lock;
 #pragma nounroll
@@ -1474,7 +1474,7 @@ rwlock_lock_write(rwlock * const lock)
 }
 
   inline void
-rwlock_lock_upgrade_write(rwlock * const lock)
+rwlock_lock_upgrade_write(wh_rwlock * const lock)
 {
   lock_t * const pvar = (typeof(pvar))lock;
 #pragma nounroll
@@ -1493,7 +1493,7 @@ rwlock_lock_upgrade_write(rwlock * const lock)
 }
 
   inline bool
-rwlock_trylock_write_hp(rwlock * const lock)
+rwlock_trylock_write_hp(wh_rwlock * const lock)
 {
   lock_t * const pvar = (typeof(pvar))lock;
   lock_v v0 = atomic_load_explicit(pvar, MO_CONSUME);
@@ -1520,7 +1520,7 @@ rwlock_trylock_write_hp(rwlock * const lock)
 }
 
   inline bool
-rwlock_trylock_write_hp_nr(rwlock * const lock, u16 nr)
+rwlock_trylock_write_hp_nr(wh_rwlock * const lock, u16 nr)
 {
 #pragma nounroll
   do {
@@ -1532,7 +1532,7 @@ rwlock_trylock_write_hp_nr(rwlock * const lock, u16 nr)
 }
 
   inline void
-rwlock_lock_write_hp(rwlock * const lock)
+rwlock_lock_write_hp(wh_rwlock * const lock)
 {
 #pragma nounroll
   while (!rwlock_trylock_write_hp(lock)) {
@@ -1545,7 +1545,7 @@ rwlock_lock_write_hp(rwlock * const lock)
 }
 
   inline void
-rwlock_unlock_write(rwlock * const lock)
+rwlock_unlock_write(wh_rwlock * const lock)
 {
   rwdep_unlock_write(lock);
   lock_t * const pvar = (typeof(pvar))lock;
@@ -1553,7 +1553,7 @@ rwlock_unlock_write(rwlock * const lock)
 }
 
   inline void
-rwlock_write_to_read(rwlock * const lock)
+rwlock_write_to_read(wh_rwlock * const lock)
 {
   rwdep_unlock_write(lock);
   rwdep_lock_read(lock);
@@ -2423,7 +2423,7 @@ struct slab {
 
   // 4th line
   union {
-    mutex lock;
+    wh_mutex lock;
     u64 padding4[8];
   };
 };

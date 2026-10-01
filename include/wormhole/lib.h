@@ -325,73 +325,73 @@ spinlock_unlock(spinlock * const lock);
 
 typedef union {
   u32 opaque;
-} rwlock;
+} wh_rwlock;
 
   extern void
-rwlock_init(rwlock * const lock);
+rwlock_init(wh_rwlock * const lock);
 
   extern bool
-rwlock_trylock_read(rwlock * const lock);
+rwlock_trylock_read(wh_rwlock * const lock);
 
 // low-priority reader-lock; use with trylock_write_hp
   extern bool
-rwlock_trylock_read_lp(rwlock * const lock);
+rwlock_trylock_read_lp(wh_rwlock * const lock);
 
   extern bool
-rwlock_trylock_read_nr(rwlock * const lock, u16 nr);
+rwlock_trylock_read_nr(wh_rwlock * const lock, u16 nr);
 
   extern void
-rwlock_lock_read(rwlock * const lock);
+rwlock_lock_read(wh_rwlock * const lock);
 
   extern void
-rwlock_unlock_read(rwlock * const lock);
+rwlock_unlock_read(wh_rwlock * const lock);
 
   extern bool
-rwlock_trylock_write(rwlock * const lock);
+rwlock_trylock_write(wh_rwlock * const lock);
 
   extern bool
-rwlock_trylock_upgrade_write(rwlock * const lock);
+rwlock_trylock_upgrade_write(wh_rwlock * const lock);
 
   extern bool
-rwlock_trylock_write_nr(rwlock * const lock, u16 nr);
+rwlock_trylock_write_nr(wh_rwlock * const lock, u16 nr);
 
   extern void
-rwlock_lock_write(rwlock * const lock);
+rwlock_lock_write(wh_rwlock * const lock);
 
 // writer has higher priority; new readers are blocked
   extern bool
-rwlock_trylock_write_hp(rwlock * const lock);
+rwlock_trylock_write_hp(wh_rwlock * const lock);
 
   extern bool
-rwlock_trylock_write_hp_nr(rwlock * const lock, u16 nr);
+rwlock_trylock_write_hp_nr(wh_rwlock * const lock, u16 nr);
 
   extern void
-rwlock_lock_write_hp(rwlock * const lock);
+rwlock_lock_write_hp(wh_rwlock * const lock);
 
   extern void
-rwlock_unlock_write(rwlock * const lock);
+rwlock_unlock_write(wh_rwlock * const lock);
 
   extern void
-rwlock_write_to_read(rwlock * const lock);
+rwlock_write_to_read(wh_rwlock * const lock);
 
 typedef union {
   u64 opqaue[8];
-} mutex;
+} wh_mutex;
 
   extern void
-mutex_init(mutex * const lock);
+mutex_init(wh_mutex * const lock);
 
   extern void
-mutex_lock(mutex * const lock);
+mutex_lock(wh_mutex * const lock);
 
   extern bool
-mutex_trylock(mutex * const lock);
+mutex_trylock(wh_mutex * const lock);
 
   extern void
-mutex_unlock(mutex * const lock);
+mutex_unlock(wh_mutex * const lock);
 
   extern void
-mutex_deinit(mutex * const lock);
+mutex_deinit(wh_mutex * const lock);
 // }}} locking
 
 // coroutine {{{

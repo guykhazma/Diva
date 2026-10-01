@@ -62,7 +62,7 @@ struct store_sim_hack {
 
 struct wormleaf_int {
   // first line
-  rwlock leaflock;
+  wh_rwlock leaflock;
   spinlock sortlock; // to protect the seemingly "read-only" iter_seek
   au64 lv; // version (dont use the first u64)
   struct wormleaf_int * prev; // prev leaf
@@ -118,7 +118,7 @@ struct wormhole_int {
   // 2 lines
   struct wormhmap hmap2[2];
   // fifth line
-  rwlock metalock;
+  wh_rwlock metalock;
   u32 padding2[15];
 };
 
