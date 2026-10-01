@@ -1571,6 +1571,11 @@ rwlock_write_to_read(rwlock * const lock)
 // coroutine {{{
 
 // asm {{{
+// co_switch_stack is defined in assembly, where wh_prefix.h's rename cannot
+// reach a string literal. Stringify the macro-expanded name instead, so the
+// label is the renamed symbol the C declaration in lib.h refers to.
+#define CO_ASM_NAME_(x) #x
+#define CO_ASM_NAME(x) CO_ASM_NAME_(x)
 #if defined(__x86_64__)
 // number pushes in co_switch_stack
 #define CO_CONTEXT_SIZE ((6))
@@ -1579,12 +1584,12 @@ rwlock_write_to_read(rwlock * const lock)
 asm (
     ".align 16;"
 #if defined(__linux__) || defined(__FreeBSD__)
-    ".global co_switch_stack;"
-    ".type co_switch_stack, @function;"
-    "co_switch_stack:"
+    ".global " CO_ASM_NAME(co_switch_stack) ";"
+    ".type " CO_ASM_NAME(co_switch_stack) ", @function;"
+    CO_ASM_NAME(co_switch_stack) ":"
 #elif defined(__APPLE__) && defined(__MACH__)
-    ".global _co_switch_stack;"
-    "_co_switch_stack:"
+    ".global _" CO_ASM_NAME(co_switch_stack) ";"
+    "_" CO_ASM_NAME(co_switch_stack) ":"
 #else
 #error Supported platforms: Linux/FreeBSD/Apple
 #endif // OS
@@ -1604,12 +1609,12 @@ asm (
 asm (
     ".align 16;"
 #if defined(__linux__) || defined(__FreeBSD__)
-    ".global co_switch_stack;"
-    ".type co_switch_stack, @function;"
-    "co_switch_stack:"
+    ".global " CO_ASM_NAME(co_switch_stack) ";"
+    ".type " CO_ASM_NAME(co_switch_stack) ", @function;"
+    CO_ASM_NAME(co_switch_stack) ":"
 #elif defined(__APPLE__) && defined(__MACH__)
-    ".global _co_switch_stack;"
-    "_co_switch_stack:"
+    ".global _" CO_ASM_NAME(co_switch_stack) ";"
+    "_" CO_ASM_NAME(co_switch_stack) ":"
 #else
 #error supported platforms: Linux/FreeBSD/Apple
 #endif // OS

@@ -39,6 +39,10 @@
 #endif
 // }}} includes
 
+// Keep this copy's exported symbols distinct from another copy of Diva's
+// wormhole linked into the same binary; see wh_prefix.h.
+#include "wh_prefix.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif

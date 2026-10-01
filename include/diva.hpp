@@ -27,7 +27,7 @@
 #include "wormhole/wh_int.h"
 
 
-namespace diva {
+namespace diva_valuelog {
 
 // Per-thread wormhole references.
 //
@@ -7884,4 +7884,4 @@ inline bool Diva<int_optimized, payload_type>::Iterator::IsValid() const {
     return ind_ < infixes_.size() || next_to_fetch_.str;
 }
 
-}
+}  // namespace diva_valuelog

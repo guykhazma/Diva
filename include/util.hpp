@@ -11,6 +11,11 @@
 #define BITMASK(nbits)                                    \
   ((nbits) == 64 ? 0xffffffffffffffff : MAX_VALUE(nbits))
 
+// Namespaced so this copy of Diva can coexist with another in one binary.
+// The macros above stay outside: they are identical in both copies, and the
+// preprocessor has no notion of namespaces.
+namespace diva_valuelog {
+
 
 __attribute__((always_inline))
 static inline uint32_t fast_reduce(uint32_t hash, uint32_t n) {
@@ -484,4 +489,4 @@ inline void rwlock_unlock_write(std::atomic<lock_t>& lock) {
     lock.fetch_sub(rwlock_write_bit, std::memory_order::memory_order_release);
 }
 
-
+}  // namespace diva_valuelog
