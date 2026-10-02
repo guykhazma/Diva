@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <endian.h>
+#include <malloc.h>
 #include <functional>
 #include <iomanip>
 #include <iostream>
