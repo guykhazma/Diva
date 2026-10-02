@@ -3917,6 +3917,20 @@ inline void Diva<int_optimized, payload_type>::DeleteMerge(InfiniteByteString ke
     rwlock_lock_write(store_l->rwlock);
     rwlock_lock_write(store_r->rwlock);
 
+    // The caller emptied middle_key's sample payloads, then released the
+    // store's lock before calling here, so an insert of middle_key can have
+    // added one since (AddSamplePayload). The merge below keeps only store_l's
+    // samples and removes middle_key from the trie, so merging now would drop
+    // that payload. The boundary is in use again: leave it. The caller's
+    // removal still happened, so count it as the merge would.
+    if (store_r->num_sample_payloads != 0) {
+        rwlock_unlock_write(store_r->rwlock);
+        rwlock_unlock_write(store_l->rwlock);
+        UnlockLeaves(leaves_to_unlock, it_write_lock);
+        n_keys_.fetch_sub(1, std::memory_order_release);
+        return;
+    }
+
     // Reconcile payload widths before merging. The merge builds one flat
     // payload list from both stores and reloads it into a single store, so the
     // two sides must agree on a stride. Widening is the safe direction: it
