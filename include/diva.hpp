@@ -135,6 +135,10 @@ public:
     void Adapt(const uint8_t *input_key, const uint32_t input_key_len, const uint32_t new_prefix_len);
     void ShrinkInfixSize(const uint32_t new_infix_size);
     uint64_t Size() const;
+    // Frees the wormhole scratch buffer (64kB), which only its splits and
+    // merges use; they re-allocate it if they happen later. For a filter that
+    // is built (e.g. deserialized) and then only queried. Not thread-safe.
+    void ReleaseScratch();
     uint32_t Serialize(char *out) const;
     void BulkLoadStreaming(uint64_t key, const uint64_t *payload=nullptr);
     void BulkLoadStreaming(std::string_view key, const uint64_t *payload=nullptr);
@@ -2084,6 +2088,13 @@ Diva<diva_type, payload_type>::GetSharedIgnoreImplicitLengths(const InfiniteByte
     implicit_size += (2 * (implicit_2 - implicit_1 + 1) < (1ULL << base_implicit_size));
 
     return {share, ignore, implicit_size};
+}
+
+
+template <DivaType diva_type, PayloadType payload_type>
+inline void Diva<diva_type, payload_type>::ReleaseScratch() {
+    if constexpr (diva_type != DivaType::Int)
+        wh_release_scratch(wh_);
 }
 
 

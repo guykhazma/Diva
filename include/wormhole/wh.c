@@ -15,7 +15,12 @@
 // }}} headers
 
 // def {{{
-#define WH_HMAPINIT_SIZE ((1u << 12)) // 10: 16KB/64KB  12: 64KB/256KB  14: 256KB/1MB
+// The hash map grows on demand (wormhmap_expand), so it starts small: a range
+// filter holds one trie per SST file, and most of a 4096-slot map (64KB/256KB)
+// would sit untouched in each. 6: 1KB/4KB.
+#ifndef WH_HMAPINIT_SIZE
+#define WH_HMAPINIT_SIZE ((1u << 6))
+#endif
 #define WH_SLABMETA_SIZE ((1lu << 21)) // 2MB
 
 #ifndef HEAPCHECKING
@@ -2851,6 +2856,23 @@ wormmeta_split(struct wormhmap * const hmap, struct wormleaf * const leaf,
 }
 
 // all locks will be released before returning
+// The scratch key buffer (pbuf) is used only to maintain the prefix index
+// on leaf splits and merges. wh_release_scratch() frees it for a map
+// that is no longer modified; a split or merge re-allocates it first.
+  static bool
+wormhole_scratch_ensure(struct wormhole * const map)
+{
+  if (likely(map->pbuf != NULL))
+    return true;
+  struct kv * const pbuf = yalloc(1lu << 16); // 64kB, as in create
+  if (pbuf == NULL)
+    return false;
+  map->pbuf = pbuf;
+  for (u32 i = 0; i < 2; i++)
+    map->hmap2[i].pbuf = pbuf;
+  return true;
+}
+
   static bool
 wormhole_split_meta(struct wormref * const ref, struct wormleaf * const leaf2, void **locked_leaf_addrs)
 {
@@ -2866,8 +2888,9 @@ wormhole_split_meta(struct wormref * const ref, struct wormleaf * const leaf2, v
   // metalock
   wormhmap_lock(map, ref);
 
-  // check slab reserve
-  const bool sr = wormhole_slab_reserve(map, mkey->klen);
+  // check scratch and slab reserve
+  const bool sr = wormhole_scratch_ensure(map) &&
+                  wormhole_slab_reserve(map, mkey->klen);
   if (unlikely(!sr)) {
     wormhmap_unlock(map);
     wormhole_free_mkey(mkey);
@@ -2947,7 +2970,8 @@ whunsafe_split_meta(struct wormhole * const map, struct wormleaf * const leaf2)
     return false;
   kv_dup2_key(leaf2->anchor, mkey);
 
-  const bool sr = wormhole_slab_reserve(map, mkey->klen);
+  const bool sr = wormhole_scratch_ensure(map) &&
+                  wormhole_slab_reserve(map, mkey->klen);
   if (unlikely(!sr)) {
     wormhmap_unlock(map);
     wormhole_free_mkey(mkey);
@@ -3081,6 +3105,10 @@ wormhole_meta_merge(struct wormref * const ref, struct wormleaf * const leaf1,
     wormleaf_lock_write(leaf2->next, ref);
 
   wormhmap_lock(map, ref);
+  // A merge cannot fail; without memory for the scratch buffer it cannot
+  // proceed either.
+  if (unlikely(!wormhole_scratch_ensure(map)))
+    abort();
 
   struct wormhmap * const hmap0 = wormhmap_load(map);
   struct wormhmap * const hmap1 = wormhmap_switch(map, hmap0);
@@ -3153,6 +3181,8 @@ whunsafe_meta_leaf_merge(struct wormhole * const map, struct wormleaf * const le
   leaf1->next = leaf2->next;
   if (leaf2->next)
     leaf2->next->prev = leaf1;
+  if (unlikely(!wormhole_scratch_ensure(map)))
+    abort();
   for (u32 i = 0; i < 2; i++)
     if (map->hmap2[i].pmap)
       wormmeta_merge(&(map->hmap2[i]), leaf2);
@@ -4367,6 +4397,15 @@ wh_clean(struct wormhole * const map)
 wh_destroy(struct wormhole * const map)
 {
   wh_api->destroy(map);
+}
+
+  void
+wh_release_scratch(struct wormhole * const map)
+{
+  free(map->pbuf);
+  map->pbuf = NULL;
+  for (u32 i = 0; i < 2; i++)
+    map->hmap2[i].pbuf = NULL;
 }
 
 // Do set/put with explicit kv buffers

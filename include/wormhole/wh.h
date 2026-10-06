@@ -306,6 +306,12 @@ wh_clean(struct wormhole * const map);
   extern void
 wh_destroy(struct wormhole * const map);
 
+// Frees the map's 64kB scratch key buffer, which only leaf splits and merges
+// use; they re-allocate it if they happen later. Call it on a map no other
+// thread is using, e.g. right after building one that is then only read.
+  extern void
+wh_release_scratch(struct wormhole * const map);
+
   extern bool
 wh_put(struct wormref * const ref, const void * const kbuf, const u32 klen,
     const void * const vbuf, const u32 vlen, void **locked_leaf_addrs);
